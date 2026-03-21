@@ -288,6 +288,16 @@ class RadianceGemminiOnlyConfig extends Config(
   new RadianceBaseConfig
 )
 
+// FireSim variant: drops WithExtGPUMem to avoid address overlap with FireSim memory model.
+// GPU mem is not needed since Muon cores are disabled.
+class RadianceGemminiOnlyFireSimConfig extends Config(
+  new WithRadianceMxGemmini(location = InCluster(0), dim = 16, accSizeInKB = 32, tileSize = (8, 8, 8)) ++
+  new WithMuonCores(1, location = InCluster(0), l0i = Some(L0iCacheConfig), l0d = Some(L0dCacheConfig), disabled = true) ++
+  new WithRadianceCluster(0, smemConfig = TapeoutSmemConfig, l1Config = L1CacheConfig) ++
+  new freechips.rocketchip.rocket.WithNSmallCores(1) ++
+  new RadianceBaseConfig
+)
+
 class TetheredRadianceTapeoutConfig extends Config(
   new chipyard.harness.WithAbsoluteFreqHarnessClockInstantiator ++   // use absolute freqs for sims in the harness
   new chipyard.harness.WithMultiChipSerialTL(0, 1) ++                // connect the serial-tl ports of the chips together
