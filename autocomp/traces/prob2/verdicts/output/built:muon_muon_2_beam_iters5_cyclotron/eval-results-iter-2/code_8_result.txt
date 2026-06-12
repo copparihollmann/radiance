@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n) * 4));\n      |                             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:143:66: error: cannot take the address of an rvalue of type 'float'\n  143 |       store_shared(S_smem_base + (row * 64 + j) * 4, *(uint32_t*)&(val * inv_sum));\n      |                                                                  ^ ~~~~~~~~~~~~~\nkernel.cpp:143:7: error: no matching function for call to 'store_shared'\n  143 |       store_shared(S_smem_base + (row * 64 + j) * 4, *(uint32_t*)&(val * inv_sum));\n      |       ^~~~~~~~~~~~\n/scratch/agustin/projects/radiance-kernels/lib/include/mu_intrinsics.h:22:13: note: candidate function not viable: requires 3 arguments, but 2 were provided\n   22 | inline void store_shared(uint32_t base, uint32_t offset, uint32_t data) {\n      |             ^            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:160:33: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  160 |         float s_val = *((float*)&load32_shared(S_smem_base + (row * 64 + k) * 4));\n      |                                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:161:33: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  161 |         float v_val = *((float*)&load32_shared(V_smem_base + (k * 64 + col) * 4));\n      |                                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n12 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

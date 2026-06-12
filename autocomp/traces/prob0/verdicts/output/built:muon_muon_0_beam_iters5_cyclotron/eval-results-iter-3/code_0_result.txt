@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:51:5: error: use of undeclared identifier 'kernel_impl'\n   51 |     kernel_impl<64, 64, 64>(args, tid_in_threadblock, threads_per_threadblock);\n      |     ^\nkernel.cpp:53:5: error: use of undeclared identifier 'kernel_fallback'\n   53 |     kernel_fallback(args, tid_in_threadblock, threads_per_threadblock);\n      |     ^\n2 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:64:9: error: use of undeclared identifier 'store_float_shared'\n   64 |         store_float_shared(smem_w + (ckk * 16 + oc) * 4, val);\n      |         ^\nkernel.cpp:101:9: error: use of undeclared identifier 'store_float_shared'\n  101 |         store_float_shared(addr, val);\n      |         ^\nkernel.cpp:145:23: error: use of undeclared identifier 'load_float_shared'\n  145 |         float w_val = load_float_shared(w_ptr);\n      |                       ^\nkernel.cpp:146:24: error: use of undeclared identifier 'load_float_shared'\n  146 |         float p0_val = load_float_shared(patch0_ptr);\n      |                        ^\nkernel.cpp:147:24: error: use of undeclared identifier 'load_float_shared'\n  147 |         float p1_val = load_float_shared(patch1_ptr);\n      |                        ^\nkernel.cpp:170:26: error: reinterpret_cast from '__global float *' to 'uint32_t *' (aka 'unsigned int *') is not allowed\n  170 |         uint32_t data = *reinterpret_cast<uint32_t*>(&a->w[i]);\n      |                          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:190:26: error: reinterpret_cast from '__global float *' to 'uint32_t *' (aka 'unsigned int *') is not allowed\n  190 |         uint32_t data = *reinterpret_cast<uint32_t*>(&a->in[in_idx]);\n      |                          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n7 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

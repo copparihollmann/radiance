@@ -1,0 +1,35 @@
+PROJECT = mxgemm
+
+MU_SRCS = mxgemm.cpp mxgemm_singletile.cpp \
+	  mxgemm.fp8.singletile.tm128tn128tk128.requant.cpp \
+	  mxgemm.fp8.singletile.tm128tn128tk256.fullout.cpp \
+	  mxgemm.fp8.singletile.tm128tn128tk256.requant.cpp \
+	  mxgemm.fp8.singletile.tm64tn64tk64.fullout.cpp \
+	  mxgemm.fp8.singletile.tm64tn64tk64.requant.cpp \
+	  mxgemm.fp8.m64n64k128.tm64tn64tk64.fullout.cpp \
+	  mxgemm.fp8.m128n128k512.tm128tn128tk256.fullout.cpp \
+	  mxgemm.fp6.singletile.tm128tn128tk128.fullout.cpp \
+	  mxgemm.fp6.m128n128k256.tm128tn128tk128.fullout.cpp \
+	  mxgemm.fp6.singletile.tm128tn128tk128.requant.cpp \
+	  mxgemm.fp6.singletile.tm128tn128tk512.fullout.cpp \
+	  mxgemm.fp6.m128n128k1024.tm128tn128tk512.fullout.cpp \
+	  mxgemm.fp6.singletile.tm128tn128tk512.requant.cpp \
+	  mxgemm.fp4.singletile.tm64tn64tk64.fullout.cpp \
+	  mxgemm.fp4.m64n64k128.tm64tn64tk64.fullout.cpp \
+	  mxgemm.fp4.singletile.tm64tn64tk64.requant.cpp \
+	  mxgemm.fp4.singletile.tm128tn128tk128.fullout.cpp \
+	  mxgemm.fp4.m128n128k256.tm128tn128tk128.fullout.cpp \
+	  mxgemm.fp4.singletile.tm128tn128tk128.requant.cpp \
+	  mxgemm.fp4.singletile.tm128tn128tk512.fullout.cpp \
+	  mxgemm.fp4.m128n128k1024.tm128tn128tk512.fullout.cpp \
+	  mxgemm.fp4.singletile.tm128tn128tk512.requant.cpp \
+	  mxgemm.flash_contention.cpp \
+	  mxgemm.simt_contention.cpp \
+	  mxgemm_smol.cpp \
+	  requant.cpp
+HOST_SRCS = host.cpp
+
+MXGEMM_MU_OBJS := $(addsuffix .mu.o,$(basename $(MU_SRCS)))
+$(MXGEMM_MU_OBJS): mxgemm_lib.hpp
+
+include ../common.mk

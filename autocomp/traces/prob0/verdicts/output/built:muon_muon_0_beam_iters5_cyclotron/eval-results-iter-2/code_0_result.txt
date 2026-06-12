@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nrenamable $x40, $x0, %bb.13\n\nbb.14.join_stub130:\n; predecessors: %bb.11, %bb.13\n  successors: %bb.15(0x50000000), %bb.8(0x30000000); %bb.15(62.50%), %bb.8(37.50%)\n  liveins: $x10, $x11, $x12, $x13, $x14, $x15, $x16, $x17, $x32, $x33, $x34, $x35, $x36, $x37, $x38\n  VX_JOIN killed renamable $x38\n  renamable $x39 = VX_SPLIT_N renamable $x34\n  BEQ renamable $x34, $x0, %bb.8\n\nbb.15.for.body44.epil.preheader:\n; predecessors: %bb.14\n  successors: %bb.16(0x80000000); %bb.16(100.00%)\n  liveins: $x10, $x11, $x12, $x13, $x14, $x15, $x16, $x17, $x32, $x33, $x34, $x35, $x36, $x37, $x39\n  renamable $x38 = CSRRS 3268, $x0\n  $x40 = ADDI $x15, 0\n\nbb.16.for.body44.epil:\n; predecessors: %bb.15, %bb.16\n  successors: %bb.8(0x04000000), %bb.16(0x7c000000); %bb.8(3.12%), %bb.16(96.88%)\n  liveins: $x10, $x11, $x12, $x13, $x14, $x15, $x16, $x17, $x32, $x33, $x34, $x35, $x36, $x37, $x38, $x39, $x40\n  renamable $x36 = nofpexcept FMADD_S_INX undef renamable $x10, undef renamable $x10, killed renamable $x36, 7, implicit $frm\n  renamable $x37 = nuw ADDI killed renamable $x37, 1\n  renamable $x40 = nsw ADDI killed renamable $x40, -1\n  renamable $x41 = SLTIU renamable $x40, 1\n  VX_PRED_N renamable $x41, renamable $x38\n  BEQ killed renamable $x41, $x0, %bb.16\n  PseudoBR %bb.8\n\nbb.17.join_stub132:\n; predecessors: %bb.9, %bb.6\n  liveins: $x14\n  VX_JOIN killed renamable $x14\n  PseudoRET\n\n# End machine code for function _ZL11kernel_bodyPvjjj.\n\n12 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

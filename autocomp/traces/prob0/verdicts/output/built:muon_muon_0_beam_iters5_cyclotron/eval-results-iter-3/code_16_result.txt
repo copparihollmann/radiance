@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:86:32: error: use of undeclared identifier 'load32_shared_offset'\n   86 |       float a0 = bits_to_float(load32_shared_offset(a_base, k * 4));\n      |                                ^\nkernel.cpp:87:32: error: use of undeclared identifier 'load32_shared_offset'\n   87 |       float b0 = bits_to_float(load32_shared_offset(b_base, k * 4));\n      |                                ^\nkernel.cpp:90:32: error: use of undeclared identifier 'load32_shared_offset'\n   90 |       float a1 = bits_to_float(load32_shared_offset(a_base, (k + 1) * 4));\n      |                                ^\nkernel.cpp:91:32: error: use of undeclared identifier 'load32_shared_offset'\n   91 |       float b1 = bits_to_float(load32_shared_offset(b_base, (k + 1) * 4));\n      |                                ^\n4 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

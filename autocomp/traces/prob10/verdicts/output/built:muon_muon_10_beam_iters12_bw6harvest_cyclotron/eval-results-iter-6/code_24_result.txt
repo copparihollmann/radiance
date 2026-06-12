@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n     store_shared(smem_B_offset, idx * 4, float_to_bits(val_b));\n      |                        ^\nkernel.cpp:105:59: error: use of undeclared identifier 'TILE_K'\n  105 |         const uint32_t a_base = smem_A_offset + ty * 8 * (TILE_K + 16) * 4; // Stride includes padding\n      |                                                           ^\nkernel.cpp:105:33: error: use of undeclared identifier 'smem_A_offset'\n  105 |         const uint32_t a_base = smem_A_offset + ty * 8 * (TILE_K + 16) * 4; // Stride includes padding\n      |                                 ^\nkernel.cpp:106:33: error: use of undeclared identifier 'smem_B_offset'\n  106 |         const uint32_t b_base = smem_B_offset + tx * 4;\n      |                                 ^\nkernel.cpp:111:34: error: use of undeclared identifier 'TILE_K'\n  111 |         for (uint32_t k = 0; k < TILE_K; k++) {\n      |                                  ^\nkernel.cpp:112:31: error: use of undeclared identifier 'bits_to_float'\n  112 |           const float b_val = bits_to_float(load32_shared(b_base + k * 128)); // b[k][tx]\n      |                               ^\nkernel.cpp:114:70: error: use of undeclared identifier 'TILE_K'\n  114 |           const float a0 = bits_to_float(load32_shared(a_base + 0 * (TILE_K + 16) * 4 + k * 4));\n      |                                                                      ^\nfatal error: too many errors emitted, stopping now [-ferror-limit=]\n20 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

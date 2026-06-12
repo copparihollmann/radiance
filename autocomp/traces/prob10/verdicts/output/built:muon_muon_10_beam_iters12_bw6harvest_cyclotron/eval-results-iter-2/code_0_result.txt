@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n error: use of undeclared identifier 'SMEM_C_OFFSET'\n  152 |         store_smem_float(SMEM_C_OFFSET + (thread_m * TILE_N + thread_n * elems_per_thread + 1) * 4, acc1);\n      |                          ^\nkernel.cpp:153:26: error: use of undeclared identifier 'SMEM_C_OFFSET'\n  153 |         store_smem_float(SMEM_C_OFFSET + (thread_m * TILE_N + thread_n * elems_per_thread + 2) * 4, acc2);\n      |                          ^\nkernel.cpp:154:26: error: use of undeclared identifier 'SMEM_C_OFFSET'\n  154 |         store_smem_float(SMEM_C_OFFSET + (thread_m * TILE_N + thread_n * elems_per_thread + 3) * 4, acc3);\n      |                          ^\nkernel.cpp:161:38: error: use of undeclared identifier 'SMEM_C_OFFSET'\n  161 |     float final_c0 = load_smem_float(SMEM_C_OFFSET + (thread_m * TILE_N + thread_n * elems_per_thread + 0) * 4);\n      |                                      ^\nkernel.cpp:162:38: error: use of undeclared identifier 'SMEM_C_OFFSET'\n  162 |     float final_c1 = load_smem_float(SMEM_C_OFFSET + (thread_m * TILE_N + thread_n * elems_per_thread + 1) * 4);\n      |                                      ^\nkernel.cpp:163:38: error: use of undeclared identifier 'SMEM_C_OFFSET'\n  163 |     float final_c2 = load_smem_float(SMEM_C_OFFSET + (thread_m * TILE_N + thread_n * elems_per_thread + 2) * 4);\n      |                                      ^\nfatal error: too many errors emitted, stopping now [-ferror-limit=]\n20 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

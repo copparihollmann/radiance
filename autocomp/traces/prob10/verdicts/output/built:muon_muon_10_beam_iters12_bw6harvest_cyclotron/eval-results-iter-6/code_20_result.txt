@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nnel.cpp:55:3: error: unknown type name '__local'\n   55 |   __local float* const s_A = reinterpret_cast<__local float*>(0);\n      |   ^\nkernel.cpp:55:47: error: unknown type name '__local'\n   55 |   __local float* const s_A = reinterpret_cast<__local float*>(0);\n      |                                               ^\nkernel.cpp:56:3: error: unknown type name '__local'\n   56 |   __local float* const s_B = s_A + 2 * BK; // 2 rows of BK elements\n      |   ^\nkernel.cpp:56:40: error: use of undeclared identifier 'BK'\n   56 |   __local float* const s_B = s_A + 2 * BK; // 2 rows of BK elements\n      |                                        ^\nkernel.cpp:65:56: error: use of undeclared identifier 'BK'\n   65 |     for (uint32_t k_outer = 0; k_outer < K; k_outer += BK) {\n      |                                                        ^\nkernel.cpp:100:44: error: use of undeclared identifier 'BK'\n  100 |       uint32_t a_base_offset = local_row * BK;     // Base offset for this thread's A row in s_A\n      |                                            ^\nkernel.cpp:101:35: error: use of undeclared identifier 'BK'\n  101 |       uint32_t k_end = (k_outer + BK > K) ? (K - k_outer) : BK;\n      |                                   ^\nkernel.cpp:101:61: error: use of undeclared identifier 'BK'\n  101 |       uint32_t k_end = (k_outer + BK > K) ? (K - k_outer) : BK;\n      |                                                             ^\n8 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n   |                  ^\nkernel.cpp:138:18: error: use of undeclared identifier 'load_float_shared'\n  138 |       float v0 = load_float_shared(addr);\n      |                  ^\nkernel.cpp:139:18: error: use of undeclared identifier 'load_float_shared'\n  139 |       float v1 = load_float_shared(addr + 4);\n      |                  ^\nkernel.cpp:142:7: error: use of undeclared identifier 'store_float_shared'\n  142 |       store_float_shared(addr, e0);\n      |       ^\nkernel.cpp:143:7: error: use of undeclared identifier 'store_float_shared'\n  143 |       store_float_shared(addr + 4, e1);\n      |       ^\nkernel.cpp:151:18: error: use of undeclared identifier 'load_float_shared'\n  151 |       float e0 = load_float_shared(addr);\n      |                  ^\nkernel.cpp:152:18: error: use of undeclared identifier 'load_float_shared'\n  152 |       float e1 = load_float_shared(addr + 4);\n      |                  ^\nkernel.cpp:153:7: error: use of undeclared identifier 'store_float_shared'\n  153 |       store_float_shared(addr, e0 * inv);\n      |       ^\nkernel.cpp:154:7: error: use of undeclared identifier 'store_float_shared'\n  154 |       store_float_shared(addr + 4, e1 * inv);\n      |       ^\nkernel.cpp:171:22: error: use of undeclared identifier 'load_float_shared'\n  171 |       float s_val0 = load_float_shared(s_addr);\n      |                      ^\nfatal error: too many errors emitted, stopping now [-ferror-limit=]\n20 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

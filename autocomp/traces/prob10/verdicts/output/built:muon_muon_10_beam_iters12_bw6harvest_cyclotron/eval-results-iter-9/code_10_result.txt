@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nel.cpp:99:28: error: use of undeclared identifier 'load_shared_float'\n   99 |           const float b1 = load_shared_float(1088 + (k * 64 + tid_col * 8 + 1) * 4);\n      |                            ^\nkernel.cpp:100:28: error: use of undeclared identifier 'load_shared_float'\n  100 |           const float b2 = load_shared_float(1088 + (k * 64 + tid_col * 8 + 2) * 4);\n      |                            ^\nkernel.cpp:101:28: error: use of undeclared identifier 'load_shared_float'\n  101 |           const float b3 = load_shared_float(1088 + (k * 64 + tid_col * 8 + 3) * 4);\n      |                            ^\nkernel.cpp:102:28: error: use of undeclared identifier 'load_shared_float'\n  102 |           const float b4 = load_shared_float(1088 + (k * 64 + tid_col * 8 + 4) * 4);\n      |                            ^\nkernel.cpp:103:28: error: use of undeclared identifier 'load_shared_float'\n  103 |           const float b5 = load_shared_float(1088 + (k * 64 + tid_col * 8 + 5) * 4);\n      |                            ^\nkernel.cpp:104:28: error: use of undeclared identifier 'load_shared_float'\n  104 |           const float b6 = load_shared_float(1088 + (k * 64 + tid_col * 8 + 6) * 4);\n      |                            ^\nkernel.cpp:105:28: error: use of undeclared identifier 'load_shared_float'\n  105 |           const float b7 = load_shared_float(1088 + (k * 64 + tid_col * 8 + 7) * 4);\n      |                            ^\n11 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

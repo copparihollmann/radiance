@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\ntack.29)\n  $x65 = LW $x2, 52 :: (load (s32) from %stack.30)\n  $x66 = LW $x2, 48 :: (load (s32) from %stack.31)\n  $x67 = LW $x2, 44 :: (load (s32) from %stack.32)\n  $x68 = LW $x2, 40 :: (load (s32) from %stack.33)\n  $x69 = LW $x2, 36 :: (load (s32) from %stack.34)\n  $x70 = LW $x2, 32 :: (load (s32) from %stack.35)\n  $x71 = LW $x2, 28 :: (load (s32) from %stack.36)\n  $x72 = LW $x2, 24 :: (load (s32) from %stack.37)\n  $x73 = LW $x2, 20 :: (load (s32) from %stack.38)\n  $x74 = LW $x2, 16 :: (load (s32) from %stack.39)\n  $x75 = LW $x2, 12 :: (load (s32) from %stack.40)\n  $x76 = LW $x2, 8 :: (load (s32) from %stack.41)\n  $x79 = LW $x2, 4 :: (load (s32) from %stack.42)\n  $x95 = LW $x2, 0 :: (load (s32) from %stack.43)\n  $x2 = frame-destroy ADDI $x2, 176\n  PseudoRET\n\n# End machine code for function _ZL11kernel_bodyPvjjj.\n\nclang++: warning: argument unused during compilation: '-nostartfiles' [-Wunused-command-line-argument]\nld.lld: error: undefined symbol: fmaf\n>>> referenced by kernel.cpp\n>>>               kernel.mu.o:(kernel_body(void*, unsigned int, unsigned int, unsigned int))\n>>> referenced by kernel.cpp\n>>>               kernel.mu.o:(kernel_body(void*, unsigned int, unsigned int, unsigned int))\n>>> referenced by kernel.cpp\n>>>               kernel.mu.o:(kernel_body(void*, unsigned int, unsigned int, unsigned int))\n>>> referenced 1 more times\nclang++: error: ld.lld command failed with exit code 1 (use -v to see invocation)\nmake: *** [../common.mk:107: kernel.radiance.elf] Error 1\n"
+}

@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n   ^\nkernel.cpp:70:31: error: use of undeclared identifier 'K_CONST'\n   70 |       float val = args->A[r * K_CONST + kk + c];\n      |                               ^\nkernel.cpp:75:47: error: use of undeclared identifier 'BK_CONST'\n   75 |     for (uint32_t i = tid_in_threadblock; i < BK_CONST * N_CONST; i += threads_per_threadblock) {\n      |                                               ^\nkernel.cpp:75:58: error: use of undeclared identifier 'N_CONST'\n   75 |     for (uint32_t i = tid_in_threadblock; i < BK_CONST * N_CONST; i += threads_per_threadblock) {\n      |                                                          ^\nkernel.cpp:76:24: error: use of undeclared identifier 'N_CONST'\n   76 |       uint32_t r = i / N_CONST;  // Optimized to shifts\n      |                        ^\nkernel.cpp:77:24: error: use of undeclared identifier 'N_CONST'\n   77 |       uint32_t c = i % N_CONST;  // Optimized to bitwise AND\n      |                        ^\nkernel.cpp:78:38: error: use of undeclared identifier 'N_CONST'\n   78 |       float val = args->B[(kk + r) * N_CONST + c];\n      |                                      ^\nkernel.cpp:86:51: error: use of undeclared identifier 'M_CONST'\n   86 |     for (uint32_t idx = tid_in_threadblock; idx < M_CONST * N_CONST; idx += threads_per_threadblock) {\n      |                                                   ^\nfatal error: too many errors emitted, stopping now [-ferror-limit=]\n20 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

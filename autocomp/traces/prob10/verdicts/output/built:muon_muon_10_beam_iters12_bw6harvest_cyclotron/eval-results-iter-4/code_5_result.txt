@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nx = tid; idx < (M_Tile * N_Tile); idx += 128) {\n      |                                                ^\nkernel.cpp:106:23: error: use of undeclared identifier 'load_shared_float'\n  106 |           float acc = load_shared_float(C_SMEM_BASE + (idx << 2));\n      |                       ^\nkernel.cpp:113:48: error: use of undeclared identifier 'K_Tile'\n  113 |           for (uint32_t k_inner = 0; k_inner < K_Tile; ++k_inner) {\n      |                                                ^\nkernel.cpp:114:29: error: use of undeclared identifier 'load_shared_float'\n  114 |               float a_val = load_shared_float(a_ptr_base);\n      |                             ^\nkernel.cpp:115:29: error: use of undeclared identifier 'load_shared_float'\n  115 |               float b_val = load_shared_float(b_ptr_base);\n      |                             ^\nkernel.cpp:122:11: error: use of undeclared identifier 'store_shared_float'\n  122 |           store_shared_float(C_SMEM_BASE + (idx << 2), acc);\n      |           ^\nkernel.cpp:129:31: error: use of undeclared identifier 'M_Tile'\n  129 |   for (uint32_t i = tid; i < (M_Tile * N_Tile); i += 128) {\n      |                               ^\nkernel.cpp:129:40: error: use of undeclared identifier 'N_Tile'\n  129 |   for (uint32_t i = tid; i < (M_Tile * N_Tile); i += 128) {\n      |                                        ^\nfatal error: too many errors emitted, stopping now [-ferror-limit=]\n20 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

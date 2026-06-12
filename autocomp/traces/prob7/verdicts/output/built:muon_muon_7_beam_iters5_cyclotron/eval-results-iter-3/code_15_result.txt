@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n);\n      |                     ^\nkernel.cpp:132:21: error: use of undeclared identifier 'as_float'\n  132 |         float val = as_float(load32_shared(smem_S_base + s_local_offset + j * sizeof(float)));\n      |                     ^\nkernel.cpp:140:21: error: use of undeclared identifier 'as_float'\n  140 |         float val = as_float(load32_shared(addr));\n      |                     ^\nkernel.cpp:143:31: error: use of undeclared identifier 'as_uint'\n  143 |         store_shared(addr, 0, as_uint(exp_val));\n      |                               ^\nkernel.cpp:151:21: error: use of undeclared identifier 'as_float'\n  151 |         float val = as_float(load32_shared(addr));\n      |                     ^\nkernel.cpp:152:31: error: use of undeclared identifier 'as_uint'\n  152 |         store_shared(addr, 0, as_uint(val * inv_sum));\n      |                               ^\nkernel.cpp:161:58: error: use of undeclared identifier 'as_uint'\n  161 |         store_shared(smem_V_base + i * sizeof(float), 0, as_uint(V_global[i]));\n      |                                                          ^\nkernel.cpp:177:27: error: use of undeclared identifier 'as_float'\n  177 |             float s_val = as_float(load32_shared(s_addr));\n      |                           ^\nkernel.cpp:178:27: error: use of undeclared identifier 'as_float'\n  178 |             float v_val = as_float(load32_shared(v_addr));\n      |                           ^\n14 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

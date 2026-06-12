@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:83:9: error: use of undeclared identifier 'store32_shared'\n   83 |         store32_shared(SMEM_C_ADDR, i * 4, 0);\n      |         ^\nkernel.cpp:100:11: error: use of undeclared identifier 'store32_shared'\n  100 |           store32_shared(SMEM_A_ADDR, i * 4, data);\n      |           ^\nkernel.cpp:112:11: error: use of undeclared identifier 'store32_shared'\n  112 |           store32_shared(SMEM_B_ADDR, i * 4, data);\n      |           ^\nkernel.cpp:133:9: error: use of undeclared identifier 'store32_shared'\n  133 |         store32_shared(c_addr, 0, prev_c + acc);\n      |         ^\n4 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

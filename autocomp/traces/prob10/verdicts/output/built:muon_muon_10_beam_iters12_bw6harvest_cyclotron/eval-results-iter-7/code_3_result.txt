@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:90:15: error: use of undeclared identifier 'As'\n   90 |               As[tr][col_offset] = A_tile_base[tr * K + local_k + col_offset];\n      |               ^\nkernel.cpp:99:15: error: use of undeclared identifier 'Bs'\n   99 |               Bs[col_offset][tc] = B_tile_base[(local_k + col_offset) * N + tc];\n      |               ^\nkernel.cpp:110:30: error: use of undeclared identifier 'Bs'\n  110 |           const float bval = Bs[kk][tc];\n      |                              ^\nkernel.cpp:111:19: error: use of undeclared identifier 'As'\n  111 |           acc0 += As[tr][kk] * bval;\n      |                   ^\nkernel.cpp:113:21: error: use of undeclared identifier 'As'\n  113 |             acc1 += As[tr + 8][kk] * bval;\n      |                     ^\n5 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

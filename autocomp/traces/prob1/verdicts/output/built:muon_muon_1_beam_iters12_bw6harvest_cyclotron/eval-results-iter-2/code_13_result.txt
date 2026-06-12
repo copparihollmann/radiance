@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n(w_ptr2 + 4));\n      |         ^~~~~~~~\nkernel.cpp:132:9: error: ISO C++17 does not allow 'register' storage class specifier [-Wregister]\n  132 |         register float p_val_k1  = __builtin_bit_cast(float, load32_shared(p_ptr + 64)); // stride 16*4\n      |         ^~~~~~~~\nkernel.cpp:158:9: error: ISO C++17 does not allow 'register' storage class specifier [-Wregister]\n  158 |         register float acc = 0.0f;\n      |         ^~~~~~~~\nkernel.cpp:159:9: error: ISO C++17 does not allow 'register' storage class specifier [-Wregister]\n  159 |         register uint32_t w_ptr = smem_w + oc * CKK * 4;\n      |         ^~~~~~~~\nkernel.cpp:160:9: error: ISO C++17 does not allow 'register' storage class specifier [-Wregister]\n  160 |         register uint32_t p_ptr = local_p * 4;\n      |         ^~~~~~~~\nkernel.cpp:162:14: error: ISO C++17 does not allow 'register' storage class specifier [-Wregister]\n  162 |         for (register uint32_t k = 0; k < CKK; ++k) {\n      |              ^~~~~~~~\nkernel.cpp:163:11: error: ISO C++17 does not allow 'register' storage class specifier [-Wregister]\n  163 |           register float w_val = __builtin_bit_cast(float, load32_shared(w_ptr));\n      |           ^~~~~~~~\nkernel.cpp:164:11: error: ISO C++17 does not allow 'register' storage class specifier [-Wregister]\n  164 |           register float p_val = __builtin_bit_cast(float, load32_shared(p_ptr));\n      |           ^~~~~~~~\n18 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

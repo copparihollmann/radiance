@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n((k_inner * 64 + base_cs_c + 2) << 2)));\n      |                           ^\nkernel.cpp:163:27: error: use of undeclared identifier 'bits_to_float'\n  163 |           acc3 += a_val * bits_to_float(load32_shared(Bs_base + ((k_inner * 64 + base_cs_c + 3) << 2)));\n      |                           ^\nkernel.cpp:167:62: error: use of undeclared identifier 'float_to_bits'\n  167 |         store_shared(Cs_base + ((base_out_idx + 0) << 2), 0, float_to_bits(acc0));\n      |                                                              ^\nkernel.cpp:168:62: error: use of undeclared identifier 'float_to_bits'\n  168 |         store_shared(Cs_base + ((base_out_idx + 1) << 2), 0, float_to_bits(acc1));\n      |                                                              ^\nkernel.cpp:169:62: error: use of undeclared identifier 'float_to_bits'\n  169 |         store_shared(Cs_base + ((base_out_idx + 2) << 2), 0, float_to_bits(acc2));\n      |                                                              ^\nkernel.cpp:170:62: error: use of undeclared identifier 'float_to_bits'\n  170 |         store_shared(Cs_base + ((base_out_idx + 3) << 2), 0, float_to_bits(acc3));\n      |                                                              ^\nkernel.cpp:186:27: error: use of undeclared identifier 'bits_to_float'\n  186 |         const float val = bits_to_float(load32_shared(Cs_base + (cs_flat_idx << 2)));\n      |                           ^\n17 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

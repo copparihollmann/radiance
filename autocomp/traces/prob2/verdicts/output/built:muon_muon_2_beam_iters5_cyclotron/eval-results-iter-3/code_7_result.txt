@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:143:7: error: no matching function for call to 'store_shared'\n  143 |       store_shared(row_base + j * 4, *((uint32_t*)&e));\n      |       ^~~~~~~~~~~~\n/scratch/agustin/projects/radiance-kernels/lib/include/mu_intrinsics.h:22:13: note: candidate function not viable: requires 3 arguments, but 2 were provided\n   22 | inline void store_shared(uint32_t base, uint32_t offset, uint32_t data) {\n      |             ^            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:153:7: error: no matching function for call to 'store_shared'\n  153 |       store_shared(row_base + j * 4, *((uint32_t*)&normalized));\n      |       ^~~~~~~~~~~~\n/scratch/agustin/projects/radiance-kernels/lib/include/mu_intrinsics.h:22:13: note: candidate function not viable: requires 3 arguments, but 2 were provided\n   22 | inline void store_shared(uint32_t base, uint32_t offset, uint32_t data) {\n      |             ^            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n2 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

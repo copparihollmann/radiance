@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:83:37: error: use of undeclared identifier 'smem_A_offset'\n   83 |                 uint32_t s_addr_A = smem_A_offset + (a_row_thread * 64 + a_col_lane) * sizeof(float);\n      |                                     ^\nkernel.cpp:97:37: error: use of undeclared identifier 'smem_B_offset'\n   97 |                 uint32_t s_addr_B = smem_B_offset + (warp_id * 16 + lane_id) * sizeof(float);\n      |                                     ^\nkernel.cpp:114:32: error: use of undeclared identifier 'smem_A_offset'\n  114 |             uint32_t s_ptr_A = smem_A_offset + a_row_offset;\n      |                                ^\nkernel.cpp:115:32: error: use of undeclared identifier 'smem_B_offset'\n  115 |             uint32_t s_ptr_B = smem_B_offset + b_col_offset;\n      |                                ^\n4 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

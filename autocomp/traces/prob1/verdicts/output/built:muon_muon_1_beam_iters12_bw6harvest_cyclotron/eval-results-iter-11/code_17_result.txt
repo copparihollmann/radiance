@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:67:37: error: use of undeclared identifier 'MU_SHARED_BASE'\n   67 |   const uint32_t smem_w_start     = MU_SHARED_BASE;\n      |                                     ^\n1 error generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

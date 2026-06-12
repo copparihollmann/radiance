@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nerror: use of undeclared identifier 'K_CONST'\n   70 |             smem_A_base[global_idx] = args->A[a_row * K_CONST + k_base + a_col];\n      |                                                       ^\nkernel.cpp:82:53: error: use of undeclared identifier 'N_CONST'\n   82 |           if ((k_base + b_row) < K_CONST && b_col < N_CONST) {\n      |                                                     ^\nkernel.cpp:82:34: error: use of undeclared identifier 'K_CONST'\n   82 |           if ((k_base + b_row) < K_CONST && b_col < N_CONST) {\n      |                                  ^\nkernel.cpp:83:66: error: use of undeclared identifier 'N_CONST'\n   83 |             smem_B_base[global_idx] = args->B[(k_base + b_row) * N_CONST + b_col];\n      |                                                                  ^\nkernel.cpp:94:34: error: use of undeclared identifier 'BK'\n   94 |         for (uint32_t k = 0; k < BK; k++) {\n      |                                  ^\nkernel.cpp:112:19: error: use of undeclared identifier 'M_CONST'\n  112 |       if (c_row < M_CONST && c_col < N_CONST) {\n      |                   ^\nkernel.cpp:112:38: error: use of undeclared identifier 'N_CONST'\n  112 |       if (c_row < M_CONST && c_col < N_CONST) {\n      |                                      ^\nkernel.cpp:113:25: error: use of undeclared identifier 'N_CONST'\n  113 |         args->C[c_row * N_CONST + c_col] = acc;\n      |                         ^\n17 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

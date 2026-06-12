@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:57:3: error: unknown type name '__local'\n   57 |   __local float* const s_A = reinterpret_cast<__local float*>(0);\n      |   ^\nkernel.cpp:57:47: error: unknown type name '__local'\n   57 |   __local float* const s_A = reinterpret_cast<__local float*>(0);\n      |                                               ^\nkernel.cpp:58:3: error: unknown type name '__local'\n   58 |   __local float* const s_B = s_A + 2 * BK;\n      |   ^\nkernel.cpp:58:40: error: use of undeclared identifier 'BK'\n   58 |   __local float* const s_B = s_A + 2 * BK;\n      |                                        ^\nkernel.cpp:68:56: error: use of undeclared identifier 'BK'\n   68 |     for (uint32_t k_outer = 0; k_outer < K; k_outer += BK) {\n      |                                                        ^\nkernel.cpp:102:34: error: use of undeclared identifier 'BK'\n  102 |         for (uint32_t k = 0; k < BK; k++) {\n      |                                  ^\n6 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

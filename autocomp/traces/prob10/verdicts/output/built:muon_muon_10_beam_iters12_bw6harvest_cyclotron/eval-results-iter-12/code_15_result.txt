@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nlared identifier 'fmaf'\n  119 |           acc4 = fmaf(a1, bv, acc4);\n      |                  ^\nkernel.cpp:121:16: error: use of undeclared identifier 'bits_to_float'\n  121 |           bv = bits_to_float(load32_shared(b_base + b_stride + off));\n      |                ^\nkernel.cpp:122:18: error: use of undeclared identifier 'fmaf'\n  122 |           acc1 = fmaf(a0, bv, acc1);\n      |                  ^\nkernel.cpp:123:18: error: use of undeclared identifier 'fmaf'\n  123 |           acc5 = fmaf(a1, bv, acc5);\n      |                  ^\nkernel.cpp:125:16: error: use of undeclared identifier 'bits_to_float'\n  125 |           bv = bits_to_float(load32_shared(b_base + 2 * b_stride + off));\n      |                ^\nkernel.cpp:126:18: error: use of undeclared identifier 'fmaf'\n  126 |           acc2 = fmaf(a0, bv, acc2);\n      |                  ^\nkernel.cpp:127:18: error: use of undeclared identifier 'fmaf'\n  127 |           acc6 = fmaf(a1, bv, acc6);\n      |                  ^\nkernel.cpp:129:16: error: use of undeclared identifier 'bits_to_float'\n  129 |           bv = bits_to_float(load32_shared(b_base + 3 * b_stride + off));\n      |                ^\nkernel.cpp:130:18: error: use of undeclared identifier 'fmaf'\n  130 |           acc3 = fmaf(a0, bv, acc3);\n      |                  ^\nkernel.cpp:131:18: error: use of undeclared identifier 'fmaf'\n  131 |           acc7 = fmaf(a1, bv, acc7);\n      |                  ^\n16 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

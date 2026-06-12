@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\ned_float(C_OFFSET_BYTES + (idx << 2));\n      |                         ^\nkernel.cpp:108:50: error: use of undeclared identifier 'TILE_K'\n  108 |             for (uint32_t k_inner = 0; k_inner < TILE_K; ++k_inner) {\n      |                                                  ^\nkernel.cpp:109:31: error: use of undeclared identifier 'load_shared_float'\n  109 |                 float a_val = load_shared_float(a_ptr_base);\n      |                               ^\nkernel.cpp:110:31: error: use of undeclared identifier 'load_shared_float'\n  110 |                 float b_val = load_shared_float(b_ptr_base);\n      |                               ^\nkernel.cpp:117:13: error: use of undeclared identifier 'store_shared_float'\n  117 |             store_shared_float(C_OFFSET_BYTES + (idx << 2), acc);\n      |             ^\nkernel.cpp:125:51: error: use of undeclared identifier 'TILE_M'\n  125 |     for (uint32_t idx = tid_in_threadblock; idx < TILE_M * TILE_N; idx += 128) {\n      |                                                   ^\nkernel.cpp:125:60: error: use of undeclared identifier 'TILE_N'\n  125 |     for (uint32_t idx = tid_in_threadblock; idx < TILE_M * TILE_N; idx += 128) {\n      |                                                            ^\nkernel.cpp:126:21: error: use of undeclared identifier 'load_shared_float'\n  126 |         float val = load_shared_float(C_OFFSET_BYTES + (idx << 2));\n      |                     ^\n19 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n use of undeclared identifier 'SMEM_C_OFFSET'\n   60 |       store_shared_float(SMEM_C_OFFSET + idx * 4, 0.0f);\n      |                          ^\nkernel.cpp:75:30: error: use of undeclared identifier 'SMEM_A_OFFSET'\n   75 |           store_shared_float(SMEM_A_OFFSET + idx * 4, val);\n      |                              ^\nkernel.cpp:86:30: error: use of undeclared identifier 'SMEM_B_OFFSET'\n   86 |           store_shared_float(SMEM_B_OFFSET + idx * 4, val);\n      |                              ^\nkernel.cpp:99:35: error: use of undeclared identifier 'SMEM_C_OFFSET'\n   99 |           acc = load_shared_float(SMEM_C_OFFSET + idx * 4);\n      |                                   ^\nkernel.cpp:103:37: error: use of undeclared identifier 'SMEM_A_OFFSET'\n  103 |               a = load_shared_float(SMEM_A_OFFSET + (row * 16 + k) * 4);\n      |                                     ^\nkernel.cpp:104:37: error: use of undeclared identifier 'SMEM_B_OFFSET'\n  104 |               b = load_shared_float(SMEM_B_OFFSET + (k * 64 + col) * 4);\n      |                                     ^\nkernel.cpp:108:30: error: use of undeclared identifier 'SMEM_C_OFFSET'\n  108 |           store_shared_float(SMEM_C_OFFSET + idx * 4, acc);\n      |                              ^\nkernel.cpp:119:31: error: use of undeclared identifier 'SMEM_C_OFFSET'\n  119 |       val = load_shared_float(SMEM_C_OFFSET + idx * 4);\n      |                               ^\n8 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

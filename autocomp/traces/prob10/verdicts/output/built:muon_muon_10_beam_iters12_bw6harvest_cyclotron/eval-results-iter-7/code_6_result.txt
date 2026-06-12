@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:91:11: error: no matching function for call to 'store_shared'\n   91 |           store_shared(smem_a + global_idx * 4, __builtin_bit_cast(uint32_t, val));\n      |           ^~~~~~~~~~~~\n/scratch/agustin/projects/radiance-kernels/lib/include/mu_intrinsics.h:22:13: note: candidate function not viable: requires 3 arguments, but 2 were provided\n   22 | inline void store_shared(uint32_t base, uint32_t offset, uint32_t data) {\n      |             ^            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:103:11: error: no matching function for call to 'store_shared'\n  103 |           store_shared(smem_b + global_idx * 4, __builtin_bit_cast(uint32_t, val));\n      |           ^~~~~~~~~~~~\n/scratch/agustin/projects/radiance-kernels/lib/include/mu_intrinsics.h:22:13: note: candidate function not viable: requires 3 arguments, but 2 were provided\n   22 | inline void store_shared(uint32_t base, uint32_t offset, uint32_t data) {\n      |             ^            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n2 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

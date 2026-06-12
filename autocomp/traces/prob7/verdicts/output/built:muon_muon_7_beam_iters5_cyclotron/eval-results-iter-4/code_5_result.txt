@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:107:19: error: use of undeclared identifier 'fmaxf'\n  107 |     float m_new = fmaxf(s_ij, m);\n      |                   ^\n1 error generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

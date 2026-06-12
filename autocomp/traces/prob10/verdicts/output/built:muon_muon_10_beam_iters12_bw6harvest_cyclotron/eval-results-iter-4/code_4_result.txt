@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\ntore_shared_float'\n   78 |       store_shared_float(A_smem_base + (flat_idx << 2), val);\n      |       ^\nkernel.cpp:86:41: error: use of undeclared identifier 'N_CONST'\n   86 |       uint32_t gidx = (k_outer + row) * N_CONST + col;\n      |                                         ^\nkernel.cpp:88:7: error: use of undeclared identifier 'store_shared_float'\n   88 |       store_shared_float(B_smem_base + (flat_idx << 2), val);\n      |       ^\nkernel.cpp:99:19: error: use of undeclared identifier 'load_shared_float'\n   99 |       float acc = load_shared_float(C_smem_base + (idx << 2));\n      |                   ^\nkernel.cpp:110:32: error: use of undeclared identifier 'BK_CONST'\n  110 |       for (uint32_t k = 0; k < BK_CONST; ++k) {\n      |                                ^\nkernel.cpp:111:23: error: use of undeclared identifier 'load_shared_float'\n  111 |         float a_val = load_shared_float(a_ptr);\n      |                       ^\nkernel.cpp:112:23: error: use of undeclared identifier 'load_shared_float'\n  112 |         float b_val = load_shared_float(b_ptr);\n      |                       ^\nkernel.cpp:118:7: error: use of undeclared identifier 'store_shared_float'\n  118 |       store_shared_float(C_smem_base + (idx << 2), acc);\n      |       ^\nkernel.cpp:127:17: error: use of undeclared identifier 'load_shared_float'\n  127 |     float val = load_shared_float(C_smem_base + (idx << 2));\n      |                 ^\n13 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

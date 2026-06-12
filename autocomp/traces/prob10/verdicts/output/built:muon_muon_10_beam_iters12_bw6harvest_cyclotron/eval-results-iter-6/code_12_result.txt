@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:59:30: error: use of undeclared identifier 'sdata'\n   59 |   __shared float* const As = sdata;\n      |                              ^\nkernel.cpp:60:30: error: use of undeclared identifier 'sdata'\n   60 |   __shared float* const Bs = sdata + 1088;\n      |                              ^\nkernel.cpp:61:30: error: use of undeclared identifier 'sdata'\n   61 |   __shared float* const Cs = sdata + 1088 + 1040;\n      |                              ^\n3 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

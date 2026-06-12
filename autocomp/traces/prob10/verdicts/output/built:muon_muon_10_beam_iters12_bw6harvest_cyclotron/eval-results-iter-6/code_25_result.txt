@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n\nkernel.cpp:100:24: error: use of undeclared identifier 'smem_B'\n  100 |           store_shared(smem_B, smem_addr, float_to_bits(val_b));\n      |                        ^\nkernel.cpp:107:52: error: use of undeclared identifier 'SMEM_PAD'\n  107 |         const uint32_t a_row_base = ty * 2 * (16 + SMEM_PAD) * 4;\n      |                                                    ^\nkernel.cpp:111:45: error: use of undeclared identifier 'SMEM_PAD'\n  111 |           const uint32_t b_addr = k * (16 + SMEM_PAD) * 4 + b_col_base;\n      |                                             ^\nkernel.cpp:112:59: error: use of undeclared identifier 'smem_B'\n  112 |           const float b_val = bits_to_float(load32_shared(smem_B + b_addr));\n      |                                                           ^\nkernel.cpp:116:60: error: use of undeclared identifier 'smem_A'\n  116 |           const float a_val0 = bits_to_float(load32_shared(smem_A + a_addr0));\n      |                                                            ^\nkernel.cpp:120:52: error: use of undeclared identifier 'SMEM_PAD'\n  120 |           const uint32_t a_addr1 = a_addr0 + (16 + SMEM_PAD) * 4;\n      |                                                    ^\nkernel.cpp:121:60: error: use of undeclared identifier 'smem_A'\n  121 |           const float a_val1 = bits_to_float(load32_shared(smem_A + a_addr1));\n      |                                                            ^\n13 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

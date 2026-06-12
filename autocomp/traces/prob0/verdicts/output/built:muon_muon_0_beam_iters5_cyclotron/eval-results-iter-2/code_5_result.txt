@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:63:10: error: cannot initialize a variable of type 'float *' with an lvalue of type '__global float *'\n   63 |   float* C_global = args->C;\n      |          ^          ~~~~~~~\n1 error generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

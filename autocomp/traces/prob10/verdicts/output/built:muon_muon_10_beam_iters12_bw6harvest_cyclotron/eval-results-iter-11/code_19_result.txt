@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nclared identifier 'store_shared_float'\n   99 |                store_shared_float(a_addr_0, args->A[global_idx_0]);\n      |                ^\nkernel.cpp:107:16: error: use of undeclared identifier 'store_shared_float'\n  107 |                store_shared_float(a_addr_1, args->A[global_idx_1]);\n      |                ^\nkernel.cpp:122:17: error: use of undeclared identifier 'store_shared_float'\n  122 |                 store_shared_float(b_addr, args->B[global_idx]);\n      |                 ^\nkernel.cpp:140:33: error: use of undeclared identifier 'load32_shared_as_float'\n  140 |             const float a_val = load32_shared_as_float(a_addr);\n      |                                 ^\nkernel.cpp:141:33: error: use of undeclared identifier 'load32_shared_as_float'\n  141 |             const float b_val = load32_shared_as_float(b_addr);\n      |                                 ^\nkernel.cpp:158:31: error: use of undeclared identifier 'load32_shared_as_float'\n  158 |         const float old_val = load32_shared_as_float(c_smem_addr);\n      |                               ^\nkernel.cpp:159:9: error: use of undeclared identifier 'store_shared_float'\n  159 |         store_shared_float(c_smem_addr, old_val + acc);\n      |         ^\nkernel.cpp:176:33: error: use of undeclared identifier 'load32_shared_as_float'\n  176 |           args->C[global_idx] = load32_shared_as_float(c_smem_addr);\n      |                                 ^\n9 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

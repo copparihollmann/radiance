@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nidentifier 'SMEM_REDUCE_BASE'\n  111 |             float sibling_max = __builtin_bit_cast(float, load32_shared(SMEM_REDUCE_BASE + (tid_in_threadblock ^ 1) * 4));\n      |                                                                         ^\nkernel.cpp:119:30: error: use of undeclared identifier 'SMEM_SCRATCH_BASE'\n  119 |                 store_shared(SMEM_SCRATCH_BASE + row * SEQ * 4 + c * 4, __builtin_bit_cast(uint32_t, e));\n      |                              ^\nkernel.cpp:124:26: error: use of undeclared identifier 'SMEM_REDUCE_BASE'\n  124 |             store_shared(SMEM_REDUCE_BASE + tid_in_threadblock * 4, __builtin_bit_cast(uint32_t, local_sum));\n      |                          ^\nkernel.cpp:128:73: error: use of undeclared identifier 'SMEM_REDUCE_BASE'\n  128 |             float sibling_sum = __builtin_bit_cast(float, load32_shared(SMEM_REDUCE_BASE + (tid_in_threadblock ^ 1) * 4));\n      |                                                                         ^\nkernel.cpp:135:30: error: use of undeclared identifier 'SMEM_SCRATCH_BASE'\n  135 |                 store_shared(SMEM_SCRATCH_BASE + row * SEQ * 4 + c * 4, __builtin_bit_cast(uint32_t, e * inv_sum));\n      |                              ^\nkernel.cpp:154:42: error: use of undeclared identifier 'SMEM_SCRATCH_BASE'\n  154 |             const uint32_t p_row_start = SMEM_SCRATCH_BASE + i * SEQ * 4;\n      |                                          ^\n9 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

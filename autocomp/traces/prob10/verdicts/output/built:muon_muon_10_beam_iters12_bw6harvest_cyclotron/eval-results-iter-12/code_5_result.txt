@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:57:18: error: expected unqualified-id\n   57 |   const uint32_t NUM_THREADS = threads_per_threadblock;\n      |                  ^\n/scratch/agustin/projects/radiance-kernels/lib/include/VX_config.h:95:21: note: expanded from macro 'NUM_THREADS'\n   95 | #define NUM_THREADS 8\n      |                     ^\n1 error generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

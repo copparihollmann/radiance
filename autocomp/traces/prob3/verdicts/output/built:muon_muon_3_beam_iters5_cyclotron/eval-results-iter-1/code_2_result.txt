@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:88:42: error: invalid lvalue in asm output\n   88 |     asm volatile(\"flw %0, %1(%2)\" : \"=f\"(scale) : \"I\"(0), \"r\"(&a->K[i])); // dummy load to use scale reg\n      |                                          ^~~~~\n1 error generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

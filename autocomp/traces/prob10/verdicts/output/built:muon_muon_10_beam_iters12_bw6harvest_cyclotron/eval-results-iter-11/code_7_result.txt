@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n)\n  $x18 = LW $x2, 112 :: (load (s32) from %stack.3)\n  $x19 = LW $x2, 108 :: (load (s32) from %stack.4)\n  $x20 = LW $x2, 104 :: (load (s32) from %stack.5)\n  $x21 = LW $x2, 100 :: (load (s32) from %stack.6)\n  $x22 = LW $x2, 96 :: (load (s32) from %stack.7)\n  $x23 = LW $x2, 92 :: (load (s32) from %stack.8)\n  $x24 = LW $x2, 88 :: (load (s32) from %stack.9)\n  $x25 = LW $x2, 84 :: (load (s32) from %stack.10)\n  $x26 = LW $x2, 80 :: (load (s32) from %stack.11)\n  $x27 = LW $x2, 76 :: (load (s32) from %stack.12)\n  $x48 = LW $x2, 72 :: (load (s32) from %stack.13)\n  $x49 = LW $x2, 68 :: (load (s32) from %stack.14)\n  $x50 = LW $x2, 64 :: (load (s32) from %stack.15)\n  $x51 = LW $x2, 60 :: (load (s32) from %stack.16)\n  $x52 = LW $x2, 56 :: (load (s32) from %stack.17)\n  $x53 = LW $x2, 52 :: (load (s32) from %stack.18)\n  $x54 = LW $x2, 48 :: (load (s32) from %stack.19)\n  $x55 = LW $x2, 44 :: (load (s32) from %stack.20)\n  $x56 = LW $x2, 40 :: (load (s32) from %stack.21)\n  $x57 = LW $x2, 36 :: (load (s32) from %stack.22)\n  $x58 = LW $x2, 32 :: (load (s32) from %stack.23)\n  $x59 = LW $x2, 28 :: (load (s32) from %stack.24)\n  $x60 = LW $x2, 24 :: (load (s32) from %stack.25)\n  $x61 = LW $x2, 20 :: (load (s32) from %stack.26)\n  $x63 = LW $x2, 16 :: (load (s32) from %stack.27)\n  $x95 = LW $x2, 12 :: (load (s32) from %stack.28)\n  $x2 = frame-destroy ADDI $x2, 128\n  PseudoRET\n\n# End machine code for function _ZL11kernel_bodyPvjjj.\n\n20 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

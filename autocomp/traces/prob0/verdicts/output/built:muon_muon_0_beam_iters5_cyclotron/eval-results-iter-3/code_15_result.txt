@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n* 4));\n      |                                       ^\nkernel.cpp:101:39: error: use of undeclared identifier 'load32_shared_offset'\n  101 |       acc2 += a_elem0 * bits_to_float(load32_shared_offset(b0_base, (k * 65 + 32 * 65) * 4));\n      |                                       ^\nkernel.cpp:102:39: error: use of undeclared identifier 'load32_shared_offset'\n  102 |       acc3 += a_elem0 * bits_to_float(load32_shared_offset(b0_base, (k * 65 + 48 * 65) * 4));\n      |                                       ^\nkernel.cpp:104:39: error: use of undeclared identifier 'load32_shared_offset'\n  104 |       acc0 += a_elem1 * bits_to_float(load32_shared_offset(b0_base, (k + 1) * 4));\n      |                                       ^\nkernel.cpp:105:39: error: use of undeclared identifier 'load32_shared_offset'\n  105 |       acc1 += a_elem1 * bits_to_float(load32_shared_offset(b0_base, ((k + 1) * 65 + 16 * 65) * 4));\n      |                                       ^\nkernel.cpp:106:39: error: use of undeclared identifier 'load32_shared_offset'\n  106 |       acc2 += a_elem1 * bits_to_float(load32_shared_offset(b0_base, ((k + 1) * 65 + 32 * 65) * 4));\n      |                                       ^\nkernel.cpp:107:39: error: use of undeclared identifier 'load32_shared_offset'\n  107 |       acc3 += a_elem1 * bits_to_float(load32_shared_offset(b0_base, ((k + 1) * 65 + 48 * 65) * 4));\n      |                                       ^\n12 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nts_to_float(first_val_bits);\n      |               ^\nkernel.cpp:138:23: error: use of undeclared identifier 'bits_to_float'\n  138 |       const float v = bits_to_float(val_bits);\n      |                       ^\nkernel.cpp:147:29: error: use of undeclared identifier 'bits_to_float'\n  147 |       const float shifted = bits_to_float(val_bits) - m;\n      |                             ^\nkernel.cpp:149:72: error: use of undeclared identifier 'float_to_bits'\n  149 |       asm volatile(\"sw.shared %1, 0(%0)\" :: \"r\"(row_base + j * 4), \"r\"(float_to_bits(e)) : \"memory\");\n      |                                                                        ^\nkernel.cpp:158:32: error: use of undeclared identifier 'bits_to_float'\n  158 |       const float normalized = bits_to_float(e_bits) * inv_sum;\n      |                                ^\nkernel.cpp:159:72: error: use of undeclared identifier 'float_to_bits'\n  159 |       asm volatile(\"sw.shared %1, 0(%0)\" :: \"r\"(row_base + j * 4), \"r\"(float_to_bits(normalized)) : \"memory\");\n      |                                                                        ^\nkernel.cpp:180:27: error: use of undeclared identifier 'bits_to_float'\n  180 |       const float p_val = bits_to_float(p_bits);\n      |                           ^\nkernel.cpp:181:27: error: use of undeclared identifier 'bits_to_float'\n  181 |       const float v_val = bits_to_float(v_bits);\n      |                           ^\n14 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

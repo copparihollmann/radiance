@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:53:17: error: expected ';' at end of declaration\n   53 |   float* __local smem = (float* __local)0;\n      |                 ^\n      |                 ;\nkernel.cpp:57:5: error: use of undeclared identifier 'smem'\n   57 |     smem[smem_w_idx + i] = a->w[i];\n      |     ^\nkernel.cpp:71:7: error: use of undeclared identifier 'smem'\n   71 |       smem[i] = a->in[in_idx];\n      |       ^\nkernel.cpp:80:25: error: expected ';' at end of declaration\n   80 |     const float* __local wa = &smem[smem_w_idx + (idx / P) * CKK];\n      |                         ^\n      |                         ;\nkernel.cpp:81:18: error: redefinition of '__local'\n   81 |     const float* __local pa = &smem[(idx % P) * CKK];\n      |                  ^\nkernel.cpp:80:18: note: previous definition is here\n   80 |     const float* __local wa = &smem[smem_w_idx + (idx / P) * CKK];\n      |                  ^\nkernel.cpp:81:25: error: expected ';' at end of declaration\n   81 |     const float* __local pa = &smem[(idx % P) * CKK];\n      |                         ^\n      |                         ;\nkernel.cpp:84:14: error: use of undeclared identifier 'wa'\n   84 |       acc += wa[k] * pa[k];\n      |              ^\nkernel.cpp:84:22: error: use of undeclared identifier 'pa'\n   84 |       acc += wa[k] * pa[k];\n      |                      ^\n8 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

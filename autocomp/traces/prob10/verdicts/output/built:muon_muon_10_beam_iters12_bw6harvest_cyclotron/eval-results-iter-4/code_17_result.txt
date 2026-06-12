@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:67:10: error: cannot initialize a variable of type 'float *' with an lvalue of type '__global float *'\n   67 |   float* C = args->C;\n      |          ^   ~~~~~~~\nkernel.cpp:132:21: error: use of undeclared identifier 'row0'\n  132 |     if (row_start + row0 < M) {\n      |                     ^\nkernel.cpp:133:22: error: use of undeclared identifier 'row0'\n  133 |       C[(row_start + row0) * N + col_start + lane_id] = acc0;\n      |                      ^\nkernel.cpp:135:21: error: use of undeclared identifier 'row1'\n  135 |     if (row_start + row1 < M) {\n      |                     ^\nkernel.cpp:136:22: error: use of undeclared identifier 'row1'\n  136 |       C[(row_start + row1) * N + col_start + lane_id] = acc1;\n      |                      ^\n5 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

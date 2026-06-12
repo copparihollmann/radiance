@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\noad32_shared_off<0>(b_base + b_off));\n      |                                          ^\nkernel.cpp:124:42: error: use of undeclared identifier 'load32_shared_off'\n  124 |         acc += __builtin_bit_cast(float, load32_shared_off<4>(a_base + a_off)) *\n      |                                          ^\nkernel.cpp:125:42: error: use of undeclared identifier 'load32_shared_off'\n  125 |                __builtin_bit_cast(float, load32_shared_off<256>(b_base + b_off)); // 256 = 16*16B\n      |                                          ^\nkernel.cpp:126:42: error: use of undeclared identifier 'load32_shared_off'\n  126 |         acc += __builtin_bit_cast(float, load32_shared_off<8>(a_base + a_off)) *\n      |                                          ^\nkernel.cpp:127:42: error: use of undeclared identifier 'load32_shared_off'\n  127 |                __builtin_bit_cast(float, load32_shared_off<512>(b_base + b_off)); // 512 = 32*16B\n      |                                          ^\nkernel.cpp:128:42: error: use of undeclared identifier 'load32_shared_off'\n  128 |         acc += __builtin_bit_cast(float, load32_shared_off<12>(a_base + a_off)) *\n      |                                          ^\nkernel.cpp:129:42: error: use of undeclared identifier 'load32_shared_off'\n  129 |                __builtin_bit_cast(float, load32_shared_off<768>(b_base + b_off)); // 768 = 48*16B\n      |                                          ^\n8 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

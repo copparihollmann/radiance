@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n(C_base + flat_idx * 4, 0.0f);\n      |             ^\nkernel.cpp:89:17: error: use of undeclared identifier 'store_shared_float'\n   89 |                 store_shared_float(saddr, val);\n      |                 ^\nkernel.cpp:103:17: error: use of undeclared identifier 'store_shared_float'\n  103 |                 store_shared_float(saddr, val);\n      |                 ^\nkernel.cpp:121:37: error: use of undeclared identifier 'load32_shared_as_float'\n  121 |                 const float a_val = load32_shared_as_float(A_base + (c_row * 16 + k) * 4);\n      |                                     ^\nkernel.cpp:122:37: error: use of undeclared identifier 'load32_shared_as_float'\n  122 |                 const float b_val = load32_shared_as_float(B_base + (k * 64 + c_col) * 4);\n      |                                     ^\nkernel.cpp:126:36: error: use of undeclared identifier 'load32_shared_as_float'\n  126 |             const float prev_val = load32_shared_as_float(C_base + flat_idx * 4);\n      |                                    ^\nkernel.cpp:127:13: error: use of undeclared identifier 'store_shared_float'\n  127 |             store_shared_float(C_base + flat_idx * 4, prev_val + sum);\n      |             ^\nkernel.cpp:142:35: error: use of undeclared identifier 'load32_shared_as_float'\n  142 |                 const float val = load32_shared_as_float(C_base + (row * 64 + col) * 4);\n      |                                   ^\n8 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

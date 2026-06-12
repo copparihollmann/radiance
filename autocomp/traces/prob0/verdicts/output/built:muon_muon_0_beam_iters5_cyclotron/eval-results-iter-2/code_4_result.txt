@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:60:10: error: cannot initialize a variable of type 'float *' with an lvalue of type '__global float *'\n   60 |   float* C_global = args->C;\n      |          ^          ~~~~~~~\nkernel.cpp:75:43: error: invalid lvalue in asm output\n   75 |       asm volatile(\"flw %0, 0(%1)\" : \"=f\"(A_global[global_idx_a]) : \"r\"(A_global + global_idx_a));\n      |                                           ^~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:84:43: error: invalid lvalue in asm output\n   84 |       asm volatile(\"flw %0, 0(%1)\" : \"=f\"(B_global[global_idx_b]) : \"r\"(B_global + global_idx_b));\n      |                                           ^~~~~~~~~~~~~~~~~~~~~~\n3 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

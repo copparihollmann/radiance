@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\noat(load32_shared(Bs_base + ((k << 6) + c_c0 + 3) << 2));\n      |                                                     ~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~ ~~\nkernel.cpp:125:61: note: place parentheses around the '+' expression to silence this warning\n  125 |         acc3 += a_val * bits_to_float(load32_shared(Bs_base + ((k << 6) + c_c0 + 3) << 2));\n      |                                                             ^\n      |                                                     (                              )\nkernel.cpp:125:25: error: use of undeclared identifier 'bits_to_float'\n  125 |         acc3 += a_val * bits_to_float(load32_shared(Bs_base + ((k << 6) + c_c0 + 3) << 2));\n      |                         ^\nkernel.cpp:129:47: error: use of undeclared identifier 'float_to_bits'\n  129 |       store_shared(Cs_base + (out_idx0 << 2), float_to_bits(acc0));\n      |                                               ^\nkernel.cpp:130:53: error: use of undeclared identifier 'float_to_bits'\n  130 |       store_shared(Cs_base + ((out_idx0 + 1) << 2), float_to_bits(acc1));\n      |                                                     ^\nkernel.cpp:131:53: error: use of undeclared identifier 'float_to_bits'\n  131 |       store_shared(Cs_base + ((out_idx0 + 2) << 2), float_to_bits(acc2));\n      |                                                     ^\nfatal error: too many errors emitted, stopping now [-ferror-limit=]\n4 warnings and 20 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

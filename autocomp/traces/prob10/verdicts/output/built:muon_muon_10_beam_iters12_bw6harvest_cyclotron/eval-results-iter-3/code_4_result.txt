@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n.cpp:97:47: warning: operator '<<' has lower precedence than '+'; '+' will be evaluated first [-Wshift-op-parentheses]\n   97 |       uint32_t b_smem_addr_base = B_SMEM_BASE + col_C << 2;            // col_C * 4\n      |                                   ~~~~~~~~~~~~^~~~~~~ ~~\nkernel.cpp:97:47: note: place parentheses around the '+' expression to silence this warning\n   97 |       uint32_t b_smem_addr_base = B_SMEM_BASE + col_C << 2;            // col_C * 4\n      |                                               ^\n      |                                   (                  )\nkernel.cpp:104:80: warning: operator '<<' has lower precedence than '+'; '+' will be evaluated first [-Wshift-op-parentheses]\n  104 |         float b_val = __builtin_bit_cast(float, load32_shared(b_smem_addr_base + (k * 64) << 2)); // k * 64 * 4\n      |                                                               ~~~~~~~~~~~~~~~~~^~~~~~~~~~ ~~\nkernel.cpp:104:80: note: place parentheses around the '+' expression to silence this warning\n  104 |         float b_val = __builtin_bit_cast(float, load32_shared(b_smem_addr_base + (k * 64) << 2)); // k * 64 * 4\n      |                                                                                ^\n      |                                                               (                          )\nkernel.cpp:123:1: error: extraneous closing brace ('}')\n  123 | } // extern \"C\"\n      | ^\n3 warnings and 1 error generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

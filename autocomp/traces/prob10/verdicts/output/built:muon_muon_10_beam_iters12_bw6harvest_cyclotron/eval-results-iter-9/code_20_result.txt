@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n: use of undeclared identifier 'store_shared_from_global_direct'; did you mean 'store_shared_from_global'?\n   79 |           store_shared_from_global_direct(dst_addr, src_addr);\n      |           ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n      |           store_shared_from_global\n/scratch/agustin/projects/radiance-kernels/lib/include/mu_intrinsics.h:34:13: note: 'store_shared_from_global' declared here\n   34 | inline void store_shared_from_global(uint32_t dst, uint32_t src) {\n      |             ^\nkernel.cpp:89:11: error: use of undeclared identifier 'store_shared_from_global_direct'; did you mean 'store_shared_from_global'?\n   89 |           store_shared_from_global_direct(dst_addr, src_addr);\n      |           ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n      |           store_shared_from_global\n/scratch/agustin/projects/radiance-kernels/lib/include/mu_intrinsics.h:34:13: note: 'store_shared_from_global' declared here\n   34 | inline void store_shared_from_global(uint32_t dst, uint32_t src) {\n      |             ^\nkernel.cpp:102:31: error: use of undeclared identifier 'load_float_shared_off'\n  102 |           const float a_val = load_float_shared_off<0>(smem_a + (ty * 17 + k) * 4);\n      |                               ^\nkernel.cpp:103:31: error: use of undeclared identifier 'load_float_shared_off'\n  103 |           const float b_val = load_float_shared_off<0>(smem_b + (k * 33 + tx) * 4);\n      |                               ^\n4 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

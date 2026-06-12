@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:63:10: error: cannot initialize a variable of type 'float *' with an lvalue of type '__global float *'\n   63 |   float* C = args->C;\n      |          ^   ~~~~~~~\nkernel.cpp:78:39: error: use of undeclared identifier 'BK'\n   78 |   for (uint32_t kk = 0; kk < K; kk += BK) {\n      |                                       ^\nkernel.cpp:83:31: error: use of undeclared identifier 'BK'\n   83 |       uint32_t r = load_idx / BK;\n      |                               ^\nkernel.cpp:84:31: error: use of undeclared identifier 'BK'\n   84 |       uint32_t c = load_idx % BK;\n      |                               ^\nkernel.cpp:116:52: error: use of undeclared identifier 'BK'\n  116 |       const uint32_t a_row_offset = smem_A + row * BK * 4;\n      |                                                    ^\nkernel.cpp:120:32: error: use of undeclared identifier 'BK'\n  120 |       for (uint32_t k = 0; k < BK; k++) {\n      |                                ^\n6 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

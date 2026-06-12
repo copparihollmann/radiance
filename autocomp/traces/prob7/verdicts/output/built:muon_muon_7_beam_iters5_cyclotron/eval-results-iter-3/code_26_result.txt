@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:67:3: error: unknown type name '__local'\n   67 |   __local float* smem_scratch = (__local float*)0x0;\n      |   ^\nkernel.cpp:67:34: error: use of undeclared identifier '__local'\n   67 |   __local float* smem_scratch = (__local float*)0x0;\n      |                                  ^\nkernel.cpp:83:5: error: unknown type name '__local'\n   83 |     __local float* sp = smem_scratch + i * seq;\n      |     ^\nkernel.cpp:95:11: error: unknown type name '__local'\n   95 |     const __local float* sp = smem_scratch + i * seq;\n      |           ^\n4 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

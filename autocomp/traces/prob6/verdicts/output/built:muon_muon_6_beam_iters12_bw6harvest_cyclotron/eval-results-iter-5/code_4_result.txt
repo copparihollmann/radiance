@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "RTL-ILLEGAL: register oversubscription (>256 distinct regs across 8 warps). Cut outputs-per-thread / accumulators / #pragma unroll; use one accumulator and a single incrementing pointer."
+}

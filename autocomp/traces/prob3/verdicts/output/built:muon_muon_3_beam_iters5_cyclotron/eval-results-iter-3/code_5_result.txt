@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n       ^\nkernel.cpp:118:22: error: use of undeclared identifier 'S_smem_base'\n  118 |     store_f32_shared(S_smem_base + warp_id * 384, (lane_id + 48) * 4, acc3);\n      |                      ^\nkernel.cpp:119:22: error: use of undeclared identifier 'S_smem_base'\n  119 |     store_f32_shared(S_smem_base + warp_id * 384, (lane_id + 64) * 4, acc4);\n      |                      ^\nkernel.cpp:120:22: error: use of undeclared identifier 'S_smem_base'\n  120 |     store_f32_shared(S_smem_base + warp_id * 384, (lane_id + 80) * 4, acc5);\n      |                      ^\nkernel.cpp:131:31: error: use of undeclared identifier 'reduce_smem_base'\n  131 |     uint32_t my_reduce_addr = reduce_smem_base + warp_id * 64 + lane_id * 4;\n      |                               ^\nkernel.cpp:132:5: error: use of undeclared identifier 'store_f32_shared'\n  132 |     store_f32_shared(my_reduce_addr, 0, local_max);\n      |     ^\nkernel.cpp:136:22: error: use of undeclared identifier 'load_f32_shared'; did you mean 'load32_shared'?\n  136 |         float val1 = load_f32_shared(my_reduce_addr);\n      |                      ^~~~~~~~~~~~~~~\n      |                      load32_shared\n/scratch/agustin/projects/radiance-kernels/lib/include/mu_intrinsics.h:47:17: note: 'load32_shared' declared here\n   47 | inline uint32_t load32_shared(uint32_t address) {\n      |                 ^\nfatal error: too many errors emitted, stopping now [-ferror-limit=]\n20 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

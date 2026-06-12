@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nble $x15\n  renamable $x16 = SLTU renamable $x11, renamable $x17\n  renamable $x15 = VX_SPLIT_N renamable $x16\n  BEQ killed renamable $x16, $x0, %bb.17\n\nbb.15.for.body157.lr.ph:\n; predecessors: %bb.14\n  successors: %bb.16(0x80000000); %bb.16(100.00%)\n  liveins: $x10, $x11, $x12, $x13, $x14, $x15, $x17\n  renamable $x16 = CSRRS 3268, $x0\n\nbb.16.for.body157:\n; predecessors: %bb.15, %bb.16\n  successors: %bb.17(0x04000000), %bb.16(0x7c000000); %bb.17(3.12%), %bb.16(96.88%)\n  liveins: $x10, $x11, $x12, $x13, $x14, $x15, $x16, $x17\n  INLINEASM &\"lw.shared $0, $1($2)\" [sideeffect] [mayload] [maystore] [attdialect], $0:[regdef:GPRNoX0], def renamable $x32, $1:[imm], 0, $2:[reguse:GPRNoX0], renamable $x14, !36\n  renamable $x33 = LW renamable $x10, 8 :: (load (s32) from %ir.sunkaddr272, !tbaa !38)\n  renamable $x35 = ADD killed renamable $x33, renamable $x14\n  SW killed renamable $x32, killed renamable $x35, 0 :: (store (s32) into %ir.scevgep, !tbaa !23)\n  renamable $x11 = ADD killed renamable $x11, renamable $x12\n  renamable $x14 = ADD killed renamable $x14, renamable $x13\n  renamable $x32 = SLTU renamable $x11, renamable $x17\n  renamable $x33 = XORI killed renamable $x32, 1\n  VX_PRED_N renamable $x33, renamable $x16\n  BEQ killed renamable $x33, $x0, %bb.16\n\nbb.17.join_stub:\n; predecessors: %bb.16, %bb.14\n  liveins: $x15\n  VX_JOIN killed renamable $x15\n  PseudoRET\n\n# End machine code for function _ZL11kernel_bodyPvjjj.\n\n7 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:53:3: error: unknown type name '__local'\n   53 |   __local float* smem_a = reinterpret_cast<__local float*>(0x00000000);\n      |   ^\nkernel.cpp:53:44: error: unknown type name '__local'\n   53 |   __local float* smem_a = reinterpret_cast<__local float*>(0x00000000);\n      |                                            ^\nkernel.cpp:54:3: error: unknown type name '__local'\n   54 |   __local float* smem_b = reinterpret_cast<__local float*>(0x00010000); // 64 KiB offset\n      |   ^\nkernel.cpp:54:44: error: unknown type name '__local'\n   54 |   __local float* smem_b = reinterpret_cast<__local float*>(0x00010000); // 64 KiB offset\n      |                                            ^\n4 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

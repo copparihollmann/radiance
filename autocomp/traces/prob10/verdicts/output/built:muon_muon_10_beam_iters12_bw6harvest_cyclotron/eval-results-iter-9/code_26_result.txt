@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:80:39: error: use of undeclared identifier 'BK'\n   80 |   for (uint32_t kk = 0; kk < K; kk += BK) {\n      |                                       ^\nkernel.cpp:85:27: error: use of undeclared identifier 'BK'\n   85 |       if (load_idx < 64 * BK) {\n      |                           ^\nkernel.cpp:86:33: error: use of undeclared identifier 'BK'\n   86 |         uint32_t r = load_idx / BK;\n      |                                 ^\nkernel.cpp:87:33: error: use of undeclared identifier 'BK'\n   87 |         uint32_t c = load_idx % BK;\n      |                                 ^\nkernel.cpp:97:22: error: use of undeclared identifier 'BK'\n   97 |       if (load_idx < BK * 64) {\n      |                      ^\nkernel.cpp:119:55: error: use of undeclared identifier 'BK'\n  119 |       const uint32_t a_row_addr = smem_A_base + row * BK * 4;\n      |                                                       ^\nkernel.cpp:123:32: error: use of undeclared identifier 'BK'\n  123 |       for (uint32_t k = 0; k < BK; k++) {\n      |                                ^\n7 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

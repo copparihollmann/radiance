@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nept FMADD_S_INX killed renamable $x121, killed renamable $x126, killed renamable $x120, 7, implicit $frm\n  renamable $x126 = nofpexcept FMADD_S_INX killed renamable $x123, killed renamable $x124, killed renamable $x1, 7, implicit $frm\n  renamable $x1 = nofpexcept FMADD_S_INX killed renamable $x125, killed renamable $x8, killed renamable $x126, 7, implicit $frm\n  renamable $x120 = nofpexcept FMADD_S_INX killed renamable $x127, killed renamable $x9, killed renamable $x1, 7, implicit $frm\n  INLINEASM &\"vx_bar $0, $1\" [sideeffect] [mayload] [maystore] [attdialect], $0:[reguse:GPRNoX0], killed renamable $x122, $1:[reguse:GPRNoX0], renamable $x109, !19\n  renamable $x116 = ADDI killed renamable $x116, 16\n  renamable $x119 = ADD killed renamable $x119, renamable $x104\n  renamable $x118 = ADDI killed renamable $x118, 64\n  renamable $x117 = ADDI killed renamable $x117, 64\n  renamable $x121 = SLTU renamable $x116, renamable $x15\n  renamable $x122 = XORI killed renamable $x121, 1\n  VX_PRED_N renamable $x122, renamable $x115\n  BEQ killed renamable $x122, $x0, %bb.6\n  PseudoBR %bb.3\n\nbb.7.for.cond.cleanup:\n; predecessors: %bb.1\n\n  $x1 = LW $x2, 12 :: (load (s32) from %stack.0)\n  $x8 = LW $x2, 8 :: (load (s32) from %stack.1)\n  $x9 = LW $x2, 4 :: (load (s32) from %stack.2)\n  $x18 = LW $x2, 0 :: (load (s32) from %stack.3)\n  $x2 = frame-destroy ADDI $x2, 16\n  PseudoRET\n\n# End machine code for function _ZL11kernel_bodyPvjjj.\n\n3 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

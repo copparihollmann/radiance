@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nfier 'smem_b'\n  116 |         store_shared_from_global(smem_b + (warp_id * 16 + lane_id + 2 * 16) * 4, \n      |                                  ^\nkernel.cpp:118:34: error: use of undeclared identifier 'smem_b'\n  118 |         store_shared_from_global(smem_b + (warp_id * 16 + lane_id + 3 * 16) * 4, \n      |                                  ^\nkernel.cpp:120:34: error: use of undeclared identifier 'smem_b'\n  120 |         store_shared_from_global(smem_b + (warp_id * 16 + lane_id + 4 * 16) * 4, \n      |                                  ^\nkernel.cpp:122:34: error: use of undeclared identifier 'smem_b'\n  122 |         store_shared_from_global(smem_b + (warp_id * 16 + lane_id + 5 * 16) * 4, \n      |                                  ^\nkernel.cpp:124:34: error: use of undeclared identifier 'smem_b'\n  124 |         store_shared_from_global(smem_b + (warp_id * 16 + lane_id + 6 * 16) * 4, \n      |                                  ^\nkernel.cpp:126:34: error: use of undeclared identifier 'smem_b'\n  126 |         store_shared_from_global(smem_b + (warp_id * 16 + lane_id + 7 * 16) * 4, \n      |                                  ^\nkernel.cpp:137:24: error: use of undeclared identifier 'smem_a'\n  137 |       uint32_t a_ptr = smem_a + a_row_base;\n      |                        ^\nkernel.cpp:138:24: error: use of undeclared identifier 'smem_b'\n  138 |       uint32_t b_ptr = smem_b + b_col_base;\n      |                        ^\n14 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

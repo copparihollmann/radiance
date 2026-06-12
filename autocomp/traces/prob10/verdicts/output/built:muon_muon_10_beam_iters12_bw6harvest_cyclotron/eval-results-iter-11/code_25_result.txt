@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n 5) + a_col) * 4, 0, float_to_uint(val));\n      |                                                                   ^\nkernel.cpp:85:22: error: use of undeclared identifier 'A_smem_base'\n   85 |         store_shared(A_smem_base + ((a_row << 5) + a_col) * 4, 0, float_to_uint(val));\n      |                      ^\nkernel.cpp:98:65: error: use of undeclared identifier 'float_to_uint'\n   98 |         store_shared(B_smem_base + (b_row * 16 + b_col) * 4, 0, float_to_uint(val));\n      |                                                                 ^\nkernel.cpp:98:22: error: use of undeclared identifier 'B_smem_base'\n   98 |         store_shared(B_smem_base + (b_row * 16 + b_col) * 4, 0, float_to_uint(val));\n      |                      ^\nkernel.cpp:108:25: error: use of undeclared identifier 'A_smem_base'\n  108 |       uint32_t a_addr = A_smem_base + (th_m * TILE_K + k_inner) * 4;\n      |                         ^\nkernel.cpp:109:21: error: use of undeclared identifier 'uint_to_float'\n  109 |       float a_val = uint_to_float(load32_shared(a_addr));\n      |                     ^\nkernel.cpp:112:25: error: use of undeclared identifier 'B_smem_base'\n  112 |       uint32_t b_addr = B_smem_base + (k_inner * 16 + th_n) * 4;\n      |                         ^\nkernel.cpp:113:21: error: use of undeclared identifier 'uint_to_float'\n  113 |       float b_val = uint_to_float(load32_shared(b_addr));\n      |                     ^\n8 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

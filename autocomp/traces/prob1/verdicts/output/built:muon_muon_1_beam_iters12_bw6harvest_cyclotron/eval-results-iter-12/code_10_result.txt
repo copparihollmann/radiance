@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n |                        ^\nkernel.cpp:132:18: error: use of undeclared identifier 'load_float_shared_offset'\n  132 |       float w0 = load_float_shared_offset(w_ptr_gemm, 0);\n      |                  ^\nkernel.cpp:133:18: error: use of undeclared identifier 'load_float_shared_offset'\n  133 |       float a0 = load_float_shared_offset(a_ptr_gemm, 0);\n      |                  ^\nkernel.cpp:134:18: error: use of undeclared identifier 'load_float_shared_offset'\n  134 |       float w1 = load_float_shared_offset(w_ptr_gemm, 4);\n      |                  ^\nkernel.cpp:135:18: error: use of undeclared identifier 'load_float_shared_offset'\n  135 |       float a1 = load_float_shared_offset(a_ptr_gemm, 4);\n      |                  ^\nkernel.cpp:136:18: error: use of undeclared identifier 'load_float_shared_offset'\n  136 |       float w2 = load_float_shared_offset(w_ptr_gemm, 8);\n      |                  ^\nkernel.cpp:137:18: error: use of undeclared identifier 'load_float_shared_offset'\n  137 |       float a2 = load_float_shared_offset(a_ptr_gemm, 8);\n      |                  ^\nkernel.cpp:138:18: error: use of undeclared identifier 'load_float_shared_offset'\n  138 |       float w3 = load_float_shared_offset(w_ptr_gemm, 12);\n      |                  ^\nkernel.cpp:139:18: error: use of undeclared identifier 'load_float_shared_offset'\n  139 |       float a3 = load_float_shared_offset(a_ptr_gemm, 12);\n      |                  ^\n10 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

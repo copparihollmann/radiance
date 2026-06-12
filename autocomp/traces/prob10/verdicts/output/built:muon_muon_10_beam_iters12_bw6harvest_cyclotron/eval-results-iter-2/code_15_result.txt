@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n: error: use of undeclared identifier 'TILE_K'\n   72 |       uint32_t a_row = idx / TILE_K;  // idx / 32\n      |                              ^\nkernel.cpp:73:30: error: use of undeclared identifier 'TILE_K'\n   73 |       uint32_t a_col = idx % TILE_K;  // idx % 32\n      |                              ^\nkernel.cpp:75:19: error: use of undeclared identifier 'TILE_M'\n   75 |       if (a_row < TILE_M && (k_block + a_col) < args->K) {\n      |                   ^\nkernel.cpp:86:30: error: use of undeclared identifier 'TILE_N'\n   86 |       uint32_t b_row = idx / TILE_N;  // idx / 64\n      |                              ^\nkernel.cpp:87:30: error: use of undeclared identifier 'TILE_N'\n   87 |       uint32_t b_col = idx % TILE_N;  // idx % 64\n      |                              ^\nkernel.cpp:89:50: error: use of undeclared identifier 'TILE_N'\n   89 |       if ((k_block + b_row) < args->K && b_col < TILE_N) {\n      |                                                  ^\nkernel.cpp:100:30: error: use of undeclared identifier 'TILE_K'\n  100 |     for (uint32_t k = 0; k < TILE_K; k++) {\n      |                              ^\nkernel.cpp:101:28: error: use of undeclared identifier 'TILE_N'\n  101 |       float b_val = Bs[k * TILE_N + col];\n      |                            ^\nkernel.cpp:102:30: error: use of undeclared identifier 'TILE_K'\n  102 |       float a_val = As[row * TILE_K + k];\n      |                              ^\n17 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

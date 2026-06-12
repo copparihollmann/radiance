@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:126:1: error: extraneous closing brace ('}')\n  126 | }\n      | ^\n1 error generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

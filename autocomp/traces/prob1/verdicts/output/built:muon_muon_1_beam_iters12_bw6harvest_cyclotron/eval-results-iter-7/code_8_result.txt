@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:100:18: error: use of undeclared identifier 'load_float_shared'\n  100 |       float w0 = load_float_shared<0>(wa);\n      |                  ^\nkernel.cpp:101:18: error: use of undeclared identifier 'load_float_shared'\n  101 |       float w1 = load_float_shared<4>(wa);\n      |                  ^\nkernel.cpp:102:19: error: use of undeclared identifier 'load_float_shared'\n  102 |       float in0 = load_float_shared<0>(pa);\n      |                   ^\nkernel.cpp:103:19: error: use of undeclared identifier 'load_float_shared'\n  103 |       float in1 = load_float_shared<4>(pa);\n      |                   ^\n4 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n 'store_shared'\n  160 |         store_shared(cs_addr1, __builtin_bit_cast(uint32_t, sum1));\n      |         ^~~~~~~~~~~~\n/scratch/agustin/projects/radiance-kernels/lib/include/mu_intrinsics.h:22:13: note: candidate function not viable: requires 3 arguments, but 2 were provided\n   22 | inline void store_shared(uint32_t base, uint32_t offset, uint32_t data) {\n      |             ^            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:161:9: error: no matching function for call to 'store_shared'\n  161 |         store_shared(cs_addr2, __builtin_bit_cast(uint32_t, sum2));\n      |         ^~~~~~~~~~~~\n/scratch/agustin/projects/radiance-kernels/lib/include/mu_intrinsics.h:22:13: note: candidate function not viable: requires 3 arguments, but 2 were provided\n   22 | inline void store_shared(uint32_t base, uint32_t offset, uint32_t data) {\n      |             ^            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:162:9: error: no matching function for call to 'store_shared'\n  162 |         store_shared(cs_addr3, __builtin_bit_cast(uint32_t, sum3));\n      |         ^~~~~~~~~~~~\n/scratch/agustin/projects/radiance-kernels/lib/include/mu_intrinsics.h:22:13: note: candidate function not viable: requires 3 arguments, but 2 were provided\n   22 | inline void store_shared(uint32_t base, uint32_t offset, uint32_t data) {\n      |             ^            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n9 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

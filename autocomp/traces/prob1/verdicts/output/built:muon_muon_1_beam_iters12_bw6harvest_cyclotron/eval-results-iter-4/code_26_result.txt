@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:120:20: error: cannot initialize a variable of type 'const float *' with an rvalue of type '__global float *'\n  120 |       const float* w_base = a->w + oc * CKK;\n      |                    ^        ~~~~~~~~~~~~~~~\n1 error generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

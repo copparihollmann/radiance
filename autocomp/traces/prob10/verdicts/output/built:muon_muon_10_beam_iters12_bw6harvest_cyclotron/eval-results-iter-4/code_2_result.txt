@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nbb.39(0x7c000000); %bb.34(3.12%), %bb.39(96.88%)\n  liveins: $x5, $x6, $x7, $x10, $x11, $x12, $x13, $x14, $x15, $x16, $x17, $x28, $x29, $x30, $x31, $x32, $x33, $x34, $x35, $x36, $x37, $x38, $x39, $x40, $x41, $x42, $x43, $x44, $x45, $x46, $x47, $x96, $x97, $x98, $x99, $x100, $x101, $x102, $x103, $x104, $x105, $x106, $x107, $x108, $x109, $x110, $x111, $x112, $x113, $x114, $x115, $x116, $x117, $x118, $x119, $x120, $x121, $x122, $x123, $x124\n  renamable $x125 = LW renamable $x123, 0 :: (load (s32) from %ir.lsr.iv373, !tbaa !23)\n  renamable $x127 = LW renamable $x124, 0 :: (load (s32) from %ir.lsr.iv364, !tbaa !23)\n  renamable $x114 = nofpexcept FMADD_S_INX killed renamable $x125, killed renamable $x127, killed renamable $x114, 7, implicit $frm\n  renamable $x121 = nuw ADDI killed renamable $x121, 1\n  renamable $x124 = ADD killed renamable $x124, renamable $x47\n  renamable $x123 = ADDI killed renamable $x123, 4\n  renamable $x126 = SLTU renamable $x121, renamable $x119\n  renamable $x125 = XORI killed renamable $x126, 1\n  VX_PRED_N renamable $x125, renamable $x122\n  BEQ killed renamable $x125, $x0, %bb.39\n  PseudoBR %bb.34\n\nbb.40.join_stub413:\n; predecessors: %bb.0, %bb.2\n  liveins: $x15\n  VX_JOIN killed renamable $x15\n  $x1 = LW $x2, 12 :: (load (s32) from %stack.0)\n  $x8 = LW $x2, 8 :: (load (s32) from %stack.1)\n  $x2 = frame-destroy ADDI $x2, 16\n  PseudoRET\n\n# End machine code for function _ZL11kernel_bodyPvjjj.\n\n2 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

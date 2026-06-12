@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:83:9: error: redefinition of 'd' with a different type: 'float' vs 'const uint32_t' (aka 'const unsigned int')\n   83 |   float d = 0.0f;    // Running sum of exp\n      |         ^\nkernel.cpp:63:18: note: previous definition is here\n   63 |   const uint32_t d = a->d;          // 64\n      |                  ^\nkernel.cpp:122:7: error: cannot assign to variable 'd' with const-qualified type 'const uint32_t' (aka 'const unsigned int')\n  122 |     d = d_new;\n      |     ~ ^\nkernel.cpp:63:18: note: variable 'd' declared const here\n   63 |   const uint32_t d = a->d;          // 64\n      |   ~~~~~~~~~~~~~~~^~~~~~~~\n2 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

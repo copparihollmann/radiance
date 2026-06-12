@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nrror: use of undeclared identifier 'BK'\n   87 |         uint32_t a_col_offset = tid_in_threadblock % BK; // 0..15\n      |                                                      ^\nkernel.cpp:94:22: error: use of undeclared identifier 'SMEM_A_BASE'\n   94 |         store_shared(SMEM_A_BASE, (local_a_row * BK + a_col_offset) * 4, __builtin_bit_cast(uint32_t, a_val));\n      |                      ^\nkernel.cpp:94:50: error: use of undeclared identifier 'BK'\n   94 |         store_shared(SMEM_A_BASE, (local_a_row * BK + a_col_offset) * 4, __builtin_bit_cast(uint32_t, a_val));\n      |                                                  ^\nkernel.cpp:102:34: error: use of undeclared identifier 'BK'\n  102 |         for (uint32_t i = 0; i < BK; i++) {\n      |                                  ^\nkernel.cpp:103:70: error: use of undeclared identifier 'BK'\n  103 |           uint32_t a_linear_index = (((idx - block_start_idx) / N) * BK) + i; // Row relative to block 0 or 1, then col i\n      |                                                                      ^\nkernel.cpp:104:34: error: use of undeclared identifier 'SMEM_A_BASE'\n  104 |           uint32_t a_smem_addr = SMEM_A_BASE + a_linear_index * 4;\n      |                                  ^\nkernel.cpp:107:34: error: use of undeclared identifier 'SMEM_B_BASE'\n  107 |           uint32_t b_smem_addr = SMEM_B_BASE + b_linear_index * 4;\n      |                                  ^\n12 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

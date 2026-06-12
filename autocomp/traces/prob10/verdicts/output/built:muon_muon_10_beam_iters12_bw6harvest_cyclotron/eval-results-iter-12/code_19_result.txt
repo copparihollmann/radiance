@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n *(float*)(&load32_shared(0x00008000 + (k * 64 + c_col) * 4));\n      |                                ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:111:32: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  111 |           float a1 = *(float*)(&load32_shared(0x00004000 + (c_row * 64 + k + 1) * 4));\n      |                                ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:112:32: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  112 |           float b1 = *(float*)(&load32_shared(0x00008000 + ((k + 1) * 64 + c_col) * 4));\n      |                                ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:119:42: error: cannot cast from type 'float' to pointer type 'uint32_t *' (aka 'unsigned int *')\n  119 |         store_shared(flat_index * 4, 0, *(uint32_t*)(prev_val + sum));\n      |                                          ^~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:139:16: error: use of undeclared identifier 'A'\n  139 |         acc += A[row * args->K + k] * B[k * args->N + col];\n      |                ^\nkernel.cpp:139:39: error: use of undeclared identifier 'B'\n  139 |         acc += A[row * args->K + k] * B[k * args->N + col];\n      |                                       ^\nkernel.cpp:141:7: error: use of undeclared identifier 'C'\n  141 |       C[idx] = acc;\n      |       ^\n8 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

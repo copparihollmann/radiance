@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:56:3: error: unknown type name '__local'\n   56 |   __local float* const s_mem = reinterpret_cast<__local float*>(0x0);\n      |   ^\nkernel.cpp:56:49: error: unknown type name '__local'\n   56 |   __local float* const s_mem = reinterpret_cast<__local float*>(0x0);\n      |                                                 ^\nkernel.cpp:57:3: error: unknown type name '__local'\n   57 |   __local float* const s_a = s_mem;\n      |   ^\nkernel.cpp:58:3: error: unknown type name '__local'\n   58 |   __local float* const s_b = s_mem + M * K;\n      |   ^\nkernel.cpp:82:5: error: unknown type name '__local'\n   82 |     __local const float* __restrict__ a_ptr = s_a + m * K;\n      |     ^\nkernel.cpp:83:5: error: unknown type name '__local'\n   83 |     __local const float* __restrict__ b_ptr = s_b + n * (K + PAD);\n      |     ^\n6 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nb_base);\n      |                           ^\nkernel.cpp:115:27: error: use of undeclared identifier 'load_float_shared_off'\n  115 |           acc1 += a_val * load_float_shared_off<(k * 33 + 1) * 4>(b_base);\n      |                           ^\nkernel.cpp:116:27: error: use of undeclared identifier 'load_float_shared_off'\n  116 |           acc2 += a_val * load_float_shared_off<(k * 33 + 2) * 4>(b_base);\n      |                           ^\nkernel.cpp:117:27: error: use of undeclared identifier 'load_float_shared_off'\n  117 |           acc3 += a_val * load_float_shared_off<(k * 33 + 3) * 4>(b_base);\n      |                           ^\nkernel.cpp:118:27: error: use of undeclared identifier 'load_float_shared_off'\n  118 |           acc4 += a_val * load_float_shared_off<(k * 33 + 4) * 4>(b_base);\n      |                           ^\nkernel.cpp:119:27: error: use of undeclared identifier 'load_float_shared_off'\n  119 |           acc5 += a_val * load_float_shared_off<(k * 33 + 5) * 4>(b_base);\n      |                           ^\nkernel.cpp:120:27: error: use of undeclared identifier 'load_float_shared_off'\n  120 |           acc6 += a_val * load_float_shared_off<(k * 33 + 6) * 4>(b_base);\n      |                           ^\nkernel.cpp:121:27: error: use of undeclared identifier 'load_float_shared_off'\n  121 |           acc7 += a_val * load_float_shared_off<(k * 33 + 7) * 4>(b_base);\n      |                           ^\n9 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

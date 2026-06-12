@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:181:26: error: use of undeclared identifier 'INFINITY'\n  181 |         float max_val = -INFINITY;\n      |                          ^\n1 error generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

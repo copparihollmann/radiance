@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "TOO SLOW: correct functionally, but the timed sim exceeded the wall cap (far slower than baseline). Likely 16-way SMEM bank-conflict serialization (pad column stride +16 floats) or excessive global memory traffic. Reduce serialization; keep the algorithm."
+}

@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:54:3: error: unknown type name '__local'\n   54 |   __local float* A_shared = (__local float*)0;\n      |   ^\nkernel.cpp:54:30: error: use of undeclared identifier '__local'\n   54 |   __local float* A_shared = (__local float*)0;\n      |                              ^\nkernel.cpp:55:3: error: unknown type name '__local'\n   55 |   __local float* B_shared = (__local float*)32768;\n      |   ^\nkernel.cpp:55:30: error: use of undeclared identifier '__local'\n   55 |   __local float* B_shared = (__local float*)32768;\n      |                              ^\nkernel.cpp:56:3: error: unknown type name '__local'\n   56 |   __local float* C_shared = (__local float*)65536;\n      |   ^\nkernel.cpp:56:30: error: use of undeclared identifier '__local'\n   56 |   __local float* C_shared = (__local float*)65536;\n      |                              ^\n6 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n, $x33, $x34, $x36\n  renamable $x35 = SLTU renamable $x34, renamable $x13\n\nbb.24.join_stub302:\n; predecessors: %bb.22, %bb.23\n  successors: %bb.25(0x50000000), %bb.21(0x30000000); %bb.25(62.50%), %bb.21(37.50%)\n  liveins: $x10, $x11, $x12, $x13, $x14, $x15, $x16, $x17, $x32, $x33, $x34, $x35, $x36\n  VX_JOIN killed renamable $x33\n  renamable $x33 = VX_SPLIT_N renamable $x35\n  BEQ killed renamable $x35, $x0, %bb.21\n\nbb.25.if.then158:\n; predecessors: %bb.24\n  successors: %bb.21(0x80000000); %bb.21(100.00%)\n  liveins: $x10, $x11, $x12, $x13, $x14, $x15, $x16, $x17, $x32, $x33, $x34, $x36\n  renamable $x35 = MUL killed renamable $x36, renamable $x13\n  renamable $x37 = SLLI killed renamable $x35, 2\n  INLINEASM &\"lw.shared $0, $1($2)\" [sideeffect] [mayload] [maystore] [attdialect], $0:[regdef:GPRNoX0], def renamable $x35, $1:[imm], 0, $2:[reguse:GPRNoX0], renamable $x17, !36\n  renamable $x38 = ADD renamable $x16, killed renamable $x37\n  renamable $x36 = SLLI killed renamable $x34, 2\n  renamable $x37 = ADD killed renamable $x38, killed renamable $x36\n  SW killed renamable $x35, killed renamable $x37, 0 :: (store (s32) into %ir.arrayidx166, !tbaa !23)\n  PseudoBR %bb.21\n\nbb.26.join_stub304:\n; predecessors: %bb.21, %bb.19\n  liveins: $x32\n  VX_JOIN killed renamable $x32\n  $x1 = LW $x2, 12 :: (load (s32) from %stack.0)\n  $x2 = frame-destroy ADDI $x2, 16\n  PseudoRET\n\n# End machine code for function _ZL11kernel_bodyPvjjj.\n\n7 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

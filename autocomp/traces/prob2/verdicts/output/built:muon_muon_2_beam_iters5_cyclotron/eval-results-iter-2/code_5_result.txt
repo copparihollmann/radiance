@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\ntore_shared(SMEM_SCRATCH_BASE + (row * SEQ + col) * 4, __builtin_bit_cast(uint32_t, exp_val * inv_row_sum));\n      |                      ^\nkernel.cpp:177:62: error: use of undeclared identifier 'SMEM_SCRATCH_BASE'\n  177 |           float p0 = __builtin_bit_cast(float, load32_shared(SMEM_SCRATCH_BASE + (i * SEQ + j) * 4));\n      |                                                              ^\nkernel.cpp:178:62: error: use of undeclared identifier 'SMEM_SCRATCH_BASE'\n  178 |           float p1 = __builtin_bit_cast(float, load32_shared(SMEM_SCRATCH_BASE + (i * SEQ + j + 1) * 4));\n      |                                                              ^\nkernel.cpp:179:62: error: use of undeclared identifier 'SMEM_SCRATCH_BASE'\n  179 |           float p2 = __builtin_bit_cast(float, load32_shared(SMEM_SCRATCH_BASE + (i * SEQ + j + 2) * 4));\n      |                                                              ^\nkernel.cpp:180:62: error: use of undeclared identifier 'SMEM_SCRATCH_BASE'\n  180 |           float p3 = __builtin_bit_cast(float, load32_shared(SMEM_SCRATCH_BASE + (i * SEQ + j + 3) * 4));\n      |                                                              ^\nkernel.cpp:189:61: error: use of undeclared identifier 'SMEM_SCRATCH_BASE'\n  189 |           float p = __builtin_bit_cast(float, load32_shared(SMEM_SCRATCH_BASE + (i * SEQ + j) * 4));\n      |                                                             ^\n15 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

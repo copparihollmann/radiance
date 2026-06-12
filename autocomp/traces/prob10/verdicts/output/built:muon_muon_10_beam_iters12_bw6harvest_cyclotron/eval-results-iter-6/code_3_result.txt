@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:61:26: error: use of undeclared identifier 'smem'\n   61 |     __shared float* As = smem;        // First tile: 272 floats\n      |                          ^\nkernel.cpp:62:26: error: use of undeclared identifier 'smem'\n   62 |     __shared float* Bs = smem + 272;  // Second tile: 272 floats\n      |                          ^\n2 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

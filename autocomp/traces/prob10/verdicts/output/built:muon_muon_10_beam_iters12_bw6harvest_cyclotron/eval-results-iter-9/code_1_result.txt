@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:132:30: error: use of undeclared identifier 'load_float_shared'\n  132 |               float a_elem = load_float_shared(A_smem_base + (r * 32 + k) * 4);\n      |                              ^\nkernel.cpp:133:30: error: use of undeclared identifier 'load_float_shared'\n  133 |               float b_elem = load_float_shared(B_smem_base + (k * N + col) * 4);\n      |                              ^\nkernel.cpp:138:25: error: use of undeclared identifier 'load_float_shared'\n  138 |           float c_old = load_float_shared(C_smem_base + (r * N + col) * 4);\n      |                         ^\nkernel.cpp:150:19: error: use of undeclared identifier 'load_float_shared'\n  150 |       float val = load_float_shared(C_smem_base + (r * N + col) * 4);\n      |                   ^\n4 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

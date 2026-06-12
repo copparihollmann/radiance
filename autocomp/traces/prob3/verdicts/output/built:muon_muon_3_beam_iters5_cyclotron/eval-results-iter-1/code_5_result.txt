@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n~~~~~~~~~~~\nkernel.cpp:101:30: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  101 |         float rhs = *(float*)&load32_shared((uint32_t)&smem_max[tid_in_threadblock + stride]);\n      |                              ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:109:30: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  109 |     float max_val = *(float*)&load32_shared((uint32_t)smem_max);\n      |                              ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:125:30: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  125 |         float lhs = *(float*)&load32_shared((uint32_t)&smem_exp[tid_in_threadblock]);\n      |                              ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:126:30: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  126 |         float rhs = *(float*)&load32_shared((uint32_t)&smem_exp[tid_in_threadblock + stride]);\n      |                              ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:134:38: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  134 |     float inv_sum = 1.0f / (*(float*)&load32_shared((uint32_t)smem_exp));\n      |                                      ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n6 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

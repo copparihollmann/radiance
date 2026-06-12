@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n      |                      ^\nkernel.cpp:114:22: error: use of undeclared identifier 'bit_cast_to_float'\n  114 |           float a2 = bit_cast_to_float(load32_shared(SMEM_A_BASE + (row * 64 + kk + 2) * 4));\n      |                      ^\nkernel.cpp:115:22: error: use of undeclared identifier 'bit_cast_to_float'\n  115 |           float b2 = bit_cast_to_float(load32_shared(SMEM_B_BASE + ((kk + 2) * 64 + col) * 4));\n      |                      ^\nkernel.cpp:116:22: error: use of undeclared identifier 'bit_cast_to_float'\n  116 |           float a3 = bit_cast_to_float(load32_shared(SMEM_A_BASE + (row * 64 + kk + 3) * 4));\n      |                      ^\nkernel.cpp:117:22: error: use of undeclared identifier 'bit_cast_to_float'\n  117 |           float b3 = bit_cast_to_float(load32_shared(SMEM_B_BASE + ((kk + 3) * 64 + col) * 4));\n      |                      ^\nkernel.cpp:127:23: error: use of undeclared identifier 'bit_cast_to_float'\n  127 |         float old_c = bit_cast_to_float(load32_shared(c_addr));\n      |                       ^\nkernel.cpp:128:33: error: use of undeclared identifier 'bit_cast_to_uint32'\n  128 |         store_shared(c_addr, 0, bit_cast_to_uint32(old_c + final_acc));\n      |                                 ^\nkernel.cpp:138:19: error: use of undeclared identifier 'bit_cast_to_float'\n  138 |       float val = bit_cast_to_float(load32_shared(SMEM_C_BASE + idx * 4));\n      |                   ^\n13 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

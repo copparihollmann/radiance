@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n 115 |             float val = bits_to_float(load32_shared(s_row_base + c * sizeof(float)));\n      |                         ^\nkernel.cpp:122:25: error: use of undeclared identifier 'bits_to_float'\n  122 |             float val = bits_to_float(load32_shared(s_row_base + c * sizeof(float)));\n      |                         ^\nkernel.cpp:124:61: error: use of undeclared identifier 'float_to_bits'\n  124 |             store_shared(s_row_base + c * sizeof(float), 0, float_to_bits(exp_val));\n      |                                                             ^\nkernel.cpp:131:29: error: use of undeclared identifier 'bits_to_float'\n  131 |             float exp_val = bits_to_float(load32_shared(s_row_base + c * sizeof(float)));\n      |                             ^\nkernel.cpp:132:61: error: use of undeclared identifier 'float_to_bits'\n  132 |             store_shared(s_row_base + c * sizeof(float), 0, float_to_bits(exp_val * inv_sum));\n      |                                                             ^\nkernel.cpp:149:27: error: use of undeclared identifier 'bits_to_float'\n  149 |             float s_val = bits_to_float(load32_shared(s_row_base + k * sizeof(float)));\n      |                           ^\nkernel.cpp:150:27: error: use of undeclared identifier 'bits_to_float'\n  150 |             float v_val = bits_to_float(load32_shared(v_col_base + k * STRIDE_QKV * sizeof(float)));\n      |                           ^\n14 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

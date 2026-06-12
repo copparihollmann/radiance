@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nse of undeclared identifier 'SMEM_B_BASE'\n  111 |             uint32_t b_saddr = SMEM_B_BASE + (k_inner * BN + n_idx) * 4;\n      |                                ^\nkernel.cpp:112:13: error: use of undeclared identifier 'store_smem_float'\n  112 |             store_smem_float(b_saddr, b_val);\n      |             ^\nkernel.cpp:124:26: error: use of undeclared identifier 'SMEM_A_BASE'\n  124 |       uint32_t a_saddr = SMEM_A_BASE + (row * (BK + 1) + k_inner) * 4;\n      |                          ^\nkernel.cpp:125:21: error: use of undeclared identifier 'load_smem_float'\n  125 |       float a_val = load_smem_float(a_saddr);\n      |                     ^\nkernel.cpp:129:28: error: use of undeclared identifier 'SMEM_B_BASE'\n  129 |         uint32_t b_saddr = SMEM_B_BASE + (k_inner * BN + j + col_thread_offset) * 4;\n      |                            ^\nkernel.cpp:130:28: error: use of undeclared identifier 'SMEM_C_BASE'\n  130 |         uint32_t c_saddr = SMEM_C_BASE + (row * BN + j + col_thread_offset) * 4;\n      |                            ^\nkernel.cpp:132:20: error: use of undeclared identifier 'load_smem_float'\n  132 |         float b0 = load_smem_float(b_saddr);\n      |                    ^\nkernel.cpp:133:20: error: use of undeclared identifier 'load_smem_float'\n  133 |         float b1 = load_smem_float(b_saddr + 4);\n      |                    ^\nfatal error: too many errors emitted, stopping now [-ferror-limit=]\n20 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

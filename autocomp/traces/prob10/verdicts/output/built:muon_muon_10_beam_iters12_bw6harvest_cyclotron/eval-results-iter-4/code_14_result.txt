@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n));\n      |                    ^\nkernel.cpp:125:20: error: use of undeclared identifier 'SMEM_BASE_B'\n  125 |       store_shared(SMEM_BASE_B, (b_row1 - k) * 64 + (b_col1 - c_off) * 4, __builtin_bit_cast(uint32_t, val_B1));\n      |                    ^\nkernel.cpp:126:20: error: use of undeclared identifier 'SMEM_BASE_B'\n  126 |       store_shared(SMEM_BASE_B, (b_row2 - k) * 64 + (b_col2 - c_off) * 4, __builtin_bit_cast(uint32_t, val_B2));\n      |                    ^\nkernel.cpp:127:20: error: use of undeclared identifier 'SMEM_BASE_B'\n  127 |       store_shared(SMEM_BASE_B, (b_row3 - k) * 64 + (b_col3 - c_off) * 4, __builtin_bit_cast(uint32_t, val_B3));\n      |                    ^\nkernel.cpp:128:20: error: use of undeclared identifier 'SMEM_BASE_B'\n  128 |       store_shared(SMEM_BASE_B, (b_row4 - k) * 64 + (b_col4 - c_off) * 4, __builtin_bit_cast(uint32_t, val_B4));\n      |                    ^\nkernel.cpp:138:34: error: use of undeclared identifier 'TILE_K'\n  138 |       for (uint32_t kk = 0; kk < TILE_K; kk++) {\n      |                                  ^\nkernel.cpp:141:27: error: use of undeclared identifier 'SMEM_BASE_A'\n  141 |         uint32_t addr_a = SMEM_BASE_A + local_row * 144 + kk * 4;\n      |                           ^\nkernel.cpp:145:27: error: use of undeclared identifier 'SMEM_BASE_B'\n  145 |         uint32_t addr_b = SMEM_BASE_B + kk * 64 + local_col * 4;\n      |                           ^\n16 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

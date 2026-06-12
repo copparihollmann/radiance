@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:144:44: error: use of undeclared identifier 'thread_row'; did you mean 'tile_row'?\n  144 |           uint32_t global_row = tile_row + thread_row + i;\n      |                                            ^~~~~~~~~~\n      |                                            tile_row\nkernel.cpp:65:17: note: 'tile_row' declared here\n   65 |   for (uint32_t tile_row = 0; tile_row < M; tile_row += BM) {\n      |                 ^\nkernel.cpp:145:44: error: use of undeclared identifier 'thread_col'; did you mean 'tile_col'?\n  145 |           uint32_t global_col = tile_col + thread_col + j;\n      |                                            ^~~~~~~~~~\n      |                                            tile_col\nkernel.cpp:66:19: note: 'tile_col' declared here\n   66 |     for (uint32_t tile_col = 0; tile_col < N; tile_col += BN) {\n      |                   ^\n2 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

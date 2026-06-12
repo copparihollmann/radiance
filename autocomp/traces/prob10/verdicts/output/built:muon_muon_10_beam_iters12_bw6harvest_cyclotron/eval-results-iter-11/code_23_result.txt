@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:109:20: error: cannot initialize a variable of type 'const float *' with an rvalue of type '__global float *'\n  109 |       const float* pA = args->A + start_m * A_ld;\n      |                    ^    ~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:110:20: error: cannot initialize a variable of type 'const float *' with an rvalue of type '__global float *'\n  110 |       const float* pB = args->B + start_n; // B is KxN, so column-wise stride is 1 for contiguous N access\n      |                    ^    ~~~~~~~~~~~~~~~~~\n2 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

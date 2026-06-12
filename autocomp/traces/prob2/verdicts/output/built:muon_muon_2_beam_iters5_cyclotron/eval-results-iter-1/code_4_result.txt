@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nernel.cpp:67:3: error: unknown type name '__local'\n   67 |   __local float* s_Q = (__local float*)0x00000000;          // 0x00000 - 0x04000 (16 KiB)\n      |   ^\nkernel.cpp:67:25: error: use of undeclared identifier '__local'\n   67 |   __local float* s_Q = (__local float*)0x00000000;          // 0x00000 - 0x04000 (16 KiB)\n      |                         ^\nkernel.cpp:68:3: error: unknown type name '__local'\n   68 |   __local float* s_K = (__local float*)0x00004000;          // 0x04000 - 0x08000 (16 KiB)\n      |   ^\nkernel.cpp:68:25: error: use of undeclared identifier '__local'\n   68 |   __local float* s_K = (__local float*)0x00004000;          // 0x04000 - 0x08000 (16 KiB)\n      |                         ^\nkernel.cpp:69:3: error: unknown type name '__local'\n   69 |   __local float* s_V = (__local float*)0x00008000;          // 0x08000 - 0x0C000 (16 KiB)\n      |   ^\nkernel.cpp:69:25: error: use of undeclared identifier '__local'\n   69 |   __local float* s_V = (__local float*)0x00008000;          // 0x08000 - 0x0C000 (16 KiB)\n      |                         ^\nkernel.cpp:70:3: error: unknown type name '__local'\n   70 |   __local float* s_S = (__local float*)0x0000C000;          // 0x0C000 - 0x10000 (16 KiB)\n      |   ^\nkernel.cpp:70:25: error: use of undeclared identifier '__local'\n   70 |   __local float* s_S = (__local float*)0x0000C000;          // 0x0C000 - 0x10000 (16 KiB)\n      |                         ^\n8 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

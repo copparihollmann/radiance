@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\ns_base + idx * 4, acc * scale);\n      |         ^\nkernel.cpp:130:19: error: use of undeclared identifier 'load_smem_float'\n  130 |         float m = load_smem_float(row_offset);\n      |                   ^\nkernel.cpp:132:25: error: use of undeclared identifier 'load_smem_float'\n  132 |             float val = load_smem_float(row_offset + j * 4);\n      |                         ^\nkernel.cpp:139:26: error: use of undeclared identifier 'load_smem_float'\n  139 |             float diff = load_smem_float(row_offset + j * 4) - m;\n      |                          ^\nkernel.cpp:141:13: error: use of undeclared identifier 'store_smem_float'\n  141 |             store_smem_float(row_offset + j * 4, e);\n      |             ^\nkernel.cpp:148:25: error: use of undeclared identifier 'load_smem_float'\n  148 |             float val = load_smem_float(row_offset + j * 4);\n      |                         ^\nkernel.cpp:149:13: error: use of undeclared identifier 'store_smem_float'\n  149 |             store_smem_float(row_offset + j * 4, val * inv_sum);\n      |             ^\nkernel.cpp:165:27: error: use of undeclared identifier 'load_smem_float'\n  165 |             float p_val = load_smem_float(p_row_base + j * 4);\n      |                           ^\nkernel.cpp:166:27: error: use of undeclared identifier 'load_smem_float'\n  166 |             float v_val = load_smem_float(v_col_base + j * d * 4);\n      |                           ^\n14 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

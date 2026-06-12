@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:75:57: error: use of undeclared identifier 'float_to_bits'\n   75 |             store_shared(shared_offset_base + k * 4, 0, float_to_bits(value));\n      |                                                         ^\nkernel.cpp:99:59: error: use of undeclared identifier 'float_to_bits'\n   99 |             store_shared(shared_offset_base + ckk * 4, 0, float_to_bits(value));\n      |                                                           ^\nkernel.cpp:119:25: error: use of undeclared identifier 'bits_to_float'\n  119 |             float lhs = bits_to_float(load32_shared(w_ptr));\n      |                         ^\nkernel.cpp:120:25: error: use of undeclared identifier 'bits_to_float'\n  120 |             float rhs = bits_to_float(load32_shared(patch_ptr));\n      |                         ^\n4 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

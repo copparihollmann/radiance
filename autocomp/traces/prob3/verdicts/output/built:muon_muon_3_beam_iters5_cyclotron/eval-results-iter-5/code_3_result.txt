@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\np:115:5: error: use of undeclared identifier 'store_float_shared'\n  115 |     store_float_shared(smem_s + (i * (seq + 16) + j) * 4, acc * 0.125f);\n      |     ^\nkernel.cpp:127:15: error: use of undeclared identifier 'load_float_shared'\n  127 |     float m = load_float_shared(row_base);\n      |               ^\nkernel.cpp:131:17: error: use of undeclared identifier 'load_float_shared'\n  131 |       float v = load_float_shared(r_ptr);\n      |                 ^\nkernel.cpp:141:24: error: use of undeclared identifier 'load_float_shared'\n  141 |       float e = mu_exp(load_float_shared(r_ptr) - m);\n      |                        ^\nkernel.cpp:142:7: error: use of undeclared identifier 'store_float_shared'\n  142 |       store_float_shared(r_ptr, e);\n      |       ^\nkernel.cpp:152:17: error: use of undeclared identifier 'load_float_shared'\n  152 |       float e = load_float_shared(r_ptr);\n      |                 ^\nkernel.cpp:153:7: error: use of undeclared identifier 'store_float_shared'\n  153 |       store_float_shared(r_ptr, e * inv);\n      |       ^\nkernel.cpp:174:14: error: use of undeclared identifier 'load_float_shared'\n  174 |       acc += load_float_shared(p_ptr) * load_float_shared(v_ptr);\n      |              ^\nkernel.cpp:174:41: error: use of undeclared identifier 'load_float_shared'\n  174 |       acc += load_float_shared(p_ptr) * load_float_shared(v_ptr);\n      |                                         ^\n15 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

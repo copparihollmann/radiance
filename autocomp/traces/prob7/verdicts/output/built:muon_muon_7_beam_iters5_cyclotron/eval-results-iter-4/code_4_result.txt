@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:99:13: error: redefinition of 'k' with a different type: 'float' vs 'int'\n   99 |       float k = __builtin_bit_cast(float, load32_shared(ka));\n      |             ^\nkernel.cpp:97:14: note: previous definition is here\n   97 |     for (int k = 0; k < 64; k++) {\n      |              ^\n1 error generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

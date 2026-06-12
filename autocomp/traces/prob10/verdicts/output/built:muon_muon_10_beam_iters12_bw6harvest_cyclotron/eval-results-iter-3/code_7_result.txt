@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n    ^~~~~~~~~~~~~~~~~~\n      |                                     load32_shared\n/scratch/agustin/projects/radiance-kernels/lib/include/mu_intrinsics.h:47:17: note: 'load32_shared' declared here\n   47 | inline uint32_t load32_shared(uint32_t address) {\n      |                 ^\nkernel.cpp:101:23: error: use of undeclared identifier 'bits_to_float'\n  101 |         float b_val = bits_to_float(load32_shared_addr(b_col_base + k_inner * 256)); // Stride=256 due to column-major storage of B-tile\n      |                       ^\nkernel.cpp:105:45: error: use of undeclared identifier 'float_to_bits'\n  105 |       store_shared_imm(smem_c + idx * 4, 0, float_to_bits(acc));\n      |                                             ^\nkernel.cpp:117:39: error: use of undeclared identifier 'load32_shared_addr'; did you mean 'load32_shared'?\n  117 |     args->C[glob_idx] = bits_to_float(load32_shared_addr(smem_c + idx * 4));\n      |                                       ^~~~~~~~~~~~~~~~~~\n      |                                       load32_shared\n/scratch/agustin/projects/radiance-kernels/lib/include/mu_intrinsics.h:47:17: note: 'load32_shared' declared here\n   47 | inline uint32_t load32_shared(uint32_t address) {\n      |                 ^\nkernel.cpp:117:25: error: use of undeclared identifier 'bits_to_float'\n  117 |     args->C[glob_idx] = bits_to_float(load32_shared_addr(smem_c + idx * 4));\n      |                         ^\n12 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

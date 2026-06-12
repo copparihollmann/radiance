@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:55:24: error: use of undeclared identifier 'sdata'\n   55 |   __shared float* As = sdata;                    // 64 rows * 17 floats = 1088 floats per row\n      |                        ^\nkernel.cpp:56:24: error: use of undeclared identifier 'sdata'\n   56 |   __shared float* Bs = sdata + 64 * 17;          // Next 16 * 65 = 1040 floats\n      |                        ^\nkernel.cpp:57:24: error: use of undeclared identifier 'sdata'\n   57 |   __shared float* Cs = sdata + 64 * 17 + 16 * 65; // Final 4096 floats\n      |                        ^\n3 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

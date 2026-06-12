@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n                                              ^\nkernel.cpp:108:15: error: use of undeclared identifier 'bits_to_float'\n  108 |     float m = bits_to_float(load32_shared(row_base));\n      |               ^\nkernel.cpp:110:17: error: use of undeclared identifier 'bits_to_float'\n  110 |       float v = bits_to_float(load32_shared(row_base + c * 4));\n      |                 ^\nkernel.cpp:117:17: error: use of undeclared identifier 'bits_to_float'\n  117 |       float v = bits_to_float(load32_shared(row_base + c * 4));\n      |                 ^\nkernel.cpp:119:41: error: use of undeclared identifier 'float_to_bits'\n  119 |       store_shared(row_base + c * 4, 0, float_to_bits(e));\n      |                                         ^\nkernel.cpp:126:17: error: use of undeclared identifier 'bits_to_float'\n  126 |       float e = bits_to_float(load32_shared(row_base + c * 4));\n      |                 ^\nkernel.cpp:127:41: error: use of undeclared identifier 'float_to_bits'\n  127 |       store_shared(row_base + c * 4, 0, float_to_bits(e * inv_sum));\n      |                                         ^\nkernel.cpp:142:14: error: use of undeclared identifier 'bits_to_float'\n  142 |       acc += bits_to_float(load32_shared(p_base + j * 4)) *\n      |              ^\nkernel.cpp:143:14: error: use of undeclared identifier 'bits_to_float'\n  143 |              bits_to_float(load32_shared(v_base + j * STRIDE * 4));\n      |              ^\n14 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

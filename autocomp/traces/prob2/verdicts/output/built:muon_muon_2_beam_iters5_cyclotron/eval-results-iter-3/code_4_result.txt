@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "INCORRECT: 3584 lane(s) wrong vs golden. Check the cross-core barrier (mu_barrier(0, total_warps) AFTER the schedule), per-phase barriers (mu_barrier(1, nw)) between SMEM produce/consume, and the thread->output mapping derived from threads_per_threadblock (not a literal warp count). Gold accumulates sequentially (FP order)."
+}

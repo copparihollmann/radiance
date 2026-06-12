@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:55:23: error: use of undeclared identifier 'tid_in_threadbuffer'; did you mean 'tid_in_threadblock'?\n   55 |   const uint32_t lc = tid_in_threadbuffer & 15; // column index within tile (0..15)\n      |                       ^~~~~~~~~~~~~~~~~~~\n      |                       tid_in_threadblock\nkernel.cpp:42:12: note: 'tid_in_threadblock' declared here\n   42 |   uint32_t tid_in_threadblock,\n      |            ^\n1 error generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

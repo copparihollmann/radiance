@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n                            ^\nkernel.cpp:86:48: error: use of undeclared identifier 'SMEM_A'\n   86 |                             store_shared_float(SMEM_A(ar, ac), val);\n      |                                                ^\nkernel.cpp:88:48: error: use of undeclared identifier 'SMEM_A'\n   88 |                             store_shared_float(SMEM_A(ar, ac), 0.0f);\n      |                                                ^\nkernel.cpp:96:38: error: use of undeclared identifier 'TILE_K'\n   96 |                     if (linear_idx < TILE_K * TILE_N) {\n      |                                      ^\nkernel.cpp:96:47: error: use of undeclared identifier 'TILE_N'\n   96 |                     if (linear_idx < TILE_K * TILE_N) {\n      |                                               ^\nkernel.cpp:97:52: error: use of undeclared identifier 'TILE_N'\n   97 |                         uint32_t br = linear_idx / TILE_N;\n      |                                                    ^\nkernel.cpp:98:52: error: use of undeclared identifier 'TILE_N'\n   98 |                         uint32_t bc = linear_idx % TILE_N;\n      |                                                    ^\nkernel.cpp:104:48: error: use of undeclared identifier 'SMEM_B'\n  104 |                             store_shared_float(SMEM_B(br, bc), val);\n      |                                                ^\nfatal error: too many errors emitted, stopping now [-ferror-limit=]\n20 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

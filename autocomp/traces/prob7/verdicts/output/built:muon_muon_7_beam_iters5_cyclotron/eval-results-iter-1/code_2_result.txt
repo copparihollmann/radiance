@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:160:21: error: use of undeclared identifier 'fmaxf'\n  160 |         float val = fmaxf(load32_shared(smem_max_reduce + lane_id * sizeof(float)),\n      |                     ^\nkernel.cpp:166:21: error: use of undeclared identifier 'fmaxf'\n  166 |         float val = fmaxf(load32_shared(smem_max_reduce + lane_id * sizeof(float)),\n      |                     ^\nkernel.cpp:172:21: error: use of undeclared identifier 'fmaxf'\n  172 |         float val = fmaxf(load32_shared(smem_max_reduce + lane_id * sizeof(float)),\n      |                     ^\nkernel.cpp:178:21: error: use of undeclared identifier 'fmaxf'\n  178 |         float val = fmaxf(load32_shared(smem_max_reduce),\n      |                     ^\n4 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

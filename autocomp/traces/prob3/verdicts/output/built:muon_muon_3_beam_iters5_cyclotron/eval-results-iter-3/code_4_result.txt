@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n 4);\n      |                                    ^\nkernel.cpp:112:24: error: use of undeclared identifier 'reduce_smem_base'\n  112 |       store_f32_shared(reduce_smem_base + warp_id * 32 * 4 + lane_id * 4, 0, (val1 > val2) ? val1 : val2);\n      |                        ^\nkernel.cpp:115:36: error: use of undeclared identifier 'reduce_smem_base'\n  115 |       float val1 = load_f32_shared(reduce_smem_base + warp_id * 32 * 4 + lane_id * 4);\n      |                                    ^\nkernel.cpp:116:36: error: use of undeclared identifier 'reduce_smem_base'\n  116 |       float val2 = load_f32_shared(reduce_smem_base + warp_id * 32 * 4 + (lane_id + 2) * 4);\n      |                                    ^\nkernel.cpp:117:24: error: use of undeclared identifier 'reduce_smem_base'\n  117 |       store_f32_shared(reduce_smem_base + warp_id * 32 * 4 + lane_id * 4, 0, (val1 > val2) ? val1 : val2);\n      |                        ^\nkernel.cpp:120:36: error: use of undeclared identifier 'reduce_smem_base'\n  120 |       float val1 = load_f32_shared(reduce_smem_base + warp_id * 32 * 4 + lane_id * 4);\n      |                                    ^\nkernel.cpp:121:36: error: use of undeclared identifier 'reduce_smem_base'\n  121 |       float val2 = load_f32_shared(reduce_smem_base + warp_id * 32 * 4 + (lane_id + 1) * 4);\n      |                                    ^\nfatal error: too many errors emitted, stopping now [-ferror-limit=]\n20 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

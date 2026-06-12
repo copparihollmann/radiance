@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nts_to_float'\n  131 |       if (bits_to_float(val) > bits_to_float(max_val)) {\n      |                                ^\nkernel.cpp:141:30: error: use of undeclared identifier 'bits_to_float'\n  141 |       float exp_val = mu_exp(bits_to_float(val) - bits_to_float(max_val));\n      |                              ^\nkernel.cpp:141:51: error: use of undeclared identifier 'bits_to_float'\n  141 |       float exp_val = mu_exp(bits_to_float(val) - bits_to_float(max_val));\n      |                                                   ^\nkernel.cpp:142:49: error: use of undeclared identifier 'float_to_bits'\n  142 |       asm volatile(\"sw.shared %0, 0(%1)\" :: \"r\"(float_to_bits(exp_val)), \"r\"(s_smem_addr + (row_offset + j) * 4) : \"memory\");\n      |                                                 ^\nkernel.cpp:151:63: error: use of undeclared identifier 'bits_to_float'\n  151 |       asm volatile(\"sw.shared %0, 0(%1)\" :: \"r\"(float_to_bits(bits_to_float(val) * inv_sum)), \"r\"(s_smem_addr + (row_offset + j) * 4) : \"memory\");\n      |                                                               ^\nkernel.cpp:170:14: error: use of undeclared identifier 'bits_to_float'\n  170 |       acc += bits_to_float(p_val) * bits_to_float(v_val);\n      |              ^\nkernel.cpp:170:37: error: use of undeclared identifier 'bits_to_float'\n  170 |       acc += bits_to_float(p_val) * bits_to_float(v_val);\n      |                                     ^\n14 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

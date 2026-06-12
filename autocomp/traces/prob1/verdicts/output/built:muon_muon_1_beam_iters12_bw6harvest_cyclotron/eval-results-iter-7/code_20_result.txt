@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:51:3: error: unknown type name '__local'\n   51 |   __local float* smem = reinterpret_cast<__local float*>(0);\n      |   ^\nkernel.cpp:51:42: error: unknown type name '__local'\n   51 |   __local float* smem = reinterpret_cast<__local float*>(0);\n      |                                          ^\nkernel.cpp:81:13: error: unknown type name '__local'\n   81 |       const __local float* wa = smem + smem_w_words + (idx / P) * CKK; // W base pointer\n      |             ^\nkernel.cpp:82:13: error: unknown type name '__local'\n   82 |       const __local float* pa = smem + (idx % P) * CKK;                // patch base pointer\n      |             ^\n4 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

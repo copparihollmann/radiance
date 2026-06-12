@@ -239,6 +239,17 @@ class RadianceSingleClusterConfig extends Config(
   new RadianceBaseConfig
 )
 
+// RadianceSingleClusterConfig with tracing and profiler disabled, for fast RTL cycle gating.
+class RadianceSingleClusterFastConfig extends Config(
+  new WithRadianceMxGemmini(location = InCluster(0), dim = 16, accSizeInKB = 32, tileSize = (8, 8, 8)) ++
+  new WithMuonCores(2, location = InCluster(0), noILP = false, l0i = Some(L0iCacheConfig), l0d = Some(L0dCacheConfig), trace = false, profiler = false) ++
+  new WithRadianceCluster(0, smemConfig = TapeoutSmemConfig, l1Config = L1CacheConfig) ++
+  new WithExtGPUMem() ++
+  new WithRadianceRocket ++
+  new WithGPUResetAggregator(defaultReset = false) ++
+  new RadianceBaseConfig
+)
+
 class RadianceSingleClusterSynConfig extends Config(
   new WithRadianceMxGemmini(location = InCluster(0), dim = 16, accSizeInKB = 32, tileSize = (8, 8, 8)) ++
   new WithMuonCores(2, location = InCluster(0), noILP = false, l0i = Some(L0iCacheConfig), l0d = Some(L0dCacheConfig), trace = false, profiler = false) ++
@@ -428,6 +439,26 @@ class RadianceSingleClusterHostLaunchConfig extends Config(
   new WithExtGPUMem() ++
   new WithRadianceRocket ++
   new WithGPUResetAggregator(defaultReset = true) ++
+  new RadianceBaseConfig
+)
+
+// Single-cluster, single Muon core, WITH rocket host + command processor AND
+// cyclotron lockstep difftest. The cyclotron DPI difftest path supports exactly
+// one Muon core (see cyclotron/src/dpi/mod.rs), so this trims
+// RadianceSingleClusterConfig down to a single core to make RTL<->cyclotron
+// lockstep legal.
+// NOTE: ISA-level lockstep matches cycle-exact, but full *kernel* lockstep
+// currently stalls at the neutrino `nu.invoke` launch -- cyclotron's difftest/DPI
+// kernel-launch model is still WIP (the same kernels run to completion in
+// cyclotron standalone). Kept for ISA-level difftest today and kernel-level
+// lockstep once the DPI launch path lands.
+class RadianceSingleClusterSingleCoreDiffTestConfig extends Config(
+  new WithRadianceMxGemmini(location = InCluster(0), dim = 16, accSizeInKB = 32, tileSize = (8, 8, 8)) ++
+  new WithMuonCores(1, location = InCluster(0), noILP = false, l0i = Some(L0iCacheConfig), l0d = Some(L0dCacheConfig), trace = true, difftest = true) ++
+  new WithRadianceCluster(0, smemConfig = TapeoutSmemConfig, l1Config = L1CacheConfig) ++
+  new WithExtGPUMem() ++
+  new WithRadianceRocket ++
+  new WithGPUResetAggregator(defaultReset = false) ++
   new RadianceBaseConfig
 )
 

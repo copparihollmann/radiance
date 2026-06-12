@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n      for (uint32_t k_outer = 0; k_outer < K; k_outer += TS_K) {\n      |                                                            ^\nkernel.cpp:94:55: error: use of undeclared identifier 'TS_K'\n   94 |             for (uint32_t load_step = 0; load_step < (TS_K + 15) / 16; ++load_step) {\n      |                                                       ^\nkernel.cpp:96:40: error: use of undeclared identifier 'TS_K'\n   96 |                 if (load_element_idx < TS_K) {\n      |                                        ^\nkernel.cpp:99:53: error: use of undeclared identifier 'TS_K'\n   99 |                     uint32_t a_smem_offset = ((tm * TS_K + load_element_idx) << 2);\n      |                                                     ^\nkernel.cpp:106:75: error: use of undeclared identifier 'TS_N'\n  106 |                     uint32_t b_smem_offset = 0x800 + ((load_element_idx * TS_N + b_col) << 2);\n      |                                                                           ^\nkernel.cpp:116:47: error: use of undeclared identifier 'TS_K'\n  116 |             const uint32_t smem_a_base = tm * TS_K << 2;\n      |                                               ^\nkernel.cpp:124:50: error: use of undeclared identifier 'TS_K'\n  124 |             for (uint32_t k_inner = 0; k_inner < TS_K; k_inner++) {\n      |                                                  ^\nfatal error: too many errors emitted, stopping now [-ferror-limit=]\n20 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

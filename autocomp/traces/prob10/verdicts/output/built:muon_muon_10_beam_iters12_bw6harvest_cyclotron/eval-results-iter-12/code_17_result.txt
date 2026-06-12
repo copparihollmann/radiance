@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n                               ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:111:37: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  111 |           const float a1 = *(float*)&load32_shared(a_base1 + off);\n      |                                     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:113:37: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  113 |           const float b0 = *(float*)&load32_shared(b_base + off);\n      |                                     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:114:37: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  114 |           const float b1 = *(float*)&load32_shared(b_base + (64 + PAD) * 4 + off);\n      |                                     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:115:37: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  115 |           const float b2 = *(float*)&load32_shared(b_base + 2 * (64 + PAD) * 4 + off);\n      |                                     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:116:37: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  116 |           const float b3 = *(float*)&load32_shared(b_base + 3 * (64 + PAD) * 4 + off);\n      |                                     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n6 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

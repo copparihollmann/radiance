@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:112:30: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  112 |       float val = *((float*)(&load32_shared((uint32_t)row_ptr + (j << 2))));\n      |                              ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:119:30: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  119 |       float val = *((float*)(&load32_shared((uint32_t)row_ptr + (j << 2))));\n      |                              ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:128:30: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  128 |       float val = *((float*)(&load32_shared((uint32_t)row_ptr + (j << 2))));\n      |                              ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:147:32: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  147 |       float p_val = *((float*)(&load32_shared(S_SCRATCH_ADDR + ((row * seq + k) << 2))));\n      |                                ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:148:32: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  148 |       float v_val = *((float*)(&load32_shared(S_K_ADDR + ((k * d + col) << 2)))); // V is at S_K_ADDR\n      |                                ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n7 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

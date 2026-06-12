@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nb.26(62.50%), %bb.2(37.50%)\n  liveins: $x5, $x6, $x7, $x10, $x11, $x12, $x13, $x14, $x15, $x16, $x17, $x32, $x33, $x34, $x35, $x36, $x37, $x38, $x39, $x40, $x41, $x42, $x43, $x44, $x45, $x46, $x47\n  VX_JOIN killed renamable $x6\n  renamable $x6 = VX_SPLIT_N renamable $x7\n  BEQ killed renamable $x7, $x0, %bb.2\n\nbb.26.if.then100:\n; predecessors: %bb.25\n  successors: %bb.2(0x80000000); %bb.2(100.00%)\n  liveins: $x5, $x6, $x10, $x11, $x12, $x13, $x14, $x15, $x16, $x17, $x32, $x33, $x34, $x35, $x36, $x37, $x38, $x39, $x40, $x41, $x42, $x43, $x44, $x45, $x46, $x47\n  renamable $x7 = OR killed renamable $x5, renamable $x34\n  renamable $x5 = LW renamable $x10, 8 :: (load (s32) from %ir.sunkaddr202, !tbaa !38)\n  renamable $x28 = ADD killed renamable $x46, renamable $x33\n  renamable $x46 = MUL killed renamable $x28, renamable $x15\n  renamable $x28 = SLLI killed renamable $x46, 2\n  renamable $x46 = ADD killed renamable $x5, killed renamable $x28\n  renamable $x5 = SLLI killed renamable $x7, 2\n  renamable $x28 = ADD killed renamable $x46, killed renamable $x5\n  SW killed renamable $x47, killed renamable $x28, 0 :: (store (s32) into %ir.arrayidx105, !tbaa !23)\n  PseudoBR %bb.2\n\nbb.27.join_stub226:\n; predecessors: %bb.0, %bb.3\n  liveins: $x17\n  VX_JOIN killed renamable $x17\n  $x1 = LW $x2, 12 :: (load (s32) from %stack.0)\n  $x2 = frame-destroy ADDI $x2, 16\n  PseudoRET\n\n# End machine code for function _ZL11kernel_bodyPvjjj.\n\n2 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

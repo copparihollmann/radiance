@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n:86:37: error: invalid operand number in inline asm string\n   86 |     asm volatile(\"sw.shared %1, %0(%2)\" :: \"r\"(smem_addr), \"r\"(data) : \"memory\");\n      |                  ~~~~~~~~~~~~~~~~~~~^~~\nkernel.cpp:96:37: error: invalid operand number in inline asm string\n   96 |     asm volatile(\"sw.shared %1, %0(%2)\" :: \"r\"(smem_addr), \"r\"(data) : \"memory\");\n      |                  ~~~~~~~~~~~~~~~~~~~^~~\nkernel.cpp:106:37: error: invalid operand number in inline asm string\n  106 |     asm volatile(\"sw.shared %1, %0(%2)\" :: \"r\"(smem_addr), \"r\"(data) : \"memory\");\n      |                  ~~~~~~~~~~~~~~~~~~~^~~\nkernel.cpp:129:37: error: invalid operand number in inline asm string\n  129 |     asm volatile(\"sw.shared %1, %0(%2)\" :: \"r\"(s_addr), \"r\"(bits) : \"memory\");\n      |                  ~~~~~~~~~~~~~~~~~~~^~~\nkernel.cpp:156:39: error: invalid operand number in inline asm string\n  156 |       asm volatile(\"sw.shared %1, %0(%2)\" :: \"r\"(addr), \"r\"(e_bits) : \"memory\");\n      |                    ~~~~~~~~~~~~~~~~~~~^~~\nkernel.cpp:168:39: error: invalid operand number in inline asm string\n  168 |       asm volatile(\"sw.shared %1, %0(%2)\" :: \"r\"(addr), \"r\"(n_bits) : \"memory\");\n      |                    ~~~~~~~~~~~~~~~~~~~^~~\nkernel.cpp:189:31: error: invalid operand number in inline asm string\n  189 |     asm volatile(\"fsw %1, %0(%2)\" :: \"r\"(&a->O[idx]), \"f\"(acc) : \"memory\");\n      |                  ~~~~~~~~~~~~~^~~\n7 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

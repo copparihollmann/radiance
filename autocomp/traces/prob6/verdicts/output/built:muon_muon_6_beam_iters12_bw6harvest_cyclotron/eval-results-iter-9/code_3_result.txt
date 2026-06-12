@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n$x2, 156 :: (load (s32) from %stack.66)\n  $x80 = LW $x2, 152 :: (load (s32) from %stack.67)\n  $x81 = LW $x2, 148 :: (load (s32) from %stack.68)\n  $x82 = LW $x2, 144 :: (load (s32) from %stack.69)\n  $x83 = LW $x2, 140 :: (load (s32) from %stack.70)\n  $x84 = LW $x2, 136 :: (load (s32) from %stack.71)\n  $x85 = LW $x2, 132 :: (load (s32) from %stack.72)\n  $x86 = LW $x2, 128 :: (load (s32) from %stack.73)\n  $x87 = LW $x2, 124 :: (load (s32) from %stack.74)\n  $x88 = LW $x2, 120 :: (load (s32) from %stack.75)\n  $x89 = LW $x2, 116 :: (load (s32) from %stack.76)\n  $x90 = LW $x2, 112 :: (load (s32) from %stack.77)\n  $x91 = LW $x2, 108 :: (load (s32) from %stack.78)\n  $x92 = LW $x2, 104 :: (load (s32) from %stack.79)\n  $x93 = LW $x2, 100 :: (load (s32) from %stack.80)\n  $x94 = LW $x2, 96 :: (load (s32) from %stack.81)\n  $x95 = LW $x2, 92 :: (load (s32) from %stack.82)\n  $x2 = frame-destroy ADDI $x2, 336\n  PseudoRET\n\n# End machine code for function _ZL11kernel_bodyPvjjj.\n\nclang++: warning: argument unused during compilation: '-nostartfiles' [-Wunused-command-line-argument]\nld.lld: error: undefined symbol: fmaf\n>>> referenced by kernel.cpp\n>>>               kernel.mu.o:(kernel_body(void*, unsigned int, unsigned int, unsigned int))\n>>> referenced by kernel.cpp\n>>>               kernel.mu.o:(kernel_body(void*, unsigned int, unsigned int, unsigned int))\nclang++: error: ld.lld command failed with exit code 1 (use -v to see invocation)\nmake: *** [../common.mk:107: kernel.radiance.elf] Error 1\n"
+}

@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n* TS_M)) * K + (ko + a_col);\n      |                                                            ^\nkernel.cpp:85:30: error: use of undeclared identifier 'TS_M'\n   85 |         float val = (a_row < TS_M && (ko + a_col) < K) ? A[a_linear_idx] : 0.0f;\n      |                              ^\nkernel.cpp:86:51: error: use of undeclared identifier 'TS_K'\n   86 |         uint32_t a_addr = A_SMEM_BASE + (a_row * (TS_K + PADDING) + a_col) * 4;\n      |                                                   ^\nkernel.cpp:86:58: error: use of undeclared identifier 'PADDING'\n   86 |         uint32_t a_addr = A_SMEM_BASE + (a_row * (TS_K + PADDING) + a_col) * 4;\n      |                                                          ^\nkernel.cpp:86:27: error: use of undeclared identifier 'A_SMEM_BASE'\n   86 |         uint32_t a_addr = A_SMEM_BASE + (a_row * (TS_K + PADDING) + a_col) * 4;\n      |                           ^\nkernel.cpp:87:9: error: use of undeclared identifier 'store_shared_float'\n   87 |         store_shared_float(a_addr, val);\n      |         ^\nkernel.cpp:95:37: error: use of undeclared identifier 'TS_N'\n   95 |         uint32_t b_row = flat_idx / TS_N;\n      |                                     ^\nkernel.cpp:96:37: error: use of undeclared identifier 'TS_N'\n   96 |         uint32_t b_col = flat_idx % TS_N;\n      |                                     ^\nfatal error: too many errors emitted, stopping now [-ferror-limit=]\n20 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

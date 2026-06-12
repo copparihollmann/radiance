@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "INCORRECT UNDER TIMING: 64 lane(s) wrong with the timing model (but correct functionally) => a TIMING-DEPENDENT race. Use mu_barrier(0, total_warps) (ID 0 = CROSS-CORE) \u2014 not ID 1 (per-core) \u2014 after staging into SMEM that other cores read, and mu_fence_smem() before the cross-core barrier. Ensure all threadblock stores are visible before any read across cores."
+}

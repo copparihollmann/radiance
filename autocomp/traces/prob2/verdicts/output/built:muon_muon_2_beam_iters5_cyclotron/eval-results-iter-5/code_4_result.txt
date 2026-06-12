@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  128 |       float v = *(float*)&load32_shared(row_offset + j * 4);\n      |                          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:136:28: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  136 |       float val = *(float*)&load32_shared(row_offset + j * 4);\n      |                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:146:26: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  146 |       float e = *(float*)&load32_shared(row_offset + j * 4);\n      |                          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:147:55: error: cannot take the address of an rvalue of type 'float'\n  147 |       store_shared(row_offset + j * 4, 0, *(uint32_t*)&(e * inv));\n      |                                                       ^ ~~~~~~~\nkernel.cpp:164:30: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  164 |       float s_val = *(float*)&load32_shared(s_row_base + j * 4);\n      |                              ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:165:30: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  165 |       float v_val = *(float*)&load32_shared(v_col_base + j * d * 4);\n      |                              ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n10 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nidentifier 'V_smem_base'\n   74 |     asm volatile(\"sw.shared %1, 0(%0)\" :: \"r\"(V_smem_base + offset), \"r\"(offset) : \"memory\");\n      |                                               ^\nkernel.cpp:102:31: error: use of undeclared identifier 'K_smem_base'\n  102 |             uint32_t k_addr = K_smem_base + c * HEAD_DIM * 4 + k_word;\n      |                               ^\nkernel.cpp:118:29: error: use of undeclared identifier 'S_smem_base'\n  118 |           uint32_t s_addr = S_smem_base + warp_id * SEQ * 4 + c * 4;\n      |                             ^\nkernel.cpp:134:28: error: use of undeclared identifier 'S_smem_base'\n  134 |     uint32_t reduce_base = S_smem_base + 8 * SEQ * 4 + warp_id * 16 * 4;\n      |                            ^\nkernel.cpp:197:20: error: use of undeclared identifier 'c_base'\n  197 |       uint32_t c = c_base + i * 16 + lane_id;\n      |                    ^\nkernel.cpp:199:27: error: use of undeclared identifier 'S_smem_base'\n  199 |         uint32_t s_addr = S_smem_base + warp_id * SEQ * 4 + c * 4;\n      |                           ^\nkernel.cpp:209:25: error: use of undeclared identifier 'S_smem_base'\n  209 |       uint32_t p_addr = S_smem_base + warp_id * SEQ * 4 + c * 4;\n      |                         ^\nkernel.cpp:217:29: error: use of undeclared identifier 'V_smem_base'\n  217 |           uint32_t v_addr = V_smem_base + (c * HEAD_DIM + k_elem) * 4;\n      |                             ^\n9 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

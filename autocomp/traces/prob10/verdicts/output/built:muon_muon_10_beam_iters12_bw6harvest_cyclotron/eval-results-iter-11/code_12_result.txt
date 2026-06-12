@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n         acc1 += a * load_float_shared(bs_base + (k * 64 + col0 + 1) * 4);\n      |                     ^\nkernel.cpp:118:21: error: use of undeclared identifier 'load_float_shared'\n  118 |         acc2 += a * load_float_shared(bs_base + (k * 64 + col0 + 2) * 4);\n      |                     ^\nkernel.cpp:119:21: error: use of undeclared identifier 'load_float_shared'\n  119 |         acc3 += a * load_float_shared(bs_base + (k * 64 + col0 + 3) * 4);\n      |                     ^\nkernel.cpp:128:35: error: use of undeclared identifier 'load_float_shared'\n  128 |       store_float_shared(c_addr0, load_float_shared(c_addr0) + acc0);\n      |                                   ^\nkernel.cpp:129:35: error: use of undeclared identifier 'load_float_shared'\n  129 |       store_float_shared(c_addr1, load_float_shared(c_addr1) + acc1);\n      |                                   ^\nkernel.cpp:130:35: error: use of undeclared identifier 'load_float_shared'\n  130 |       store_float_shared(c_addr2, load_float_shared(c_addr2) + acc2);\n      |                                   ^\nkernel.cpp:131:35: error: use of undeclared identifier 'load_float_shared'\n  131 |       store_float_shared(c_addr3, load_float_shared(c_addr3) + acc3);\n      |                                   ^\nkernel.cpp:142:17: error: use of undeclared identifier 'load_float_shared'\n  142 |     float val = load_float_shared(cs_base + idx * 4);\n      |                 ^\n13 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

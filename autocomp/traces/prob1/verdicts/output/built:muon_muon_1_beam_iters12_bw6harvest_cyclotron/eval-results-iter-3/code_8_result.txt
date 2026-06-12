@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n inline uint32_t load32_shared(uint32_t address) {\n      |                 ^\nkernel.cpp:137:20: error: use of undeclared identifier 'load32_shared_float'; did you mean 'load32_shared'?\n  137 |         float p6 = load32_shared_float(pa + 24);\n      |                    ^~~~~~~~~~~~~~~~~~~\n      |                    load32_shared\n/scratch/agustin/projects/radiance-kernels/lib/include/mu_intrinsics.h:47:17: note: 'load32_shared' declared here\n   47 | inline uint32_t load32_shared(uint32_t address) {\n      |                 ^\nkernel.cpp:140:20: error: use of undeclared identifier 'load32_shared_float'; did you mean 'load32_shared'?\n  140 |         float w7 = load32_shared_float(wa + 28);\n      |                    ^~~~~~~~~~~~~~~~~~~\n      |                    load32_shared\n/scratch/agustin/projects/radiance-kernels/lib/include/mu_intrinsics.h:47:17: note: 'load32_shared' declared here\n   47 | inline uint32_t load32_shared(uint32_t address) {\n      |                 ^\nkernel.cpp:141:20: error: use of undeclared identifier 'load32_shared_float'; did you mean 'load32_shared'?\n  141 |         float p7 = load32_shared_float(pa + 28);\n      |                    ^~~~~~~~~~~~~~~~~~~\n      |                    load32_shared\n/scratch/agustin/projects/radiance-kernels/lib/include/mu_intrinsics.h:47:17: note: 'load32_shared' declared here\n   47 | inline uint32_t load32_shared(uint32_t address) {\n      |                 ^\n16 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

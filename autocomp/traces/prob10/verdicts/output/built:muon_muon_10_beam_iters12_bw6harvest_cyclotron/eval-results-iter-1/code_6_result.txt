@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:67:31: error: cannot initialize a variable of type 'const float *__restrict' with an rvalue of type '__global float *'\n   67 |     const float* __restrict__ A_base = args->A + block_r * 64;\n      |                               ^        ~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:68:31: error: cannot initialize a variable of type 'const float *__restrict' with an rvalue of type '__global float *'\n   68 |     const float* __restrict__ B_base = args->B + block_c;\n      |                               ^        ~~~~~~~~~~~~~~~~~\n2 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

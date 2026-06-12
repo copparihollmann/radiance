@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nx32, $x33, $x34, $x35, $x36, $x37, $x38, $x39, $x40, $x41, $x42, $x43, $x44, $x45, $x46, $x47, $x96, $x97, $x98, $x99, $x100\n  renamable $x100 = nofpexcept FMADD_S_INX undef renamable $x10, undef renamable $x10, killed renamable $x100, 7, implicit $frm\n  renamable $x97 = nsw ADDI killed renamable $x97, -1\n  renamable $x98 = nuw nsw ADDI killed renamable $x98, 260\n  renamable $x99 = nuw nsw ADDI killed renamable $x99, 4\n  BNE renamable $x97, $x0, %bb.40\n  PseudoBR %bb.2\n\nbb.41.join_stub343:\n; predecessors: %bb.0, %bb.2\n  successors: %bb.42(0x80000000); %bb.42(100.00%)\n  liveins: $x10, $x11, $x12, $x13, $x14, $x15\n  VX_JOIN killed renamable $x14\n  renamable $x16 = ADD killed renamable $x15, killed renamable $x10\n  renamable $x10 = ADDI $x0, 32\n\nbb.42.for.body117:\n; predecessors: %bb.41, %bb.42\n  successors: %bb.43(0x04000000), %bb.42(0x7c000000); %bb.43(3.12%), %bb.42(96.88%)\n  liveins: $x10, $x11, $x12, $x13, $x16\n  renamable $x14 = DIVU renamable $x11, renamable $x13\n  renamable $x15 = SLTU killed renamable $x14, renamable $x12\n  renamable $x14 = VX_SPLIT renamable $x15\n  VX_JOIN killed renamable $x14\n  renamable $x10 = nsw ADDI killed renamable $x10, -1\n  renamable $x11 = ADDI killed renamable $x11, 128\n  renamable $x16 = ADDI killed renamable $x16, 512\n  BNE renamable $x10, $x0, %bb.42\n\nbb.43.for.cond.cleanup116:\n; predecessors: %bb.42\n\n  PseudoRET\n\n# End machine code for function _ZL11kernel_bodyPvjjj.\n\n20 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

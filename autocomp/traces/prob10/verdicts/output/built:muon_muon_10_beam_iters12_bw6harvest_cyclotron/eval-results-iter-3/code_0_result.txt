@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:81:11: error: unknown type name 'FloatBits'\n   81 |           FloatBits val;\n      |           ^\nkernel.cpp:97:11: error: unknown type name 'FloatBits'\n   97 |           FloatBits val;\n      |           ^\nkernel.cpp:121:13: error: unknown type name 'FloatBits'\n  121 |             FloatBits a_bits, b_bits;\n      |             ^\nkernel.cpp:123:13: error: use of undeclared identifier 'b_bits'; did you mean 'a_bits'?\n  123 |             b_bits.u = load32_shared(addr_b);\n      |             ^~~~~~\n      |             a_bits\nkernel.cpp:121:23: note: 'a_bits' declared here\n  121 |             FloatBits a_bits, b_bits;\n      |                       ^\nkernel.cpp:124:31: error: use of undeclared identifier 'b_bits'\n  124 |             acc += a_bits.f * b_bits.f;\n      |                               ^\nkernel.cpp:133:15: error: unknown type name 'FloatBits'\n  133 |               FloatBits init_val;\n      |               ^\nkernel.cpp:138:15: error: unknown type name 'FloatBits'\n  138 |               FloatBits old_val;\n      |               ^\nkernel.cpp:140:15: error: unknown type name 'FloatBits'\n  140 |               FloatBits new_val;\n      |               ^\nkernel.cpp:159:11: error: unknown type name 'FloatBits'\n  159 |           FloatBits val;\n      |           ^\n9 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

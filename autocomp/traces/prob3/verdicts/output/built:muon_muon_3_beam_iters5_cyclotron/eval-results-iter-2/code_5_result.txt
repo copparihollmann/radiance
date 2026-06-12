@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\ncal'\n   72 |   __local float* const K_smem    = (__local float*)0x09000;\n      |                                     ^\nkernel.cpp:73:3: error: unknown type name '__local'\n   73 |   __local float* const V_smem_T  = (__local float*)0x0F000;\n      |   ^\nkernel.cpp:73:37: error: use of undeclared identifier '__local'\n   73 |   __local float* const V_smem_T  = (__local float*)0x0F000;\n      |                                     ^\nkernel.cpp:126:23: error: use of undeclared identifier '__local'\n  126 |       float* s_row = (__local float*)((uintptr_t)S_smem + (i * seq * sizeof(float)));\n      |                       ^\nkernel.cpp:161:13: error: unknown type name '__local'\n  161 |       const __local float* s_row = (__local float*)((uintptr_t)S_smem + (i * seq * sizeof(float)));\n      |             ^\nkernel.cpp:161:37: error: use of undeclared identifier '__local'\n  161 |       const __local float* s_row = (__local float*)((uintptr_t)S_smem + (i * seq * sizeof(float)));\n      |                                     ^\nkernel.cpp:162:13: error: unknown type name '__local'\n  162 |       const __local float* v_col = (__local float*)((uintptr_t)V_smem_T + (k * seq * sizeof(float)));\n      |             ^\nkernel.cpp:162:37: error: use of undeclared identifier '__local'\n  162 |       const __local float* v_col = (__local float*)((uintptr_t)V_smem_T + (k * seq * sizeof(float)));\n      |                                     ^\n11 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

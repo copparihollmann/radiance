@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nn type name '__local'\n   72 |   __local float* smem_K = reinterpret_cast<__local float*>(0x00008000);\n      |   ^\nkernel.cpp:72:44: error: unknown type name '__local'\n   72 |   __local float* smem_K = reinterpret_cast<__local float*>(0x00008000);\n      |                                            ^\nkernel.cpp:73:3: error: unknown type name '__local'\n   73 |   __local float* smem_V = reinterpret_cast<__local float*>(0x00010000);\n      |   ^\nkernel.cpp:73:44: error: unknown type name '__local'\n   73 |   __local float* smem_V = reinterpret_cast<__local float*>(0x00010000);\n      |                                            ^\nkernel.cpp:74:3: error: unknown type name '__local'\n   74 |   __local float* smem_O = reinterpret_cast<__local float*>(0x00018000);\n      |   ^\nkernel.cpp:74:44: error: unknown type name '__local'\n   74 |   __local float* smem_O = reinterpret_cast<__local float*>(0x00018000);\n      |                                            ^\nkernel.cpp:88:3: error: unknown type name '__local'\n   88 |   __local float* o_ptr = smem_O + tid * 64;\n      |   ^\nkernel.cpp:97:3: error: unknown type name '__local'\n   97 |   __local float* q_ptr = smem_Q + tid * 64;\n      |   ^\nkernel.cpp:102:5: error: unknown type name '__local'\n  102 |     __local float* k_ptr = smem_K + j * 64;\n      |     ^\nkernel.cpp:118:5: error: unknown type name '__local'\n  118 |     __local float* v_ptr = smem_V + j * 64;\n      |     ^\n12 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

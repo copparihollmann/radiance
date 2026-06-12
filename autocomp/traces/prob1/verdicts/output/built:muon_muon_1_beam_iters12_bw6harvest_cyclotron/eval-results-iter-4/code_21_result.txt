@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nannels\n      |             ~~~~~~ ^\nkernel.cpp:84:22: note: variable 'c_base' declared const here\n   84 |       const uint32_t c_base = (tid_in_threadblock >> 8) << 12; // base c offset for this thread's work chunk\n      |       ~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:149:23: error: use of undeclared identifier 'load_float_shared'\n  149 |         float w_val = load_float_shared(w_ptr);\n      |                       ^\nkernel.cpp:152:29: error: use of undeclared identifier 'load_float_shared'\n  152 |         float patch_a_val = load_float_shared(patch_a_ptr);\n      |                             ^\nkernel.cpp:153:29: error: use of undeclared identifier 'load_float_shared'\n  153 |         float patch_b_val = load_float_shared(patch_b_ptr);\n      |                             ^\nkernel.cpp:178:9: error: use of undeclared identifier 'store_float_shared'\n  178 |         store_float_shared(smem_w + i * 4, fval);\n      |         ^\nkernel.cpp:200:9: error: use of undeclared identifier 'store_float_shared'\n  200 |         store_float_shared(i * 4, val);\n      |         ^\nkernel.cpp:215:25: error: use of undeclared identifier 'load_float_shared'\n  215 |           float w_val = load_float_shared(wa);\n      |                         ^\nkernel.cpp:216:25: error: use of undeclared identifier 'load_float_shared'\n  216 |           float p_val = load_float_shared(pa);\n      |                         ^\n12 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n117:20: error: use of undeclared identifier 'load_shared_imm'\n  117 |         float p1 = load_shared_imm(ptr_p, 64);\n      |                    ^\nkernel.cpp:118:22: error: use of undeclared identifier 'load_shared_imm'\n  118 |         float w0_1 = load_shared_imm(ptr_w0, 4);\n      |                      ^\nkernel.cpp:119:22: error: use of undeclared identifier 'load_shared_imm'\n  119 |         float w1_1 = load_shared_imm(ptr_w1, 4);\n      |                      ^\nkernel.cpp:121:20: error: use of undeclared identifier 'load_shared_imm'\n  121 |         float p2 = load_shared_imm(ptr_p, 128);\n      |                    ^\nkernel.cpp:122:22: error: use of undeclared identifier 'load_shared_imm'\n  122 |         float w0_2 = load_shared_imm(ptr_w0, 8);\n      |                      ^\nkernel.cpp:123:22: error: use of undeclared identifier 'load_shared_imm'\n  123 |         float w1_2 = load_shared_imm(ptr_w1, 8);\n      |                      ^\nkernel.cpp:125:20: error: use of undeclared identifier 'load_shared_imm'\n  125 |         float p3 = load_shared_imm(ptr_p, 192);\n      |                    ^\nkernel.cpp:126:22: error: use of undeclared identifier 'load_shared_imm'\n  126 |         float w0_3 = load_shared_imm(ptr_w0, 12);\n      |                      ^\nkernel.cpp:127:22: error: use of undeclared identifier 'load_shared_imm'\n  127 |         float w1_3 = load_shared_imm(ptr_w1, 12);\n      |                      ^\n12 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

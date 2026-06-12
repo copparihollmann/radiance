@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:66:18: error: expected unqualified-id\n   66 |   const uint32_t NUM_WARPS = threads_per_threadblock / 16;\n      |                  ^\n/scratch/agustin/projects/radiance-kernels/lib/include/VX_config.h:91:19: note: expanded from macro 'NUM_WARPS'\n   91 | #define NUM_WARPS 8\n      |                   ^\n1 error generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

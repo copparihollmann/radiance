@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:55:19: error: automatic variable qualified with an address space\n   55 |   float* __global C = args->C;\n      |                   ^\nkernel.cpp:96:21: error: automatic variable qualified with an address space\n   96 |     float* __global c_ptr = C + block_row * BM * c_stride_n + block_col * BN;\n      |                     ^\n2 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

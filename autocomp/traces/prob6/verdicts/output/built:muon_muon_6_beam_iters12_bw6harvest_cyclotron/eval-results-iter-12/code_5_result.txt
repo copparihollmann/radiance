@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nSMEM_B_BASE + idx * 4, 0, __builtin_bit_cast(uint32_t, b_val));\n      |                    ^\nkernel.cpp:81:5: error: use of undeclared identifier 'sync_cross_core'\n   81 |     sync_cross_core(num_warps); // Ensure both A and B are fully loaded before compute begins\n      |     ^\nkernel.cpp:88:59: error: use of undeclared identifier 'SMEM_C_BASE'\n   88 |       float sum = __builtin_bit_cast(float, load32_shared(SMEM_C_BASE + idx * 4));\n      |                                                           ^\nkernel.cpp:90:23: error: use of undeclared identifier 'SMEM_A_BASE'\n   90 |       uint32_t aptr = SMEM_A_BASE + (row * BK) * 4;\n      |                       ^\nkernel.cpp:91:23: error: use of undeclared identifier 'SMEM_B_BASE'\n   91 |       uint32_t bptr = SMEM_B_BASE + col * 4;\n      |                       ^\nkernel.cpp:102:20: error: use of undeclared identifier 'SMEM_C_BASE'\n  102 |       store_shared(SMEM_C_BASE + idx * 4, 0, __builtin_bit_cast(uint32_t, sum));\n      |                    ^\nkernel.cpp:105:5: error: use of undeclared identifier 'sync_cross_core'\n  105 |     sync_cross_core(num_warps); // Wait for all warps to finish accumulating before starting next K tile\n      |     ^\nkernel.cpp:110:58: error: use of undeclared identifier 'SMEM_C_BASE'\n  110 |     args->C[i] = __builtin_bit_cast(float, load32_shared(SMEM_C_BASE + i * 4));\n      |                                                          ^\n11 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

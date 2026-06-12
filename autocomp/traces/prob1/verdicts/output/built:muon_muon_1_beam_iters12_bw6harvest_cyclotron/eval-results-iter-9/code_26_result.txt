@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n |         float w0 = __builtin_bit_cast(float, load32_shared_offset(wa, 0));\n      |                                              ^\nkernel.cpp:127:46: error: use of undeclared identifier 'load32_shared_offset'\n  127 |         float p1 = __builtin_bit_cast(float, load32_shared_offset(pa, 4));\n      |                                              ^\nkernel.cpp:128:46: error: use of undeclared identifier 'load32_shared_offset'\n  128 |         float w1 = __builtin_bit_cast(float, load32_shared_offset(wa, 4));\n      |                                              ^\nkernel.cpp:129:46: error: use of undeclared identifier 'load32_shared_offset'\n  129 |         float p2 = __builtin_bit_cast(float, load32_shared_offset(pa, 8));\n      |                                              ^\nkernel.cpp:130:46: error: use of undeclared identifier 'load32_shared_offset'\n  130 |         float w2 = __builtin_bit_cast(float, load32_shared_offset(wa, 8));\n      |                                              ^\nkernel.cpp:131:46: error: use of undeclared identifier 'load32_shared_offset'\n  131 |         float p3 = __builtin_bit_cast(float, load32_shared_offset(pa, 12));\n      |                                              ^\nkernel.cpp:132:46: error: use of undeclared identifier 'load32_shared_offset'\n  132 |         float w3 = __builtin_bit_cast(float, load32_shared_offset(wa, 12));\n      |                                              ^\n8 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

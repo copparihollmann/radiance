@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:77:7: error: use of undeclared identifier 'store_shared_float'\n   77 |       store_shared_float(C_BASE + idx * 4, 0.0f);\n      |       ^\nkernel.cpp:91:9: error: use of undeclared identifier 'store_shared_float'\n   91 |         store_shared_float(A_BASE + linear_idx * 4, val);\n      |         ^\nkernel.cpp:103:9: error: use of undeclared identifier 'store_shared_float'\n  103 |         store_shared_float(B_BASE + linear_idx * 4, val);\n      |         ^\nkernel.cpp:118:19: error: use of undeclared identifier 'load_shared_float'\n  118 |       float acc = load_shared_float(C_BASE + idx * 4);\n      |                   ^\nkernel.cpp:123:23: error: use of undeclared identifier 'load_shared_float'\n  123 |         float a_val = load_shared_float(A_BASE + (r * 16 + k) * 4);\n      |                       ^\nkernel.cpp:124:23: error: use of undeclared identifier 'load_shared_float'\n  124 |         float b_val = load_shared_float(B_BASE + (k * 64 + c) * 4);\n      |                       ^\nkernel.cpp:128:7: error: use of undeclared identifier 'store_shared_float'\n  128 |       store_shared_float(C_BASE + idx * 4, acc);\n      |       ^\nkernel.cpp:139:19: error: use of undeclared identifier 'load_shared_float'\n  139 |       float val = load_shared_float(C_BASE + idx * 4);\n      |                   ^\n8 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

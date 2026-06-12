@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:93:13: error: use of undeclared identifier 'As'\n   93 |             As[idx] = base_A_ptr_0[i * 32 * K];\n      |             ^\nkernel.cpp:94:13: error: use of undeclared identifier 'As'\n   94 |             As[idx + 128] = base_A_ptr_0[(i * 32 + 128) * K];\n      |             ^\nkernel.cpp:104:13: error: use of undeclared identifier 'Bs'\n  104 |             Bs[idx] = base_B_ptr_0[i * 16 * N];\n      |             ^\nkernel.cpp:114:25: error: use of undeclared identifier 'Bs'\n  114 |           float b_val = Bs[tc + kk * 16];\n      |                         ^\nkernel.cpp:115:19: error: use of undeclared identifier 'As'\n  115 |           acc0 += As[tr * 64 + kk] * b_val;\n      |                   ^\nkernel.cpp:116:19: error: use of undeclared identifier 'As'\n  116 |           acc1 += As[(tr + 8) * 64 + kk] * b_val;\n      |                   ^\n6 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}
