@@ -194,7 +194,14 @@ class TLNBDCacheModule(outer: TLNBDCache)(implicit p: Parameters) extends LazyMo
       }
       respBufReady := inFlights < mshrs.U
 
-      assert(respBufReady || !tlIn.a.valid, "this assertion can be safely commented but lmk")
+      // NOTE: removed (per author's note "this assertion can be safely commented").
+      // It is spurious: TileLink explicitly allows `a.valid` to be held high while the
+      // sink is not `ready`. When respBufReady is false we gate `tlIn.a.ready` (line ~133),
+      // so no request fires; `inFlights < mshrs` bounds outstanding requests and the
+      // respBuf (depth mshrs = nMSHRs+1) is sized to hold every in-flight response, so the
+      // real safety guard is the `respBuf.io.enq.ready` assert above. sfilter legitimately
+      // backpressures the L0d D channel, which tripped this over-strict check.
+      // assert(respBufReady || !tlIn.a.valid, "this assertion can be safely commented but lmk")
 
       (respBuf.io.deq.bits, respBuf.io.deq.valid)
     } else {

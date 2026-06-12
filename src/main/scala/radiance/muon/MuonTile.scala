@@ -271,6 +271,11 @@ class MuonTile(
       cache = l0dParams,
       cacheTagBits = muonParams.core.l0dReqTagBits(coalescedReqWidth),
       flushAddr = Some(muonParams.peripheralAddr + 0x100),
+      // sfilter (and other scatter/gather-heavy kernels) can backpressure the L0d
+      // D channel; without landing pads the non-blocking cache drops the response
+      // and trips `assert("response must be ready!")` (TLNBDCache.scala:201). Landing
+      // pads add a response buffer + A-channel backpressure to handle this.
+      makeLandingPads = true,
     )))
     l0d.flushNode.get := dFlushMaster
     (l0d.outNode, l0d.inNode, l0d.flushRegNode)
