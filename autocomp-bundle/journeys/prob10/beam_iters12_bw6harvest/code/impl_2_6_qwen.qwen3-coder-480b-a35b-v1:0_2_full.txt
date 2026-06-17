@@ -1,0 +1,139 @@
+```cpp
+#include <stdint.h>
+
+#define MU_NUM_THREADS 16
+#define K_TILE 64
+#define K_PAD (K_TILE + 1) // Pad to avoid bank conflicts
+#define SMEM_A_BASE 0
+#define SMEM_B_BASE (32 * K_PAD * sizeof(float))
+
+static inline float bits_to_float(uint32_t b) {
+    union { uint32_t u; float f; } c;
+    c.u = b;
+    return c.f;
+}
+
+static inline uint32_t float_to_bits(float f) {
+    union { uint32_t u; float f; } c;
+    c.f = f;
+    return c.u;
+}
+
+static inline void kernel_body(
+    void* raw_arg,
+    uint32_t tid_in_threadblock,
+    uint32_t threads_per_threadblock,
+    uint32_t threadblock_id
+) {
+    (void)threadblock_id;
+    auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+    const uint32_t M = args->M;
+    const uint32_t N = args->N;
+    const uint32_t K = args->K;
+
+    const uint32_t tid = tid_in_threadblock;
+    const uint32_t num_warps = threads_per_threadblock / MU_NUM_THREADS; // 8 warps
+
+    // Thread mapping: 128 threads -> 8 warps -> 32x16 tile
+    const uint32_t warp_id = tid / MU_NUM_THREADS;
+    const uint32_t lane_id = tid % MU_NUM_THREADS;
+
+    // Output tile mapping: 32 rows x 16 cols
+    const uint32_t th_r = warp_id / 2;      // 0..7 -> 0..3 (4 groups of 8 warps, but 8 warps total -> 0..3)
+    const uint32_t th_c = lane_id;          // 0..15
+
+    const __global float* A = args->A;
+    const __global float* B = args->B;
+    float* C = args->C;
+
+    // Loop over 32x16 output tiles
+    for (uint32_t block_row = 0; block_row < (M + 31) / 32; ++block_row) {
+        for (uint32_t block_col = 0; block_col < (N + 15) / 16; ++block_col) {
+            const uint32_t row_start = block_row * 32;
+            const uint32_t col_start = block_col * 16;
+
+            if (row_start >= M || col_start >= N) continue;
+
+            float acc0 = 0.0f;
+            float acc1 = 0.0f;
+            float acc2 = 0.0f;
+            float acc3 = 0.0f;
+            float acc4 = 0.0f;
+            float acc5 = 0.0f;
+            float acc6 = 0.0f;
+            float acc7 = 0.0f;
+
+            for (uint32_t kk = 0; kk < K; kk += K_TILE) {
+                // 1. Load A tile (32 rows x K_TILE cols) into SMEM
+                #pragma GCC unroll 1
+                for (uint32_t i = 0; i < 8; i++) { // 128 threads / 16 lanes = 8 iterations
+                    uint32_t idx = i * 16 + lane_id;
+                    uint32_t r = idx / K_TILE;
+                    uint32_t c = idx % K_TILE;
+                    uint32_t global_r = row_start + r;
+                    uint32_t global_c = kk + c;
+
+                    if (global_r < M && global_c < K) {
+                        float val = A[global_r * K + global_c];
+                        uint32_t smem_addr = SMEM_A_BASE + (r * K_PAD + c) * sizeof(float);
+                        store_shared(0, smem_addr, float_to_bits(val));
+                    }
+                }
+
+                // 2. Load B tile (K_TILE rows x 16 cols, transposed) into SMEM
+                #pragma GCC unroll 1
+                for (uint32_t i = 0; i < 8; i++) {
+                    uint32_t idx = i * 16 + lane_id;
+                    uint32_t r = idx / 16;
+                    uint32_t c = idx % 16;
+                    uint32_t global_r = kk + r;
+                    uint32_t global_c = col_start + c;
+
+                    if (global_r < K && global_c < N) {
+                        float val = B[global_r * N + global_c];
+                        uint32_t smem_addr = SMEM_B_BASE + (c * K_PAD + r) * sizeof(float);
+                        store_shared(0, smem_addr, float_to_bits(val));
+                    }
+                }
+
+                // Cross-core barrier
+                mu_barrier(0, num_warps);
+
+                // 3. Compute partial products
+                uint32_t b_base = SMEM_B_BASE + th_c * K_PAD * sizeof(float);
+                uint32_t a_base = SMEM_A_BASE + (th_r * 8) * K_PAD * sizeof(float);
+
+                #pragma GCC unroll 1
+                for (uint32_t k = 0; k < K_TILE; k++) {
+                    float b_val = bits_to_float(load32_shared(b_base + k * sizeof(float)));
+                    acc0 += bits_to_float(load32_shared(a_base + 0 * K_PAD * sizeof(float) + k * sizeof(float))) * b_val;
+                    acc1 += bits_to_float(load32_shared(a_base + 1 * K_PAD * sizeof(float) + k * sizeof(float))) * b_val;
+                    acc2 += bits_to_float(load32_shared(a_base + 2 * K_PAD * sizeof(float) + k * sizeof(float))) * b_val;
+                    acc3 += bits_to_float(load32_shared(a_base + 3 * K_PAD * sizeof(float) + k * sizeof(float))) * b_val;
+                    acc4 += bits_to_float(load32_shared(a_base + 4 * K_PAD * sizeof(float) + k * sizeof(float))) * b_val;
+                    acc5 += bits_to_float(load32_shared(a_base + 5 * K_PAD * sizeof(float) + k * sizeof(float))) * b_val;
+                    acc6 += bits_to_float(load32_shared(a_base + 6 * K_PAD * sizeof(float) + k * sizeof(float))) * b_val;
+                    acc7 += bits_to_float(load32_shared(a_base + 7 * K_PAD * sizeof(float) + k * sizeof(float))) * b_val;
+                }
+
+                // Barrier before next tile load
+                mu_barrier(0, num_warps);
+            }
+
+            // 4. Write back results
+            const uint32_t r_base = row_start + th_r * 8;
+            const uint32_t c = col_start + th_c;
+
+            if (r_base + 0 < M && c < N) C[(r_base + 0) * N + c] = acc0;
+            if (r_base + 1 < M && c < N) C[(r_base + 1) * N + c] = acc1;
+            if (r_base + 2 < M && c < N) C[(r_base + 2) * N + c] = acc2;
+            if (r_base + 3 < M && c < N) C[(r_base + 3) * N + c] = acc3;
+            if (r_base + 4 < M && c < N) C[(r_base + 4) * N + c] = acc4;
+            if (r_base + 5 < M && c < N) C[(r_base + 5) * N + c] = acc5;
+            if (r_base + 6 < M && c < N) C[(r_base + 6) * N + c] = acc6;
+            if (r_base + 7 < M && c < N) C[(r_base + 7) * N + c] = acc7;
+        }
+    }
+}
+```

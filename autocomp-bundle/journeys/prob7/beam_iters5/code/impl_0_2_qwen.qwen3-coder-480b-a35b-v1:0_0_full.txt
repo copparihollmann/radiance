@@ -1,0 +1,88 @@
+```cpp
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t seq = a->seq;
+  const uint32_t d = a->d;
+
+  // Shared memory layout:
+  // smem_Q: [128 threads][64 floats] => 32 KiB
+  // smem_S: [128 threads][128 floats] => 64 KiB
+  // Total: 96 KiB < 128 KiB
+  const uint32_t smem_Q_base = 0x00000000;
+  const uint32_t smem_S_base = 0x00008000; // 32 KiB
+
+  const uint32_t tid = tid_in_threadblock;
+
+  // Early exit if tid >= seq
+  if (tid >= seq) return;
+
+  // Phase 1: Load Q[tid] into SMEM
+  const __global float* Qi = a->Q + tid * d;
+  uint32_t q_smem_addr = smem_Q_base + tid * 64 * sizeof(float);
+  for (uint32_t k = 0; k < d; k++) {
+    store_shared(q_smem_addr, 0, __builtin_bit_cast(uint32_t, Qi[k]));
+    q_smem_addr += sizeof(float);
+  }
+
+  // Phase 2: Compute scores S[tid][j] = scale * Q[tid]·K[j], store in SMEM
+  uint32_t s_smem_addr = smem_S_base + tid * 128 * sizeof(float);
+  for (uint32_t j = 0; j < seq; j++) {
+    const __global float* Kj = a->K + j * d;
+    float acc = 0.0f;
+    uint32_t q_addr = smem_Q_base + tid * 64 * sizeof(float);
+    for (uint32_t k = 0; k < d; k++) {
+      float q_val = __builtin_bit_cast(float, load32_shared(q_addr));
+      acc += q_val * Kj[k];
+      q_addr += sizeof(float);
+    }
+    float score = acc * 0.125f;
+    store_shared(s_smem_addr, 0, __builtin_bit_cast(uint32_t, score));
+    s_smem_addr += sizeof(float);
+  }
+
+  // Phase 3: Softmax in-place on S[tid]
+  s_smem_addr = smem_S_base + tid * 128 * sizeof(float);
+  
+  // Find max
+  float max_val = __builtin_bit_cast(float, load32_shared(s_smem_addr));
+  for (uint32_t j = 1; j < seq; j++) {
+    float val = __builtin_bit_cast(float, load32_shared(s_smem_addr + j * sizeof(float)));
+    if (val > max_val) max_val = val;
+  }
+
+  // Compute sum of exponentials and store back
+  float sum = 0.0f;
+  for (uint32_t j = 0; j < seq; j++) {
+    float val = __builtin_bit_cast(float, load32_shared(s_smem_addr + j * sizeof(float)));
+    float exp_val = mu_exp(val - max_val);
+    store_shared(s_smem_addr + j * sizeof(float), 0, __builtin_bit_cast(uint32_t, exp_val));
+    sum += exp_val;
+  }
+
+  // Normalize
+  float inv_sum = 1.0f / sum;
+  for (uint32_t j = 0; j < seq; j++) {
+    float val = __builtin_bit_cast(float, load32_shared(s_smem_addr + j * sizeof(float)));
+    store_shared(s_smem_addr + j * sizeof(float), 0, __builtin_bit_cast(uint32_t, val * inv_sum));
+  }
+
+  // Phase 4: Compute output O[tid][k] = sum_j P[tid][j] * V[j][k]
+  __global float* Oi = a->O + tid * d;
+  for (uint32_t k = 0; k < d; k++) {
+    float acc = 0.0f;
+    s_smem_addr = smem_S_base + tid * 128 * sizeof(float);
+    for (uint32_t j = 0; j < seq; j++) {
+      float p_val = __builtin_bit_cast(float, load32_shared(s_smem_addr));
+      acc += p_val * a->V[j * d + k];
+      s_smem_addr += sizeof(float);
+    }
+    Oi[k] = acc;
+  }
+}
+```

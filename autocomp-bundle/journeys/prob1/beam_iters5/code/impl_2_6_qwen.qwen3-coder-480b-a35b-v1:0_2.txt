@@ -1,0 +1,95 @@
+#include <stdint.h>
+
+// Macro to load from shared memory using a compile-time immediate offset.
+#define load32_shared_offset(addr, offset) ({ \
+    uint32_t __data; \
+    asm volatile("lw.shared %0, %1(%2)" : "=r"(__data) : "i"(offset), "r"(addr) : "memory"); \
+    __data; \
+})
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  const uint32_t CKK = 768;
+  const uint32_t P = 16;
+  const uint32_t OC = 16;
+  const uint32_t smem_w = 49152; // OC * CKK * 4
+
+  // (1) Stage W flat into SMEM[smem_w..]
+  uint32_t w_addr = smem_w + tid_in_threadblock * 4;
+  for (uint32_t i = tid_in_threadblock; i < OC * CKK; i += threads_per_threadblock) {
+    store_shared(w_addr, 0, __builtin_bit_cast(uint32_t, a->w[i]));
+    w_addr += threads_per_threadblock * 4;
+  }
+
+  // (2) Gather im2col patches into SMEM[0..]
+  const uint32_t Wd = 64;
+  const uint32_t HWd = 4096;
+  const uint32_t stride = 16;
+
+  uint32_t p = 0;
+  uint32_t ckk = tid_in_threadblock;
+  uint32_t patch_addr = tid_in_threadblock * 4;
+
+  for (uint32_t i = tid_in_threadblock; i < P * CKK; i += threads_per_threadblock) {
+    const uint32_t c = ckk >> 8;
+    const uint32_t kh = (ckk >> 4) & 0xF;
+    const uint32_t kw = ckk & 0xF;
+    const uint32_t ph = p >> 2;
+    const uint32_t pw = p & 0x3;
+
+    const uint32_t in_idx = c * HWd + (ph * stride + kh) * Wd + pw * stride + kw;
+    store_shared(patch_addr, 0, __builtin_bit_cast(uint32_t, a->in[in_idx]));
+
+    patch_addr += threads_per_threadblock * 4;
+
+    ckk += threads_per_threadblock;
+    if (ckk >= CKK) {
+      ckk -= CKK;
+      p++;
+    }
+  }
+
+  // Cross-core synchronization
+  mu_barrier(0, threads_per_threadblock / 16);
+
+  // (3) Frugal matmul with unrolled inner loop
+  for (uint32_t idx = tid_in_threadblock; idx < OC * P; idx += threads_per_threadblock) {
+    const uint32_t oc = idx >> 4;
+    const uint32_t p_idx = idx & 0xF;
+
+    uint32_t wa = smem_w + oc * CKK * 4;
+    uint32_t pa = p_idx * CKK * 4;
+
+    float acc = 0.0f;
+
+    // Unroll by 8 to expose ILP
+    for (uint32_t k = 0; k < CKK; k += 8) {
+      acc += __builtin_bit_cast(float, load32_shared_offset(wa, 0)) *
+             __builtin_bit_cast(float, load32_shared_offset(pa, 0));
+      acc += __builtin_bit_cast(float, load32_shared_offset(wa, 4)) *
+             __builtin_bit_cast(float, load32_shared_offset(pa, 4));
+      acc += __builtin_bit_cast(float, load32_shared_offset(wa, 8)) *
+             __builtin_bit_cast(float, load32_shared_offset(pa, 8));
+      acc += __builtin_bit_cast(float, load32_shared_offset(wa, 12)) *
+             __builtin_bit_cast(float, load32_shared_offset(pa, 12));
+      acc += __builtin_bit_cast(float, load32_shared_offset(wa, 16)) *
+             __builtin_bit_cast(float, load32_shared_offset(pa, 16));
+      acc += __builtin_bit_cast(float, load32_shared_offset(wa, 20)) *
+             __builtin_bit_cast(float, load32_shared_offset(pa, 20));
+      acc += __builtin_bit_cast(float, load32_shared_offset(wa, 24)) *
+             __builtin_bit_cast(float, load32_shared_offset(pa, 24));
+      acc += __builtin_bit_cast(float, load32_shared_offset(wa, 28)) *
+             __builtin_bit_cast(float, load32_shared_offset(pa, 28));
+      wa += 32;
+      pa += 32;
+    }
+    a->out[idx] = acc;
+  }
+}

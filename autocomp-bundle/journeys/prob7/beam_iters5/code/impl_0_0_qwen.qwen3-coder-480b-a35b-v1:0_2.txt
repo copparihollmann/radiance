@@ -1,0 +1,181 @@
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t seq = a->seq;
+  const uint32_t d = a->d;
+  const uint32_t nw = threads_per_threadblock / MU_NUM_THREADS;
+
+  // Shared memory layout:
+  // Each warp uses 16 * 4 = 64 floats for Q tile: 256 words
+  // + 16 floats for softmax max/reduce: 64 words
+  // + 16 floats for softmax sum/reduce: 64 words
+  // + 16 * 4 = 64 floats for K/V tile: 256 words
+  // Total per warp: 640 words = 2560 bytes
+  // 8 warps * 2560 bytes = 20480 bytes < 128KB OK
+
+  const uint32_t warp_id = tid_in_threadblock / 16;
+  const uint32_t lane_id = tid_in_threadblock % 16;
+  const uint32_t rows_per_warp = seq / nw;  // 128 / 8 = 16
+  const uint32_t smem_base = warp_id * 2560 * sizeof(float);
+
+  const uint32_t smem_q_tile = smem_base;
+  const uint32_t smem_max_reduce = smem_q_tile + 64 * sizeof(float);
+  const uint32_t smem_sum_reduce = smem_max_reduce + 16 * sizeof(float);
+  const uint32_t smem_kv_tile = smem_sum_reduce + 16 * sizeof(float);
+  const uint32_t smem_scores = smem_kv_tile + 64 * sizeof(float); // 16 floats for scores
+
+  const __global float* Q = a->Q;
+  const __global float* K = a->K;
+  const __global float* V = a->V;
+  __global float* O = a->O;
+
+  for (uint32_t outer_i = warp_id; outer_i < seq; outer_i += nw) {
+    // Phase 1: Load Q[outer_i] cooperatively
+    const __global float* qi = Q + outer_i * d;
+    for (uint32_t k = lane_id; k < d; k += 16) {
+      store_shared(smem_q_tile + k * sizeof(float), 0, qi[k]);
+    }
+    mu_barrier(0, nw); // Cross-core barrier for Q load visibility
+
+    // Phase 2: S[outer_i][j] = scale * Q[outer_i] . K[j], for j in [0, seq)
+    for (uint32_t j = 0; j < seq; j++) {
+      const __global float* kj = K + j * d;
+      
+      // Load K[j] cooperatively
+      for (uint32_t k = lane_id; k < d; k += 16) {
+        store_shared(smem_kv_tile + k * sizeof(float), 0, kj[k]);
+      }
+      mu_barrier(0, nw); // Cross-core barrier for K load visibility
+
+      // Compute dot product
+      float local_acc = 0.0f;
+      for (uint32_t k = lane_id; k < d; k += 16) {
+        float q_val = load32_shared(smem_q_tile + k * sizeof(float));
+        float k_val = load32_shared(smem_kv_tile + k * sizeof(float));
+        local_acc += q_val * k_val;
+      }
+
+      // Warp reduce local_acc to get full dot product
+      // Store to SMEM first
+      store_shared(smem_sum_reduce + lane_id * sizeof(float), 0, local_acc);
+      mu_barrier(0, nw);
+
+      // Tree reduction in 4 steps (power of 2)
+      if (lane_id < 8) {
+        float val = load32_shared(smem_sum_reduce + lane_id * sizeof(float)) +
+                    load32_shared(smem_sum_reduce + (lane_id + 8) * sizeof(float));
+        store_shared(smem_sum_reduce + lane_id * sizeof(float), 0, val);
+      }
+      mu_barrier(0, nw);
+      if (lane_id < 4) {
+        float val = load32_shared(smem_sum_reduce + lane_id * sizeof(float)) +
+                    load32_shared(smem_sum_reduce + (lane_id + 4) * sizeof(float));
+        store_shared(smem_sum_reduce + lane_id * sizeof(float), 0, val);
+      }
+      mu_barrier(0, nw);
+      if (lane_id < 2) {
+        float val = load32_shared(smem_sum_reduce + lane_id * sizeof(float)) +
+                    load32_shared(smem_sum_reduce + (lane_id + 2) * sizeof(float));
+        store_shared(smem_sum_reduce + lane_id * sizeof(float), 0, val);
+      }
+      mu_barrier(0, nw);
+      if (lane_id == 0) {
+        float val = load32_shared(smem_sum_reduce) +
+                    load32_shared(smem_sum_reduce + sizeof(float));
+        store_shared(smem_sum_reduce, 0, val);
+      }
+      mu_barrier(0, nw);
+
+      float S_ij = load32_shared(smem_sum_reduce) * 0.125f;
+      
+      // Store score in SMEM for softmax
+      store_shared(smem_scores + (j % 16) * sizeof(float), 0, S_ij);
+      
+      // Phase 3: Softmax for this element
+      // Find max among 16 elements stored in smem_scores
+      float score_val = S_ij;
+      store_shared(smem_max_reduce + lane_id * sizeof(float), 0, score_val);
+      mu_barrier(0, nw);
+      
+      // Reduce max
+      if (lane_id < 8) {
+        float val = fmaxf(load32_shared(smem_max_reduce + lane_id * sizeof(float)),
+                          load32_shared(smem_max_reduce + (lane_id + 8) * sizeof(float)));
+        store_shared(smem_max_reduce + lane_id * sizeof(float), 0, val);
+      }
+      mu_barrier(0, nw);
+      if (lane_id < 4) {
+        float val = fmaxf(load32_shared(smem_max_reduce + lane_id * sizeof(float)),
+                          load32_shared(smem_max_reduce + (lane_id + 4) * sizeof(float)));
+        store_shared(smem_max_reduce + lane_id * sizeof(float), 0, val);
+      }
+      mu_barrier(0, nw);
+      if (lane_id < 2) {
+        float val = fmaxf(load32_shared(smem_max_reduce + lane_id * sizeof(float)),
+                          load32_shared(smem_max_reduce + (lane_id + 2) * sizeof(float)));
+        store_shared(smem_max_reduce + lane_id * sizeof(float), 0, val);
+      }
+      mu_barrier(0, nw);
+      if (lane_id == 0) {
+        float val = fmaxf(load32_shared(smem_max_reduce),
+                          load32_shared(smem_max_reduce + sizeof(float)));
+        store_shared(smem_max_reduce, 0, val);
+      }
+      mu_barrier(0, nw);
+      float row_max = load32_shared(smem_max_reduce);
+
+      // Compute exp and sum
+      float exp_val = mu_exp(score_val - row_max);
+      store_shared(smem_sum_reduce + lane_id * sizeof(float), 0, exp_val);
+      mu_barrier(0, nw);
+
+      // Sum reduction
+      if (lane_id < 8) {
+        float val = load32_shared(smem_sum_reduce + lane_id * sizeof(float)) +
+                    load32_shared(smem_sum_reduce + (lane_id + 8) * sizeof(float));
+        store_shared(smem_sum_reduce + lane_id * sizeof(float), 0, val);
+      }
+      mu_barrier(0, nw);
+      if (lane_id < 4) {
+        float val = load32_shared(smem_sum_reduce + lane_id * sizeof(float)) +
+                    load32_shared(smem_sum_reduce + (lane_id + 4) * sizeof(float));
+        store_shared(smem_sum_reduce + lane_id * sizeof(float), 0, val);
+      }
+      mu_barrier(0, nw);
+      if (lane_id < 2) {
+        float val = load32_shared(smem_sum_reduce + lane_id * sizeof(float)) +
+                    load32_shared(smem_sum_reduce + (lane_id + 2) * sizeof(float));
+        store_shared(smem_sum_reduce + lane_id * sizeof(float), 0, val);
+      }
+      mu_barrier(0, nw);
+      if (lane_id == 0) {
+        float val = load32_shared(smem_sum_reduce) +
+                    load32_shared(smem_sum_reduce + sizeof(float));
+        store_shared(smem_sum_reduce, 0, val);
+      }
+      mu_barrier(0, nw);
+      float row_sum = load32_shared(smem_sum_reduce);
+      float P_ij = exp_val / row_sum;
+
+      // Phase 4: Accumulate O[outer_i][k] += P_ij * V[j][k]
+      const __global float* vj = V + j * d;
+      for (uint32_t k = lane_id; k < d; k += 16) {
+        float v_val = vj[k];
+        float o_val = load32_shared(smem_q_tile + (k + 64) * sizeof(float)); // Reuse Q tile space
+        o_val += P_ij * v_val;
+        store_shared(smem_q_tile + (k + 64) * sizeof(float), 0, o_val);
+      }
+    }
+
+    // Write back O
+    __global float* oi = O + outer_i * d;
+    for (uint32_t k = lane_id; k < d; k += 16) {
+      oi[k] = load32_shared(smem_q_tile + (k + 64) * sizeof(float));
+    }
+  }
+}

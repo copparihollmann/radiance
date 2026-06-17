@@ -1,0 +1,110 @@
+An elegant and highly optimized plan to accelerate the fp32 matrix multiplication kernel on the Radiance Muon architecture, while strictly adhering to the **$\le 31$ distinct register budget** constraint.
+
+### Optimization Plan
+
+1. **Strategic Tile Slicing ($8 \times 16$ Threadblock Tile)**:
+   - Partition the $64 \times 64$ output matrix $C$ into 32 tiles of size $8 \times 16$.
+   - Map the 128-thread threadblock to cooperatively compute one $8 \times 16$ tile at a time.
+   - Within the tile, each thread computes exactly **one** output element of $C$, completely satisfying the **one-accumulator-per-thread limit** to stay under the 31-register budget.
+
+2. **Zero-Bank-Conflict Shared Memory Layout**:
+   - Map threads to $(r, c)$ coordinates inside the tile as $r = \text{tid} / 16$ and $c = \text{tid} \% 16$.
+   - When threads access matrix $A$ in SMEM, all 16 threads in a warp access the same row $r$, triggering a hardware broadcast (completely conflict-free).
+   - When threads access matrix $B$ in SMEM, they access 16 consecutive columns, perfectly mapping to 16 distinct SMEM banks (completely conflict-free).
+
+3. **K-Streaming and Coalesced Cooperatively Staged SMEM**:
+   - Stream the outer $K$-dimension in tiles of $K_{\text{tile}} = 64$.
+   - Cooperatively load $A$ ($8 \times 64$) and $B$ ($64 \times 16$) into SMEM.
+   - Re-index threads mathematically to guarantee fully coalesced global memory reads of stride-1 across lanes, and avoid costly integer divisions/modulos inside the inner loop.
+
+4. **Register-Squeezing Pointer Arithmetic**:
+   - Use direct pointer increments (`ptr_a += 8`, `ptr_b += 128`) instead of loop index calculations in the accumulation loop.
+   - Control loop termination by comparing `ptr_a` directly against `end_ptr_a` to eliminate loop counter registers.
+   - Limit the unroll factor to 2 (`#pragma unroll 2` equivalent) to keep active registers extremely lean and avoid compiler-induced register spills.
+
+---
+
+### Optimized Kernel Code
+
+```cpp
+#include <stdint.h>
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  (void)threads_per_threadblock;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+  
+  // Shared Memory Offsets (Total SMEM: 6 KiB, well within 128 KiB limit)
+  const uint32_t smem_a = 0;
+  const uint32_t smem_b = 2048; // 512 elements * 4 bytes
+  
+  // Map thread to 8x16 output block
+  const uint32_t r = tid_in_threadblock >> 4; // tid / 16 (0..7)
+  const uint32_t c = tid_in_threadblock & 15; // tid % 16 (0..15)
+  
+  // Loop over the 32 tiles of 8x16 to compute C
+  for (uint32_t block_idx = 0; block_idx < 32; block_idx++) {
+    const uint32_t block_r = (block_idx >> 2) << 3; // (block_idx / 4) * 8
+    const uint32_t block_c = (block_idx & 3) << 4;  // (block_idx % 4) * 16
+    
+    // Global memory base pointers (avoid loop-invariant additions)
+    const uint32_t a_base = (block_r + (tid_in_threadblock >> 6)) * 768 + (tid_in_threadblock & 63);
+    const uint32_t b_base = block_c + (tid_in_threadblock & 15) + (tid_in_threadblock >> 4) * 64;
+    
+    float acc = 0.0f;
+    
+    // K-streaming loop
+    for (uint32_t step = 0; step < 12; step++) {
+      
+      // 1. Cooperative Coalesced Global -> SMEM Load for A (8x64)
+      #pragma unroll 4
+      for (uint32_t l = 0; l < 4; l++) {
+        float val = args->A[a_base + l * 1536];
+        store_shared(smem_a, (tid_in_threadblock + l * 128) * 4, __builtin_bit_cast(uint32_t, val));
+      }
+      
+      // 2. Cooperative Coalesced Global -> SMEM Load for B (64x16)
+      const uint32_t k_mul_64 = step << 12; // step * 4096
+      #pragma unroll 8
+      for (uint32_t l = 0; l < 8; l++) {
+        float val = args->B[k_mul_64 + b_base + l * 512];
+        store_shared(smem_b, (tid_in_threadblock + l * 128) * 4, __builtin_bit_cast(uint32_t, val));
+      }
+      
+      // Cross-core SMEM Sync barrier (8 warps participating)
+      mu_barrier(0, 8);
+      
+      // 3. Register-Squeezed Direct Pointer Arithmetic Loop (Unroll Factor: 2)
+      uint32_t ptr_a = smem_a + r * 256; // r * 64 * 4
+      uint32_t ptr_b = smem_b + c * 4;
+      const uint32_t end_ptr_a = ptr_a + 256;
+      
+      while (ptr_a < end_ptr_a) {
+        float a0 = __builtin_bit_cast(float, load32_shared(ptr_a));
+        float b0 = __builtin_bit_cast(float, load32_shared(ptr_b));
+        acc += a0 * b0;
+        
+        float a1 = __builtin_bit_cast(float, load32_shared(ptr_a + 4));
+        float b1 = __builtin_bit_cast(float, load32_shared(ptr_b + 64));
+        acc += a1 * b1;
+        
+        ptr_a += 8;   // 2 elements of A
+        ptr_b += 128; // 2 rows of B (32 words * 4)
+      }
+      
+      // Sync before loading the next tile of K
+      mu_barrier(0, 8);
+    }
+    
+    // 4. Coalesced Global Memory Store
+    const uint32_t global_r = block_r + r;
+    const uint32_t global_c = block_c + c;
+    args->C[global_r * 64 + global_c] = acc;
+  }
+}
+```

@@ -1,0 +1,177 @@
+```cpp
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t seq = a->seq;
+  const uint32_t d = a->d;
+  const uint32_t num_warps = threads_per_threadblock / MU_NUM_THREADS;
+  const float scale = 0.125f;
+
+  // Shared memory layout
+  // smem_K: 96x64 -> padded to 96x80 = 7680 floats = 30720 bytes starting at 0x00000
+  // smem_V: 96x64 -> padded to 96x80 = 7680 floats = 30720 bytes starting at 0x07800
+  // smem_S: 96x96 -> padded to 96x112 = 10752 floats = 43008 bytes starting at 0x0F000
+  // smem_red: 8 warps * 16 lanes * 2 (max,sum) = 256 floats = 1024 bytes starting at 0x19800
+
+  const uint32_t smem_K_base = 0x00000;
+  const uint32_t smem_V_base = 0x07800;
+  const uint32_t smem_S_base = 0x0F000;
+  const uint32_t smem_red_base = 0x19800;
+
+  const uint32_t k_stride = 80; // padded
+  const uint32_t v_stride = 80; // padded
+  const uint32_t s_stride = 112; // padded
+
+  // Phase 0: Cooperative load K and V into SMEM
+  // Load K (seq x d): Each thread loads d elements, strided by threads_per_threadblock
+  for (uint32_t i = tid_in_threadblock; i < seq * d; i += threads_per_threadblock) {
+    const uint32_t row = i / d;
+    const uint32_t col = i % d;
+    const uint32_t smem_addr = smem_K_base + (row * k_stride + col) * sizeof(float);
+    asm volatile("flw %0, %1(%2)" : "=f"(scale) : "I"(0), "r"(&a->K[i])); // dummy load to use scale reg
+    asm volatile("fsw %0, %1(%2)" :: "f"(a->K[i]), "I"(0), "r"(smem_addr) : "memory");
+  }
+
+  for (uint32_t i = tid_in_threadblock; i < seq * d; i += threads_per_threadblock) {
+    const uint32_t row = i / d;
+    const uint32_t col = i % d;
+    const uint32_t smem_addr = smem_V_base + (row * v_stride + col) * sizeof(float);
+    asm volatile("fsw %0, %1(%2)" :: "f"(a->V[i]), "I"(0), "r"(smem_addr) : "memory");
+  }
+
+  mu_barrier(0, num_warps); // Cross-core sync after SMEM loads
+
+  // Phase 1: Compute QK^T and store in smem_S
+  for (uint32_t idx = tid_in_threadblock; idx < seq * seq; idx += threads_per_threadblock) {
+    const uint32_t i = idx / seq; // row in Q
+    const uint32_t j = idx % seq; // col in K^T (row in K)
+    float acc = 0.0f;
+#pragma GCC unroll 1
+    for (uint32_t k = 0; k < d; k++) {
+      float q_val, k_val;
+      const uint32_t q_addr = (i * d + k) * sizeof(float);
+      const uint32_t k_smem_addr = smem_K_base + (j * k_stride + k) * sizeof(float);
+      asm volatile("flw %0, %1(%2)" : "=f"(q_val) : "I"(0), "r"(&a->Q[q_addr]));
+      asm volatile("flw %0, %1(%2)" : "=f"(k_val) : "I"(0), "r"(k_smem_addr));
+      acc += q_val * k_val;
+    }
+    const uint32_t s_addr = smem_S_base + (i * s_stride + j) * sizeof(float);
+    acc *= scale;
+    asm volatile("fsw %0, %1(%2)" :: "f"(acc), "I"(0), "r"(s_addr) : "memory");
+  }
+
+  mu_barrier(0, num_warps); // Sync before softmax
+
+  // Phase 2: Hierarchical Softmax
+  const uint32_t rows_per_warp = (seq + num_warps - 1) / num_warps;
+  const uint32_t start_row = (tid_in_threadblock / MU_NUM_THREADS) * rows_per_warp;
+  const uint32_t end_row = (start_row + rows_per_warp) < seq ? (start_row + rows_per_warp) : seq;
+  const uint32_t lane_id = tid_in_threadblock % MU_NUM_THREADS;
+
+  for (uint32_t row = start_row; row < end_row; row++) {
+    // Step 1: Find row max
+    float local_max = -__builtin_inff();
+#pragma GCC unroll 1
+    for (uint32_t j = lane_id; j < seq; j += MU_NUM_THREADS) {
+      const uint32_t s_addr = smem_S_base + (row * s_stride + j) * sizeof(float);
+      float val;
+      asm volatile("flw %0, %1(%2)" : "=f"(val) : "I"(0), "r"(s_addr));
+      if (val > local_max) local_max = val;
+    }
+
+    // Warp-level reduction for max
+    const uint32_t red_offset_max = (tid_in_threadblock / MU_NUM_THREADS) * MU_NUM_THREADS * 2;
+    const uint32_t red_addr_max = smem_red_base + (red_offset_max + lane_id) * sizeof(float);
+    asm volatile("fsw %0, %1(%2)" :: "f"(local_max), "I"(0), "r"(red_addr_max) : "memory");
+    mu_barrier(1, num_warps); // Intra-core sync for reduction
+
+    // Tree reduction in SMEM for max
+    for (uint32_t stride = MU_NUM_THREADS / 2; stride > 0; stride >>= 1) {
+      if (lane_id < stride) {
+        const uint32_t red_addr_a = smem_red_base + (red_offset_max + lane_id) * sizeof(float);
+        const uint32_t red_addr_b = smem_red_base + (red_offset_max + lane_id + stride) * sizeof(float);
+        float a_val, b_val;
+        asm volatile("flw %0, %1(%2)" : "=f"(a_val) : "I"(0), "r"(red_addr_a));
+        asm volatile("flw %0, %1(%2)" : "=f"(b_val) : "I"(0), "r"(red_addr_b));
+        if (b_val > a_val) a_val = b_val;
+        asm volatile("fsw %0, %1(%2)" :: "f"(a_val), "I"(0), "r"(red_addr_a) : "memory");
+      }
+      mu_barrier(1, num_warps); // Intra-core sync for next level
+    }
+
+    const uint32_t final_max_addr = smem_red_base + red_offset_max * sizeof(float);
+    float row_max;
+    asm volatile("flw %0, %1(%2)" : "=f"(row_max) : "I"(0), "r"(final_max_addr));
+
+    // Step 2: Compute exp and sum
+    float local_sum = 0.0f;
+#pragma GCC unroll 1
+    for (uint32_t j = lane_id; j < seq; j += MU_NUM_THREADS) {
+      const uint32_t s_addr = smem_S_base + (row * s_stride + j) * sizeof(float);
+      float val;
+      asm volatile("flw %0, %1(%2)" : "=f"(val) : "I"(0), "r"(s_addr));
+      val = mu_exp(val - row_max);
+      asm volatile("fsw %0, %1(%2)" :: "f"(val), "I"(0), "r"(s_addr) : "memory");
+      local_sum += val;
+    }
+
+    // Warp-level reduction for sum
+    const uint32_t red_addr_sum = smem_red_base + (red_offset_max + MU_NUM_THREADS + lane_id) * sizeof(float);
+    asm volatile("fsw %0, %1(%2)" :: "f"(local_sum), "I"(0), "r"(red_addr_sum) : "memory");
+    mu_barrier(1, num_warps); // Intra-core sync for sum reduction
+
+    // Tree reduction in SMEM for sum
+    for (uint32_t stride = MU_NUM_THREADS / 2; stride > 0; stride >>= 1) {
+      if (lane_id < stride) {
+        const uint32_t red_addr_a = smem_red_base + (red_offset_max + MU_NUM_THREADS + lane_id) * sizeof(float);
+        const uint32_t red_addr_b = smem_red_base + (red_offset_max + MU_NUM_THREADS + lane_id + stride) * sizeof(float);
+        float a_val, b_val;
+        asm volatile("flw %0, %1(%2)" : "=f"(a_val) : "I"(0), "r"(red_addr_a));
+        asm volatile("flw %0, %1(%2)" : "=f"(b_val) : "I"(0), "r"(red_addr_b));
+        a_val += b_val;
+        asm volatile("fsw %0, %1(%2)" :: "f"(a_val), "I"(0), "r"(red_addr_a) : "memory");
+      }
+      mu_barrier(1, num_warps);
+    }
+
+    const uint32_t final_sum_addr = smem_red_base + (red_offset_max + MU_NUM_THREADS) * sizeof(float);
+    float row_sum;
+    asm volatile("flw %0, %1(%2)" : "=f"(row_sum) : "I"(0), "r"(final_sum_addr));
+    const float inv_row_sum = 1.0f / row_sum;
+
+    // Step 3: Normalize
+#pragma GCC unroll 1
+    for (uint32_t j = lane_id; j < seq; j += MU_NUM_THREADS) {
+      const uint32_t s_addr = smem_S_base + (row * s_stride + j) * sizeof(float);
+      float val;
+      asm volatile("flw %0, %1(%2)" : "=f"(val) : "I"(0), "r"(s_addr));
+      val *= inv_row_sum;
+      asm volatile("fsw %0, %1(%2)" :: "f"(val), "I"(0), "r"(s_addr) : "memory");
+    }
+  }
+
+  mu_barrier(0, num_warps); // Sync after softmax
+
+  // Phase 3: O = P V
+  for (uint32_t idx = tid_in_threadblock; idx < seq * d; idx += threads_per_threadblock) {
+    const uint32_t i = idx / d; // row in P (and O)
+    const uint32_t k = idx % d; // col in V (and O)
+    float acc = 0.0f;
+#pragma GCC unroll 1
+    for (uint32_t j = 0; j < seq; j++) {
+      float p_val, v_val;
+      const uint32_t p_addr = smem_S_base + (i * s_stride + j) * sizeof(float);
+      const uint32_t v_addr = smem_V_base + (j * v_stride + k) * sizeof(float);
+      asm volatile("flw %0, %1(%2)" : "=f"(p_val) : "I"(0), "r"(p_addr));
+      asm volatile("flw %0, %1(%2)" : "=f"(v_val) : "I"(0), "r"(v_addr));
+      acc += p_val * v_val;
+    }
+    a->O[idx] = acc;
+  }
+}
+```

@@ -1,0 +1,66 @@
+```cpp
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t CKK = a->C * a->KH * a->KW;
+  const uint32_t smem_w = a->OH * a->OW * CKK * 4; // W staged AFTER patches
+
+  // (1) stage W flat into SMEM[smem_w..].
+  for (uint32_t i = tid_in_threadblock; i < a->OC * CKK; i += threads_per_threadblock) {
+    store_shared(smem_w + i * 4, 0, __builtin_bit_cast(uint32_t, a->w[i]));
+  }
+
+  // (2) gather im2col patches into SMEM[0..]
+  {
+    const uint32_t KH = a->KH, KW = a->KW, OW = a->OW;
+    const uint32_t Wd = a->W, HWd = a->H * Wd, stride = a->stride;
+    const uint32_t P = a->OH * OW;
+    const uint32_t kh_kw = KH * KW;
+
+    for (uint32_t p = 0; p < P; p++) {
+      const uint32_t p_OW_stride = ((OW == 4) ? (p >> 2) : (p / OW)) * stride;
+      const uint32_t p_mod_OW_stride = ((OW == 4) ? (p & 3) : (p % OW)) * stride;
+      const uint32_t p_CKK = p * CKK;
+
+      for (uint32_t ckk = tid_in_threadblock; ckk < CKK; ckk += threads_per_threadblock) {
+        const uint32_t c = (kh_kw == 256) ? (ckk >> 8) : (ckk / kh_kw);
+        const uint32_t ckk_mod_kh_kw = (kh_kw == 256) ? (ckk & 255) : (ckk % kh_kw);
+        const uint32_t kh = (KW == 16) ? (ckk_mod_kh_kw >> 4) : (ckk_mod_kh_kw / KW);
+        const uint32_t kw = (KW == 16) ? (ckk_mod_kh_kw & 15) : (ckk_mod_kh_kw % KW);
+
+        const uint32_t in_idx = c * HWd
+                              + (p_OW_stride + kh) * Wd
+                              + p_mod_OW_stride + kw;
+        store_shared((p_CKK + ckk) * 4, 0, __builtin_bit_cast(uint32_t, a->in[in_idx]));
+      }
+    }
+  }
+
+  // Cross-core SMEM staging sync
+  mu_barrier(0, threads_per_threadblock / MU_NUM_THREADS); // ID 0 = cross-core/cluster barrier
+
+  // (3) frugal matmul: OUT[oc*P + p] = sum_ckk W[oc][ckk] * patch[p][ckk].
+  {
+    const uint32_t P = a->OH * a->OW;
+    const uint32_t OC_P = a->OC * P;
+    for (uint32_t idx = tid_in_threadblock; idx < OC_P; idx += threads_per_threadblock) {
+      const uint32_t oc = (P == 16) ? (idx >> 4) : (idx / P);
+      const uint32_t p = (P == 16) ? (idx & 15) : (idx % P);
+      uint32_t wa = smem_w + oc * CKK * 4; // W base (after patches)
+      uint32_t pa = p * CKK * 4;          // patch base (SMEM offset 0)
+      float acc = 0.0f;
+      for (uint32_t k = 0; k < CKK; k++) {
+        acc += __builtin_bit_cast(float, load32_shared(wa)) *
+               __builtin_bit_cast(float, load32_shared(pa));
+        wa += 4; pa += 4;
+      }
+      a->out[idx] = acc;
+    }
+  }
+}
+```

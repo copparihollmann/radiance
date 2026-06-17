@@ -1,0 +1,177 @@
+```cpp
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t seq = a->seq;      // 128
+  const uint32_t d = a->d;          // 64
+  const uint32_t nw = threads_per_threadblock / MU_NUM_THREADS; // 8 warps
+
+  const uint32_t warp_id = tid_in_threadblock / 16;
+  const uint32_t lane_id = tid_in_threadblock % 16;
+
+  // Shared memory layout:
+  // 0x00000: Q_shm[128][64] (padded to 128x68) -> up to 0x02200
+  // 0x02200: K_shm[128][64] (padded to 128x68) -> up to 0x04400
+  // 0x04400: scores_shm[128][128] (padded to 128x132) -> up to 0x10800
+  // 0x10800: exp_scores_shm[128][128] (padded to 128x132) -> up to 0x1CC00
+  // 0x1CC00: V_shm[128][64] (padded to 128x68) -> up to 0x1EE00
+  // All accesses are padded to avoid bank conflicts.
+
+  float* const Q_shm = reinterpret_cast<float*>(0x00000000);
+  float* const K_shm = reinterpret_cast<float*>(0x002200);
+  float* const scores_shm = reinterpret_cast<float*>(0x04400);
+  float* const exp_scores_shm = reinterpret_cast<float*>(0x10800);
+  float* const V_shm = reinterpret_cast<float*>(0x1CC00);
+
+  const uint32_t rows_per_warp = seq / nw;  // 128 / 8 = 16
+  const uint32_t my_row_start = warp_id * rows_per_warp;  // 0, 16, 32, ..., 112
+
+  // Phase 1: Load Q once per warp (cooperative)
+  for (uint32_t r = 0; r < rows_per_warp; ++r) {
+    const uint32_t i = my_row_start + r;
+    const __global float* qi = a->Q + i * d;
+    for (uint32_t k_lane = lane_id; k_lane < d; k_lane += 16) {
+      Q_shm[(i * 68) + k_lane] = qi[k_lane];
+    }
+  }
+
+  // Phase 2: Load K into shared memory
+  for (uint32_t j = lane_id; j < seq; j += 16) {
+    const __global float* kj = a->K + j * d;
+    for (uint32_t k = 0; k < d; k++) {
+      K_shm[(j * 68) + k] = kj[k];
+    }
+  }
+
+  mu_barrier(0, nw);  // Cross-core sync after K load
+
+  // Phase 3: Compute QK^T scores cooperatively
+  for (uint32_t r = 0; r < rows_per_warp; ++r) {
+    const uint32_t i = my_row_start + r;
+
+    for (uint32_t j = 0; j < seq; ++j) {
+      float local_sum = 0.0f;
+      for (uint32_t k_lane = lane_id; k_lane < d; k_lane += 16) {
+        local_sum += Q_shm[(i * 68) + k_lane] * K_shm[(j * 68) + k_lane];
+      }
+
+      // Reduce within warp using shared memory
+      const uint32_t smem_idx = (warp_id * 16) + lane_id;
+      *(scores_shm + smem_idx) = local_sum;
+      asm volatile("" ::: "memory");
+
+      // Butterfly reduction
+      if (lane_id < 8) *(scores_shm + smem_idx) += *(scores_shm + smem_idx + 8);
+      asm volatile("" ::: "memory");
+      if (lane_id < 4) *(scores_shm + smem_idx) += *(scores_shm + smem_idx + 4);
+      asm volatile("" ::: "memory");
+      if (lane_id < 2) *(scores_shm + smem_idx) += *(scores_shm + smem_idx + 2);
+      asm volatile("" ::: "memory");
+      if (lane_id < 1) *(scores_shm + smem_idx) += *(scores_shm + smem_idx + 1);
+      asm volatile("" ::: "memory");
+
+      // Broadcast result to all threads in warp
+      if (lane_id == 0) {
+        const float reduced_sum = *(scores_shm + (warp_id * 16));
+        scores_shm[i * 132 + j] = reduced_sum * 0.125f;
+      }
+    }
+  }
+
+  mu_barrier(0, nw);  // Cross-core sync after scores computation
+
+  // Phase 4: Softmax row-wise (per warp)
+  for (uint32_t r = 0; r < rows_per_warp; ++r) {
+    const uint32_t i = my_row_start + r;
+
+    // Find max (cooperative)
+    float my_val = scores_shm[i * 132 + lane_id];
+    if (lane_id >= seq) my_val = -INFINITY;
+
+    const uint32_t smem_idx = (warp_id * 16) + lane_id;
+    *(exp_scores_shm + smem_idx) = my_val;
+    asm volatile("" ::: "memory");
+
+    // Reduction tree to find max
+    if (lane_id < 8) {
+      float other = *(exp_scores_shm + smem_idx + 8);
+      if (other > *(exp_scores_shm + smem_idx)) *(exp_scores_shm + smem_idx) = other;
+    }
+    asm volatile("" ::: "memory");
+    if (lane_id < 4) {
+      float other = *(exp_scores_shm + smem_idx + 4);
+      if (other > *(exp_scores_shm + smem_idx)) *(exp_scores_shm + smem_idx) = other;
+    }
+    asm volatile("" ::: "memory");
+    if (lane_id < 2) {
+      float other = *(exp_scores_shm + smem_idx + 2);
+      if (other > *(exp_scores_shm + smem_idx)) *(exp_scores_shm + smem_idx) = other;
+    }
+    asm volatile("" ::: "memory");
+    if (lane_id < 1) {
+      float other = *(exp_scores_shm + smem_idx + 1);
+      if (other > *(exp_scores_shm + smem_idx)) *(exp_scores_shm + smem_idx) = other;
+    }
+    asm volatile("" ::: "memory");
+
+    const float m = *(exp_scores_shm + (warp_id * 16));
+
+    // Compute exp and sum (cooperative)
+    float exp_val = 0.0f;
+    if (lane_id < seq) {
+      exp_val = mu_exp(scores_shm[i * 132 + lane_id] - m);
+    }
+    *(exp_scores_shm + smem_idx) = exp_val;
+    asm volatile("" ::: "memory");
+
+    // Reduction tree to sum
+    if (lane_id < 8) *(exp_scores_shm + smem_idx) += *(exp_scores_shm + smem_idx + 8);
+    asm volatile("" ::: "memory");
+    if (lane_id < 4) *(exp_scores_shm + smem_idx) += *(exp_scores_shm + smem_idx + 4);
+    asm volatile("" ::: "memory");
+    if (lane_id < 2) *(exp_scores_shm + smem_idx) += *(exp_scores_shm + smem_idx + 2);
+    asm volatile("" ::: "memory");
+    if (lane_id < 1) *(exp_scores_shm + smem_idx) += *(exp_scores_shm + smem_idx + 1);
+    asm volatile("" ::: "memory");
+
+    const float sum = *(exp_scores_shm + (warp_id * 16));
+    const float inv_sum = 1.0f / sum;
+
+    // Write normalized values back
+    if (lane_id < seq) {
+      exp_scores_shm[i * 132 + lane_id] = exp_val * inv_sum;
+    }
+  }
+
+  mu_barrier(0, nw);  // Cross-core sync after softmax
+
+  // Phase 5: Load V into shared memory
+  for (uint32_t k = lane_id; k < d; k += 16) {
+    const __global float* vk = a->V + k;
+    for (uint32_t j = 0; j < seq; j++) {
+      V_shm[(j * 68) + k] = vk[j * d];
+    }
+  }
+
+  mu_barrier(0, nw);  // Cross-core sync after V load
+
+  // Phase 6: Compute OV^T multiplication (cooperative)
+  for (uint32_t r = 0; r < rows_per_warp; ++r) {
+    const uint32_t i = my_row_start + r;
+
+    // Each thread computes 4 output elements
+    for (uint32_t k_lane = lane_id * 4; k_lane < d && k_lane < (lane_id + 1) * 4; ++k_lane) {
+      float acc = 0.0f;
+      for (uint32_t j = 0; j < seq; ++j) {
+        acc += exp_scores_shm[i * 132 + j] * V_shm[(j * 68) + k_lane];
+      }
+      a->O[(i * d) + k_lane] = acc;
+    }
+  }
+}
+```

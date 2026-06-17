@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n36, $x37, $x38, $x39, $x40, $x41, $x42, $x43, $x44, $x45, $x46, $x47\n  renamable $x96 = SRLI renamable $x30, 6\n  renamable $x97 = ANDI renamable $x30, 63\n  renamable $x99 = nuw nsw ADD killed renamable $x96, renamable $x34\n  INLINEASM &\"lw.shared $0, $1($2)\" [sideeffect] [mayload] [maystore] [attdialect], $0:[regdef:GPRNoX0], def renamable $x96, $1:[imm], 0, $2:[reguse:GPRNoX0], renamable $x31, !37\n  renamable $x100 = LW renamable $x10, 8 :: (load (s32) from %ir.sunkaddr229, !tbaa !39)\n  renamable $x98 = MUL killed renamable $x99, renamable $x17\n  renamable $x99 = OR killed renamable $x97, renamable $x6\n  renamable $x97 = SLLI killed renamable $x98, 2\n  renamable $x98 = ADD killed renamable $x100, killed renamable $x97\n  renamable $x97 = SLLI killed renamable $x99, 2\n  renamable $x99 = ADD killed renamable $x98, killed renamable $x97\n  SW killed renamable $x96, killed renamable $x99, 0 :: (store (s32) into %ir.arrayidx121, !tbaa !23)\n  renamable $x30 = ADD killed renamable $x30, renamable $x12\n  renamable $x31 = ADD killed renamable $x31, renamable $x38\n  renamable $x96 = SRLI renamable $x30, 12\n  renamable $x98 = SLTU $x0, killed renamable $x96\n  VX_PRED_N renamable $x98, renamable $x29\n  BEQ killed renamable $x98, $x0, %bb.29\n  PseudoBR %bb.7\n\nbb.30.join_stub252:\n; predecessors: %bb.0, %bb.4\n  liveins: $x14\n  VX_JOIN killed renamable $x14\n  PseudoRET\n\n# End machine code for function _ZL11kernel_bodyPvjjj.\n\n1 error generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

@@ -1,0 +1,89 @@
+```cpp
+#include <stdint.h>
+
+struct KernelArgs {
+  float* A;
+  float* B;
+  float* C;
+  uint32_t M;
+  uint32_t N;
+  uint32_t K;
+};
+
+// Hardware configuration helper macros
+#define MU_NUM_THREADS 16
+#define MU_NUM_WARPS 8
+
+__attribute__((convergent))
+static void mu_barrier(unsigned barrier_id, unsigned num_warps) {
+    asm volatile ("vx_bar %0, %1" :: "r"(barrier_id), "r"(num_warps) : "memory");
+}
+
+inline void store_shared(uint32_t base, uint32_t offset, uint32_t data) {
+    asm volatile("sw.shared %2, %1(%0)" :: "r"(base), "I"(offset), "r"(data)
+                 : "memory");
+}
+
+inline uint32_t load32_shared(uint32_t address) {
+    uint32_t data;
+    asm volatile("lw.shared %0, %1(%2)" : "=r"(data) : "I"(0), "r"(address)
+                 : "memory");
+    return data;
+}
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  // 1. Cooperative load of Matrix A to SMEM (Base address 0)
+  for (uint32_t i = tid_in_threadblock; i < 4096; i += threads_per_threadblock) {
+    float val = args->A[i];
+    store_shared(0 + i * 4, 0, __builtin_bit_cast(uint32_t, val));
+  }
+
+  // 2. Cooperative load of Matrix B (transposed and padded to stride 65 in SMEM)
+  // B_T is stored at SMEM base address 16384.
+  uint32_t col = tid_in_threadblock & 63;
+  uint32_t row = tid_in_threadblock >> 6;
+  uint32_t smem_addr_B = 16384 + (col * 65 + row) * 4;
+
+  for (uint32_t i = tid_in_threadblock; i < 4096; i += threads_per_threadblock) {
+    float val = args->B[i];
+    store_shared(smem_addr_B, 0, __builtin_bit_cast(uint32_t, val));
+    smem_addr_B += 8; // Increment by 2 rows (each row is 65 elements, so 2*65*4 = 520 bytes, but since we're going row-major, the next element in a column is 65*4=260 away, so adding 8 moves us along columns)
+  }
+
+  // Use cross-core barrier (ID 0) to ensure both cores see the staged SMEM data
+  mu_barrier(0, MU_NUM_WARPS * 2);
+
+  // 3. Compute C using register-efficient pointer increments
+  col = tid_in_threadblock & 63;
+  row = tid_in_threadblock >> 6;
+  
+  // Each iteration processes one output element per thread
+  for (uint32_t idx = tid_in_threadblock; idx < 4096; idx += threads_per_threadblock) {
+    float acc = 0.0f;
+    
+    // Calculate initial pointers for this thread's computation
+    uint32_t k_base_A = row * 64;              // Starting index in A for current row
+    uint32_t k_base_B = col;                   // Starting index in transposed B for current column
+    
+    #pragma GCC unroll 1
+    for (uint32_t k = 0; k < 64; k++) {
+      uint32_t addr_A = (k_base_A + k) * 4;       // A[row][k]
+      uint32_t addr_B = 16384 + (k * 65 + k_base_B) * 4;  // B_T[k][col]
+      
+      float a = __builtin_bit_cast(float, load32_shared(addr_A));
+      float b = __builtin_bit_cast(float, load32_shared(addr_B));
+      acc += a * b;
+    }
+
+    args->C[idx] = acc;
+  }
+}
+```

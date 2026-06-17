@@ -1,0 +1,155 @@
+#include <stdint.h>
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  const uint32_t M = args->M;
+  const uint32_t N = args->N;
+  const uint32_t K = args->K;
+
+  // Use pointers with correct address space qualifier
+  const __global float* A = args->A;
+  const __global float* B = args->B;
+  __global float* C = args->C;
+
+  // Tile sizes
+  const uint32_t BM = 64;   // Block size in M
+  const uint32_t BN = 64;   // Block size in N
+  const uint32_t BK = 32;   // Block size in K
+
+  // Shared memory allocation
+  const uint32_t SMEM_A_BASE = 0;
+  const uint32_t SMEM_B_BASE = 8 * 32 * 4; // 8 rows * 32 cols * 4 bytes
+
+  // Thread mapping
+  const uint32_t tid = tid_in_threadblock;
+  const uint32_t warp_id = tid / 16;
+  const uint32_t lane_id = tid % 16;
+
+  // Loop over blocks in M dimension
+  for (uint32_t m_block = 0; m_block < M; m_block += BM) {
+    const uint32_t m_limit = (m_block + BM > M) ? M : m_block + BM;
+
+    // Loop over blocks in N dimension
+    for (uint32_t n_block = 0; n_block < N; n_block += BN) {
+      const uint32_t n_limit = (n_block + BN > N) ? N : n_block + BN;
+
+      // Phase-based computation: Split BM x BN into 8 phases of 8 x 64
+      for (uint32_t phase = 0; phase < 8; phase++) {
+        const uint32_t row_base = m_block + phase * 8;
+        if (row_base >= m_limit) break;
+
+        // Each thread processes one 1x4 tile of the 8x64 sub-block
+        const uint32_t thread_row = row_base + (tid / 16); // 0 to 7 relative to row_base
+        const uint32_t thread_col = (tid % 16) * 4;
+
+        if (thread_row < m_limit && thread_col < n_limit) {
+          // Single accumulator per thread
+          float acc0 = 0.0f;
+          float acc1 = 0.0f;
+          float acc2 = 0.0f;
+          float acc3 = 0.0f;
+
+          // Loop over K blocks
+          for (uint32_t k_block = 0; k_block < K; k_block += BK) {
+            const uint32_t k_limit_inner = (k_block + BK > K) ? K : k_block + BK;
+
+            // --- Load A tile (8 rows x 32 cols) ---
+            // Each thread loads 2 elements
+            uint32_t a_idx1 = tid;
+            uint32_t a_idx2 = tid + 128;
+
+            if (a_idx1 < 8 * 32) {
+              uint32_t a_r1 = a_idx1 / 32;
+              uint32_t a_c1 = a_idx1 % 32;
+              uint32_t global_r1 = row_base + a_r1;
+              if (global_r1 < m_limit && (k_block + a_c1) < k_limit_inner) {
+                float val = A[global_r1 * K + (k_block + a_c1)];
+                store_shared(SMEM_A_BASE, a_idx1 * 4, __builtin_bit_cast(uint32_t, val));
+              } else {
+                store_shared(SMEM_A_BASE, a_idx1 * 4, 0);
+              }
+            }
+
+            if (a_idx2 < 8 * 32) {
+              uint32_t a_r2 = a_idx2 / 32;
+              uint32_t a_c2 = a_idx2 % 32;
+              uint32_t global_r2 = row_base + a_r2;
+              if (global_r2 < m_limit && (k_block + a_c2) < k_limit_inner) {
+                float val = A[global_r2 * K + (k_block + a_c2)];
+                store_shared(SMEM_A_BASE, a_idx2 * 4, __builtin_bit_cast(uint32_t, val));
+              } else {
+                store_shared(SMEM_A_BASE, a_idx2 * 4, 0);
+              }
+            }
+
+            // --- Load B tile (32 rows x 64 cols) ---
+            // Each thread loads 16 elements with coalesced access
+            for (uint32_t j = 0; j < 16; j++) {
+              uint32_t b_idx = tid + j * threads_per_threadblock; // tid + j * 128
+              if (b_idx < 32 * 64) {
+                uint32_t b_r = b_idx / 64;
+                uint32_t b_c = b_idx % 64;
+                uint32_t global_k = k_block + b_r;
+                uint32_t global_n = n_block + b_c;
+                if (global_k < k_limit_inner && global_n < n_limit) {
+                  float val = B[global_k * N + global_n];
+                  store_shared(SMEM_B_BASE, b_idx * 4, __builtin_bit_cast(uint32_t, val));
+                } else {
+                  store_shared(SMEM_B_BASE, b_idx * 4, 0);
+                }
+              }
+            }
+
+            // Cross-core synchronization after loading A and B tiles
+            mu_barrier(0, threads_per_threadblock / 16); // ID 0, 8 warps
+
+            // --- Compute partial products ---
+            const uint32_t local_row = tid / 16; // 0 to 7
+            const uint32_t local_col = tid % 16; // 0 to 15
+
+            uint32_t a_ptr = SMEM_A_BASE + local_row * 32 * 4; // 32 cols, 4 bytes
+            uint32_t b_base_ptr = SMEM_B_BASE + local_col * 4 * 4; // 4 cols per thread, 4 bytes
+
+            // Rolled loop to stay under register limit
+            for (uint32_t k_inner = 0; k_inner < BK; k_inner++) {
+              float a_val = __builtin_bit_cast(float, load32_shared(a_ptr));
+              acc0 += a_val * __builtin_bit_cast(float, load32_shared(b_base_ptr + 0 * 64 * 4));
+              acc1 += a_val * __builtin_bit_cast(float, load32_shared(b_base_ptr + 1 * 64 * 4));
+              acc2 += a_val * __builtin_bit_cast(float, load32_shared(b_base_ptr + 2 * 64 * 4));
+              acc3 += a_val * __builtin_bit_cast(float, load32_shared(b_base_ptr + 3 * 64 * 4));
+
+              a_ptr += 4; // Move to next element in A row
+              b_base_ptr += 4; // Move to next row in B
+            }
+
+            // Synchronize before reusing SMEM for next K block
+            mu_barrier(0, threads_per_threadblock / 16);
+          } // End of K loop
+
+          // Write results to global memory
+          uint32_t c_row = thread_row;
+          uint32_t c_col = n_block + thread_col;
+          if (c_row < M && c_col < N) {
+            C[c_row * N + c_col + 0] = acc0;
+            if (c_col + 1 < N) C[c_row * N + c_col + 1] = acc1;
+            if (c_col + 2 < N) C[c_row * N + c_col + 2] = acc2;
+            if (c_col + 3 < N) C[c_row * N + c_col + 3] = acc3;
+          }
+        } else {
+          // Handle boundary threads by doing dummy work to maintain synchronization
+          for (uint32_t k_block = 0; k_block < K; k_block += BK) {
+            mu_barrier(0, threads_per_threadblock / 16);
+            mu_barrier(0, threads_per_threadblock / 16);
+          }
+        }
+      } // End of phase loop
+    } // End of N block loop
+  } // End of M block loop
+}

@@ -1,0 +1,87 @@
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  const uint32_t M = args->M;
+  const uint32_t N = args->N;
+  const uint32_t K = args->K;
+
+  const uint32_t tid = tid_in_threadblock;
+  const uint32_t warp_id = tid / 16;
+  const uint32_t lane_id = tid % 16;
+
+  // Shared memory layout:
+  // smem_A: [0x00000, 0x10000) -> 64x64 FP32 = 16 KB
+  // smem_B: [0x10000, 0x20000) -> 64x80 FP32 = 20 KB (padded)
+  constexpr uint32_t smem_a_base = 0x00000;
+  constexpr uint32_t smem_b_base = 0x10000;
+  constexpr uint32_t smem_b_stride = 80; // 64 + 16 padding to avoid bank conflicts
+
+  const __global float* A = args->A;
+  const __global float* B = args->B;
+  float* C = args->C;
+
+  // Each thread is responsible for one output element
+  const uint32_t row = tid / N;
+  const uint32_t col = tid % N;
+
+  // If out of bounds, exit early
+  if (row >= M || col >= N) return;
+
+  // ---------------------------
+  // Step 1: Cooperatively load A and B into SMEM
+  // ---------------------------
+  // Every thread loads 4 elements of A and B
+  uint32_t a_smem_offset = tid * 4 * sizeof(float);
+  uint32_t b_smem_offset = tid * 4 * sizeof(float);
+
+#pragma GCC unroll 1
+  for (uint32_t k = 0; k < K; k += 64) {
+    if (k + lane_id < K) {
+      uint32_t a_idx = row * K + k + lane_id;
+      uint32_t b_idx = (k + lane_id) * N + col;
+
+      float a_val = (a_idx < M * K) ? A[a_idx] : 0.0f;
+      float b_val = (b_idx < K * N) ? B[b_idx] : 0.0f;
+
+      store_shared(smem_a_base, a_smem_offset + (lane_id * 4), __builtin_bit_cast(uint32_t, a_val));
+      store_shared(smem_b_base, b_smem_offset + (lane_id * 4), __builtin_bit_cast(uint32_t, b_val));
+    }
+    a_smem_offset += 64 * sizeof(float);
+    b_smem_offset += 64 * smem_b_stride * sizeof(float);
+  }
+
+  // Cross-core barrier: ensure all threads (both cores) finish loading
+  mu_barrier(0, threads_per_threadblock / 16); // 8 warps total
+
+  // ---------------------------
+  // Step 2: Accumulate dot product using SMEM
+  // ---------------------------
+  float acc = 0.0f;
+  const uint32_t a_row_offset = row * 64 * sizeof(float);
+  const uint32_t b_col_base = smem_b_base + col * sizeof(float);
+
+#pragma GCC unroll 1
+  for (uint32_t k = 0; k < K; ++k) {
+    const uint32_t a_addr = a_row_offset + k * sizeof(float);
+    const uint32_t b_addr = b_col_base + k * smem_b_stride * sizeof(float);
+
+    uint32_t a_bits = load32_shared(a_addr);
+    uint32_t b_bits = load32_shared(b_addr);
+
+    float a_val = __builtin_bit_cast(float, a_bits);
+    float b_val = __builtin_bit_cast(float, b_bits);
+
+    acc += a_val * b_val;
+  }
+
+  // ---------------------------
+  // Step 3: Write result to global memory
+  // ---------------------------
+  C[row * N + col] = acc;
+}

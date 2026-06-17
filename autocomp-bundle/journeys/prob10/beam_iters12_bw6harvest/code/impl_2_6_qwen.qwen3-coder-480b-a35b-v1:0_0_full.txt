@@ -1,0 +1,115 @@
+```cpp
+#include <stdint.h>
+
+#define MU_NUM_THREADS 16
+#define K_TILE 64
+#define K_PAD (K_TILE + 1) // Pad to avoid bank conflicts
+#define SMEM_A_OFF 0
+#define SMEM_B_OFF (32 * K_PAD * 4) // 32 rows of A, each row K_PAD floats
+
+static inline float bits_to_float(uint32_t b) {
+    union { uint32_t u; float f; } c;
+    c.u = b;
+    return c.f;
+}
+
+static inline uint32_t float_to_bits(float f) {
+    union { uint32_t u; float f; } c;
+    c.f = f;
+    return c.u;
+}
+
+static inline void kernel_body(
+    void* raw_arg,
+    uint32_t tid_in_threadblock,
+    uint32_t threads_per_threadblock,
+    uint32_t threadblock_id
+) {
+    (void)threadblock_id;
+    auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+    const uint32_t M = args->M;
+    const uint32_t N = args->N;
+    const uint32_t K = args->K;
+
+    const uint32_t tid = tid_in_threadblock;
+    const uint32_t num_warps = threads_per_threadblock / MU_NUM_THREADS; // 8 warps
+
+    // Thread mapping: 128 threads -> 8 warps -> 32x16 tile in C
+    const uint32_t warp_id = tid / MU_NUM_THREADS; // 0..7
+    const uint32_t lane_id = tid % MU_NUM_THREADS; // 0..15
+
+    // Decompose warp_id into 2-row-blocks and 4-col-blocks indices
+    const uint32_t block_row_id = warp_id / 4; // 0..1
+    const uint32_t block_col_id = warp_id % 4; // 0..3
+
+    const uint32_t th_r = lane_id; // 0..15 (rows within 16x16 block)
+    const uint32_t th_c = block_col_id; // 0..3 col-block selector
+
+    const uint32_t row_start = block_row_id * 32;
+    const uint32_t col_start = block_col_id * 16;
+
+    // Shared memory layout:
+    // A_tile: 32 rows x K_PAD cols (padded floats), stored row-major
+    // B_tile: 16 cols x K_PAD rows (transposed), stored row-major
+
+    for (uint32_t idx = tid; idx < M * N; idx += threads_per_threadblock) {
+        const uint32_t global_row = idx / N;
+        const uint32_t global_col = idx % N;
+
+        float acc = 0.0f;
+
+        for (uint32_t k0 = 0; k0 < K; k0 += K_TILE) {
+            // --- Stage A tile ---
+            // Each thread loads 8 elements (K_TILE=64 elems, 128 threads)
+            #pragma GCC unroll 4
+            for (uint32_t i = 0; i < 4; i++) {
+                uint32_t elem_idx = i * 32 + lane_id;
+                uint32_t r = elem_idx / K_TILE;
+                uint32_t c = elem_idx % K_TILE;
+                uint32_t g_row = row_start + r;
+                uint32_t g_col = k0 + c;
+                float val = (g_row < M && g_col < K) ? args->A[g_row * K + g_col] : 0.0f;
+                uint32_t s_addr = SMEM_A_OFF + (r * K_PAD + c) * 4;
+                store_shared(s_addr, 0, float_to_bits(val));
+            }
+
+            // --- Stage B tile (transposed) ---
+            // Each thread loads 4 elements
+            #pragma GCC unroll 4
+            for (uint32_t i = 0; i < 4; i++) {
+                uint32_t elem_idx = i * 32 + lane_id;
+                uint32_t r = elem_idx / 16;
+                uint32_t c = elem_idx % 16;
+                uint32_t g_row = k0 + r;
+                uint32_t g_col = col_start + c;
+                float val = (g_row < K && g_col < N) ? args->B[g_row * N + g_col] : 0.0f;
+                uint32_t s_addr = SMEM_B_OFF + (c * K_PAD + r) * 4;
+                store_shared(s_addr, 0, float_to_bits(val));
+            }
+
+            // Cross-core barrier: Ensure all threads see SMEM writes
+            mu_barrier(0, num_warps);
+
+            // --- Compute ---
+            const uint32_t a_row_base = SMEM_A_OFF + th_r * K_PAD * 4;
+            const uint32_t b_col_base = SMEM_B_OFF + th_c * 16 * K_PAD * 4;
+
+            #pragma GCC unroll 1 // Rolled to avoid register spilling
+            for (uint32_t k = 0; k < K_TILE; k++) {
+                float b_val = bits_to_float(load32_shared(b_col_base + k * 4));
+                float a_val = bits_to_float(load32_shared(a_row_base + k * 4));
+                acc += a_val * b_val;
+            }
+
+            // Inter-tile barrier: Ensure compute finishes before next stage
+            mu_barrier(0, num_warps);
+        }
+
+        // Write result
+        if (global_row < M && global_col < N) {
+            args->C[global_row * N + global_col] = acc;
+        }
+    }
+}
+```

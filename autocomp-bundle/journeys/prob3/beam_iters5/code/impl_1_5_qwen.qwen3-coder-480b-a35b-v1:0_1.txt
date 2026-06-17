@@ -1,0 +1,143 @@
+#include <stdint.h>
+
+static inline float load_float_shared(uint32_t byte_addr) {
+    union { uint32_t i; float f; } u;
+    u.i = load32_shared(byte_addr);
+    return u.f;
+}
+
+static inline void store_float_shared(uint32_t byte_addr, float val) {
+    union { float f; uint32_t i; } u;
+    u.f = val;
+    store_shared(byte_addr, 0, u.i);
+}
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t num_warps = threads_per_threadblock / MU_NUM_THREADS;
+  const float scale = 0.125f;
+
+  const uint32_t Q_offset = 0;
+  const uint32_t K_offset = 24576;
+  const uint32_t V_offset = 49152;
+  const uint32_t S_offset = 73728;
+
+  const __global float* Q_ptr = a->Q;
+  const __global float* K_ptr = a->K;
+  const __global float* V_ptr = a->V;
+  __global float* O_ptr = a->O;
+
+  // 1. Stage Q from global memory to SMEM
+  for (uint32_t idx = tid_in_threadblock; idx < 6144; idx += threads_per_threadblock) {
+    float val = Q_ptr[idx];
+    store_float_shared(Q_offset + idx * 4, val);
+  }
+
+  // 2. Stage K from global memory to SMEM
+  for (uint32_t idx = tid_in_threadblock; idx < 6144; idx += threads_per_threadblock) {
+    float val = K_ptr[idx];
+    store_float_shared(K_offset + idx * 4, val);
+  }
+
+  // 3. Stage V from global memory and transpose it into SMEM (column-major)
+  for (uint32_t idx = tid_in_threadblock; idx < 6144; idx += threads_per_threadblock) {
+    const uint32_t j = idx / 64;
+    const uint32_t k = idx % 64;
+    float val = V_ptr[idx];
+    store_float_shared(V_offset + (k * 96 + j) * 4, val);
+  }
+
+  mu_barrier(0, num_warps);
+
+  // 4. Compute attention scores S = Q K^T * scale
+  for (uint32_t idx = tid_in_threadblock; idx < 9216; idx += threads_per_threadblock) {
+    const uint32_t i = idx / 96;
+    const uint32_t j = idx % 96;
+    
+    uint32_t q_addr = Q_offset + i * 256;
+    uint32_t k_addr = K_offset + j * 256;
+    float acc = 0.0f;
+    
+    for (uint32_t k = 0; k < 32; k++) {
+      float q_val0 = load_float_shared(q_addr);
+      float k_val0 = load_float_shared(k_addr);
+      float q_val1 = load_float_shared(q_addr + 4);
+      float k_val1 = load_float_shared(k_addr + 4);
+      acc += q_val0 * k_val0;
+      acc += q_val1 * k_val1;
+      q_addr += 8;
+      k_addr += 8;
+    }
+    store_float_shared(S_offset + idx * 4, acc * scale);
+  }
+
+  mu_barrier(0, num_warps);
+
+  // 5. Softmax per row in SMEM
+  for (uint32_t row = tid_in_threadblock; row < 96; row += threads_per_threadblock) {
+    const uint32_t s_row_addr = S_offset + row * 384;
+    float m = -1e30f;
+    
+    uint32_t addr = s_row_addr;
+    for (uint32_t j = 0; j < 48; j++) {
+      float v0 = load_float_shared(addr);
+      float v1 = load_float_shared(addr + 4);
+      if (v0 > m) m = v0;
+      if (v1 > m) m = v1;
+      addr += 8;
+    }
+    
+    float sum = 0.0f;
+    addr = s_row_addr;
+    for (uint32_t j = 0; j < 48; j++) {
+      float v0 = load_float_shared(addr);
+      float v1 = load_float_shared(addr + 4);
+      float e0 = mu_exp(v0 - m);
+      float e1 = mu_exp(v1 - m);
+      store_float_shared(addr, e0);
+      store_float_shared(addr + 4, e1);
+      sum += e0 + e1;
+      addr += 8;
+    }
+    
+    const float inv = 1.0f / sum;
+    addr = s_row_addr;
+    for (uint32_t j = 0; j < 48; j++) {
+      float e0 = load_float_shared(addr);
+      float e1 = load_float_shared(addr + 4);
+      store_float_shared(addr, e0 * inv);
+      store_float_shared(addr + 4, e1 * inv);
+      addr += 8;
+    }
+  }
+
+  mu_barrier(0, num_warps);
+
+  // 6. Compute Output O = S V_transposed
+  for (uint32_t idx = tid_in_threadblock; idx < 6144; idx += threads_per_threadblock) {
+    const uint32_t i = idx / 64;
+    const uint32_t k = idx % 64;
+    
+    uint32_t s_addr = S_offset + i * 384;
+    uint32_t v_addr = V_offset + k * 384;
+    float acc = 0.0f;
+    
+    for (uint32_t j = 0; j < 48; j++) {
+      float s_val0 = load_float_shared(s_addr);
+      float v_val0 = load_float_shared(v_addr);
+      float s_val1 = load_float_shared(s_addr + 4);
+      float v_val1 = load_float_shared(v_addr + 4);
+      acc += s_val0 * v_val0;
+      acc += s_val1 * v_val1;
+      s_addr += 8;
+      v_addr += 8;
+    }
+    O_ptr[idx] = acc;
+  }
+}

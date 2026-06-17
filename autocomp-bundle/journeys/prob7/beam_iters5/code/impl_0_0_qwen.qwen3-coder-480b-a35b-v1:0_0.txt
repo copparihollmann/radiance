@@ -1,0 +1,209 @@
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t seq = a->seq;         // 128
+  const uint32_t d = a->d;             // 64
+  const uint32_t nw = threads_per_threadblock / MU_NUM_THREADS; // 8 warps
+
+  // Derived constants
+  const uint32_t WARPS_PER_TB = nw;               // 8
+  const uint32_t LANES_PER_WARP = MU_NUM_THREADS; // 16
+  const uint32_t ROWS_PER_WARP = seq / WARPS_PER_TB; // 128/8 = 16
+  const uint32_t ELEMS_PER_LANE_QK = d / LANES_PER_WARP; // 64/16 = 4
+  const uint32_t ELEMS_PER_LANE_SOFTMAX = seq / LANES_PER_WARP; // 128/16 = 8
+
+  // Shared Memory Layout:
+  // 1. smem_q_row: 64 floats (per warp) -> 256 bytes
+  // 2. smem_k_col: 64 floats (per warp) -> 256 bytes
+  // 3. smem_scores: 128 floats (per warp) -> 512 bytes
+  // Total per warp: ~1KB
+  // For 8 warps: ~8KB (fits in 128KB SMEM easily)
+  //
+  // Base offsets for each tile per warp
+  const uint32_t smem_base = 0;
+  const uint32_t smem_q_row_offset = smem_base + 0;
+  const uint32_t smem_k_col_offset = smem_q_row_offset + 64 * sizeof(float);
+  const uint32_t smem_scores_offset = smem_k_col_offset + 64 * sizeof(float);
+
+  const uint32_t warp_id = tid_in_threadblock / LANES_PER_WARP; // 0..7
+  const uint32_t lane_id = tid_in_threadblock % LANES_PER_WARP; // 0..15
+
+  // Precompute shared memory bases for this warp
+  const uint32_t smem_q_base = smem_q_row_offset + warp_id * 1024;
+  const uint32_t smem_k_base = smem_k_col_offset + warp_id * 1024;
+  const uint32_t smem_score_base = smem_scores_offset + warp_id * 1024;
+
+  // Assign global buffers with proper address space qualifier
+  const __global float* Q = a->Q;
+  const __global float* K = a->K;
+  const __global float* V = a->V;
+  __global float* O = a->O;
+
+  // --- PHASE 1: Q * K^T (Dot Product for 16 rows per warp) ---
+  for (uint32_t wrow_idx = 0; wrow_idx < ROWS_PER_WARP; ++wrow_idx) {
+    const uint32_t row_i = warp_id * ROWS_PER_WARP + wrow_idx;
+
+    // Step 1a: Cooperatively load Q[row_i] into shared memory
+    const __global float* q_row_ptr = Q + row_i * d;
+    for (uint32_t k = 0; k < ELEMS_PER_LANE_QK; ++k) {
+      const uint32_t idx = k * LANES_PER_WARP + lane_id;
+      const float val = q_row_ptr[idx];
+      store_shared(smem_q_base, idx * sizeof(float), __builtin_bit_cast(uint32_t, val));
+    }
+    mu_barrier(0, nw); // Cross-core sync for shared Q load
+
+    // Step 1b: Compute scores for all columns j = 0..127
+    for (uint32_t j = 0; j < seq; ++j) {
+      // Load K[:,j] column into shared memory
+      const __global float* k_col_ptr = K + j * d;
+      for (uint32_t k = 0; k < ELEMS_PER_LANE_QK; ++k) {
+        const uint32_t idx = k * LANES_PER_WARP + lane_id;
+        const float val = k_col_ptr[idx];
+        store_shared(smem_k_base, idx * sizeof(float), __builtin_bit_cast(uint32_t, val));
+      }
+      mu_barrier(0, nw); // Sync after K load
+
+      // Compute partial dot product
+      float local_sum = 0.0f;
+      for (uint32_t k = 0; k < ELEMS_PER_LANE_QK; ++k) {
+        const uint32_t idx = k * LANES_PER_WARP + lane_id;
+        const float q_val = __builtin_bit_cast(float, load32_shared(smem_q_base + idx * sizeof(float)));
+        const float k_val = __builtin_bit_cast(float, load32_shared(smem_k_base + idx * sizeof(float)));
+        local_sum += q_val * k_val;
+      }
+
+      // Reduce across warp (16 lanes -> 1 scalar sum)
+      // Store partial sums in shared memory for reduction
+      store_shared(smem_score_base, lane_id * sizeof(float), __builtin_bit_cast(uint32_t, local_sum));
+      mu_barrier(0, nw); // Sync before reduction
+
+      // Perform reduction manually in shared memory (no loops, minimal reg usage)
+      if (lane_id < 8) {
+        float v1 = __builtin_bit_cast(float, load32_shared(smem_score_base + (lane_id + 0) * sizeof(float)));
+        float v2 = __builtin_bit_cast(float, load32_shared(smem_score_base + (lane_id + 8) * sizeof(float)));
+        store_shared(smem_score_base, lane_id * sizeof(float), __builtin_bit_cast(uint32_t, (v1 + v2)));
+      }
+      mu_barrier(0, nw);
+
+      if (lane_id < 4) {
+        float v1 = __builtin_bit_cast(float, load32_shared(smem_score_base + (lane_id + 0) * sizeof(float)));
+        float v2 = __builtin_bit_cast(float, load32_shared(smem_score_base + (lane_id + 4) * sizeof(float)));
+        store_shared(smem_score_base, lane_id * sizeof(float), __builtin_bit_cast(uint32_t, (v1 + v2)));
+      }
+      mu_barrier(0, nw);
+
+      if (lane_id < 2) {
+        float v1 = __builtin_bit_cast(float, load32_shared(smem_score_base + (lane_id + 0) * sizeof(float)));
+        float v2 = __builtin_bit_cast(float, load32_shared(smem_score_base + (lane_id + 2) * sizeof(float)));
+        store_shared(smem_score_base, lane_id * sizeof(float), __builtin_bit_cast(uint32_t, (v1 + v2)));
+      }
+      mu_barrier(0, nw);
+
+      if (lane_id == 0) {
+        float v1 = __builtin_bit_cast(float, load32_shared(smem_score_base + 0 * sizeof(float)));
+        float v2 = __builtin_bit_cast(float, load32_shared(smem_score_base + 1 * sizeof(float)));
+        const float score = (v1 + v2) * 0.125f;
+        store_shared(smem_score_base + j * sizeof(float), 0, __builtin_bit_cast(uint32_t, score));
+      }
+      mu_barrier(0, nw); // Sync after storing final score
+    } // End loop over j
+
+    // --- PHASE 2: Row-wise Softmax in Shared Memory ---
+    // Find max
+    float local_max = __builtin_bit_cast(float, load32_shared(smem_score_base + lane_id * sizeof(float)));
+    for (uint32_t offset = 1; offset < LANES_PER_WARP; offset <<= 1) {
+        float n = __builtin_bit_cast(float, load32_shared(smem_score_base + ((lane_id + offset) % LANES_PER_WARP) * sizeof(float)));
+        if (n > local_max) local_max = n;
+        mu_barrier(0, nw);
+    }
+    store_shared(smem_score_base, lane_id * sizeof(float), __builtin_bit_cast(uint32_t, local_max));
+    mu_barrier(0, nw);
+
+    if (lane_id == 0) {
+        float max_val = -INFINITY;
+        for (uint32_t i = 0; i < LANES_PER_WARP; ++i) {
+            float val = __builtin_bit_cast(float, load32_shared(smem_score_base + i * sizeof(float)));
+            if (val > max_val) max_val = val;
+        }
+        store_shared(smem_score_base + seq * sizeof(float), 0, __builtin_bit_cast(uint32_t, max_val));
+    }
+    mu_barrier(0, nw);
+
+    const float row_max = __builtin_bit_cast(float, load32_shared(smem_score_base + seq * sizeof(float)));
+
+    // Compute exp and sum locally, then reduce
+    float local_sum = 0.0f;
+    for (uint32_t k = 0; k < ELEMS_PER_LANE_SOFTMAX; ++k) {
+        const uint32_t idx = k * LANES_PER_WARP + lane_id;
+        const float diff = __builtin_bit_cast(float, load32_shared(smem_score_base + idx * sizeof(float))) - row_max;
+        const float e = mu_exp(diff);
+        store_shared(smem_score_base + idx * sizeof(float), 0, __builtin_bit_cast(uint32_t, e));
+        local_sum += e;
+    }
+
+    store_shared(smem_score_base + (seq + 1 + lane_id) * sizeof(float), 0, __builtin_bit_cast(uint32_t, local_sum));
+    mu_barrier(0, nw);
+
+    // Reduce sum across warp
+    if (lane_id < 8) {
+      float v1 = __builtin_bit_cast(float, load32_shared(smem_score_base + (seq + 1 + lane_id + 0) * sizeof(float)));
+      float v2 = __builtin_bit_cast(float, load32_shared(smem_score_base + (seq + 1 + lane_id + 8) * sizeof(float)));
+      store_shared(smem_score_base + (seq + 1 + lane_id) * sizeof(float), 0, __builtin_bit_cast(uint32_t, (v1 + v2)));
+    }
+    mu_barrier(0, nw);
+
+    if (lane_id < 4) {
+      float v1 = __builtin_bit_cast(float, load32_shared(smem_score_base + (seq + 1 + lane_id + 0) * sizeof(float)));
+      float v2 = __builtin_bit_cast(float, load32_shared(smem_score_base + (seq + 1 + lane_id + 4) * sizeof(float)));
+      store_shared(smem_score_base + (seq + 1 + lane_id) * sizeof(float), 0, __builtin_bit_cast(uint32_t, (v1 + v2)));
+    }
+    mu_barrier(0, nw);
+
+    if (lane_id < 2) {
+      float v1 = __builtin_bit_cast(float, load32_shared(smem_score_base + (seq + 1 + lane_id + 0) * sizeof(float)));
+      float v2 = __builtin_bit_cast(float, load32_shared(smem_score_base + (seq + 1 + lane_id + 2) * sizeof(float)));
+      store_shared(smem_score_base + (seq + 1 + lane_id) * sizeof(float), 0, __builtin_bit_cast(uint32_t, (v1 + v2)));
+    }
+    mu_barrier(0, nw);
+
+    if (lane_id == 0) {
+      float v1 = __builtin_bit_cast(float, load32_shared(smem_score_base + (seq + 1 + 0) * sizeof(float)));
+      float v2 = __builtin_bit_cast(float, load32_shared(smem_score_base + (seq + 1 + 1) * sizeof(float)));
+      const float inv_sum = 1.0f / (v1 + v2);
+      store_shared(smem_score_base + (seq + 1) * sizeof(float), 0, __builtin_bit_cast(uint32_t, inv_sum));
+    }
+    mu_barrier(0, nw);
+
+    const float inv_sum = __builtin_bit_cast(float, load32_shared(smem_score_base + (seq + 1) * sizeof(float)));
+
+    // Normalize probabilities
+    for (uint32_t k = 0; k < ELEMS_PER_LANE_SOFTMAX; ++k) {
+        const uint32_t idx = k * LANES_PER_WARP + lane_id;
+        float p = __builtin_bit_cast(float, load32_shared(smem_score_base + idx * sizeof(float)));
+        p *= inv_sum;
+        store_shared(smem_score_base + idx * sizeof(float), 0, __builtin_bit_cast(uint32_t, p));
+    }
+    mu_barrier(0, nw);
+
+
+    // --- PHASE 3: P * V Projection ---
+    const uint32_t elems_per_lane_o = d / LANES_PER_WARP; // 4
+    for (uint32_t out_k = 0; out_k < elems_per_lane_o; ++out_k) {
+        const uint32_t k = out_k * LANES_PER_WARP + lane_id;
+        float acc = 0.0f;
+        for (uint32_t j = 0; j < seq; ++j) {
+            const float prob = __builtin_bit_cast(float, load32_shared(smem_score_base + j * sizeof(float)));
+            const float v_val = V[j * d + k];
+            acc += prob * v_val;
+        }
+        // Write directly to global memory (O has stride d)
+        O[row_i * d + k] = acc;
+    }
+
+  } // End loop over wrow_idx (rows per warp)
+}

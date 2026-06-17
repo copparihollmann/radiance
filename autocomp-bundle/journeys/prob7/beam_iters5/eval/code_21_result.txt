@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nndeclared identifier 'float4'; did you mean 'float'?\n   82 |                 float4 kval = kj[k];\n      |                 ^~~~~~\n      |                 float\nkernel.cpp:83:25: error: member reference base type 'float' is not a structure or union\n   83 |                 acc += q.x * kval.x;\n      |                        ~^~\nkernel.cpp:83:34: error: member reference base type 'float' is not a structure or union\n   83 |                 acc += q.x * kval.x;\n      |                              ~~~~^~\nkernel.cpp:84:25: error: member reference base type 'float' is not a structure or union\n   84 |                 acc += q.y * kval.y;\n      |                        ~^~\nkernel.cpp:84:34: error: member reference base type 'float' is not a structure or union\n   84 |                 acc += q.y * kval.y;\n      |                              ~~~~^~\nkernel.cpp:85:25: error: member reference base type 'float' is not a structure or union\n   85 |                 acc += q.z * kval.z;\n      |                        ~^~\nkernel.cpp:85:34: error: member reference base type 'float' is not a structure or union\n   85 |                 acc += q.z * kval.z;\n      |                              ~~~~^~\nkernel.cpp:86:25: error: member reference base type 'float' is not a structure or union\n   86 |                 acc += q.w * kval.w;\n      |                        ~^~\nfatal error: too many errors emitted, stopping now [-ferror-limit=]\n20 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

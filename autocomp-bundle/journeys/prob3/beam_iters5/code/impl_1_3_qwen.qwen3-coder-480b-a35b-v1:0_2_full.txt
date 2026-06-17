@@ -1,0 +1,128 @@
+```cpp
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t seq = 96;
+  const uint32_t d = 64;
+  const uint32_t num_warps = threads_per_threadblock / MU_NUM_THREADS;
+  const float scale = 0.125f;
+
+  // SMEM layout with padding to avoid bank conflicts
+  const uint32_t Q_smem_offset = 0;
+  const uint32_t K_smem_offset = Q_smem_offset + seq * (d + 1) * 4;
+  const uint32_t V_smem_offset = K_smem_offset + seq * (d + 1) * 4;
+  const uint32_t scratch_smem_offset = V_smem_offset + seq * (d + 1) * 4;
+
+  // Phase 0: Load Q, K, V into shared memory
+  const __global float* Q_global = a->Q;
+  const __global float* K_global = a->K;
+  const __global float* V_global = a->V;
+
+  // Load matrices into SMEM. Each thread loads one element per iteration.
+  for (uint32_t idx = tid_in_threadblock; idx < seq * d; idx += threads_per_threadblock) {
+    const uint32_t row = idx / d;
+    const uint32_t col = idx % d;
+    const uint32_t Q_addr = Q_smem_offset + (row * (d + 1) + col) * 4;
+    const uint32_t K_addr = K_smem_offset + (row * (d + 1) + col) * 4;
+    const uint32_t V_addr = V_smem_offset + (row * (d + 1) + col) * 4;
+
+    store_shared(Q_addr, 0, *(reinterpret_cast<const uint32_t*>(Q_global + idx)));
+    store_shared(K_addr, 0, *(reinterpret_cast<const uint32_t*>(K_global + idx)));
+    store_shared(V_addr, 0, *(reinterpret_cast<const uint32_t*>(V_global + idx)));
+  }
+
+  // Synchronize to make SMEM writes visible across cores
+  mu_barrier(0, num_warps);
+
+  // Phase 1: Compute QK^T (Attention Scores)
+  float* scratch_ptr = reinterpret_cast<float*>(scratch_smem_offset);
+
+  for (uint32_t idx = tid_in_threadblock; idx < seq * seq; idx += threads_per_threadblock) {
+    const uint32_t i = idx / seq;  // Row index (Query vector index)
+    const uint32_t j = idx % seq;  // Column index (Key vector index)
+
+    float acc = 0.0f;
+
+    const uint32_t q_row_base = Q_smem_offset + i * (d + 1) * 4;
+    const uint32_t k_row_base = K_smem_offset + j * (d + 1) * 4;
+
+    for (uint32_t k = 0; k < d; k++) {
+      const uint32_t q_elem_addr = q_row_base + k * 4;
+      const uint32_t k_elem_addr = k_row_base + k * 4;
+
+      const float q_val = *(reinterpret_cast<float*>(&load32_shared(q_elem_addr)));
+      const float k_val = *(reinterpret_cast<float*>(&load32_shared(k_elem_addr)));
+
+      acc += q_val * k_val;
+    }
+
+    const uint32_t scratch_idx = i * (seq + 1) + j;
+    store_shared(scratch_smem_offset + scratch_idx * 4, 0, *(reinterpret_cast<uint32_t*>(&(acc *= scale))));
+  }
+
+  // Synchronize to ensure all scores are computed before softmax
+  mu_barrier(0, num_warps);
+
+  // Phase 2: Softmax
+  for (uint32_t row = tid_in_threadblock; row < seq; row += threads_per_threadblock) {
+    const uint32_t softmax_row_offset = row * (seq + 1);
+
+    // Find row max (m)
+    float m = *(reinterpret_cast<float*>(&load32_shared(scratch_smem_offset + softmax_row_offset * 4)));
+    for (uint32_t j = 1; j < seq; j++) {
+      const float val = *(reinterpret_cast<float*>(&load32_shared(scratch_smem_offset + (softmax_row_offset + j) * 4)));
+      if (val > m) m = val;
+    }
+
+    // Compute exponentials and sum
+    float sum = 0.0f;
+    for (uint32_t j = 0; j < seq; j++) {
+      const uint32_t addr = scratch_smem_offset + (softmax_row_offset + j) * 4;
+      const float val = *(reinterpret_cast<float*>(&load32_shared(addr)));
+      const float e = mu_exp(val - m);
+      store_shared(addr, 0, *(reinterpret_cast<uint32_t*>(&e)));
+      sum += e;
+    }
+
+    // Normalize
+    const float inv_sum = 1.0f / sum;
+    for (uint32_t j = 0; j < seq; j++) {
+      const uint32_t addr = scratch_smem_offset + (softmax_row_offset + j) * 4;
+      const float e = *(reinterpret_cast<float*>(&load32_shared(addr))) * inv_sum;
+      store_shared(addr, 0, *(reinterpret_cast<uint32_t*>(&e)));
+    }
+  }
+
+  // Synchronize to ensure softmax is complete before final matmul
+  mu_barrier(0, num_warps);
+
+  // Phase 3: Output = Softmax_scores * Values (O = P * V)
+  float* O_global = a->O;
+  for (uint32_t idx = tid_in_threadblock; idx < seq * d; idx += threads_per_threadblock) {
+    const uint32_t i = idx / d;  // Row index (output token)
+    const uint32_t k = idx % d;  // Column index (output dim)
+
+    float acc = 0.0f;
+
+    const uint32_t soft_row_base = scratch_smem_offset + i * (seq + 1) * 4;
+    const uint32_t v_col_base = V_smem_offset + k * 4;
+
+    for (uint32_t j = 0; j < seq; j++) {
+      const uint32_t p_elem_addr = soft_row_base + j * 4;
+      const uint32_t v_elem_addr = v_col_base + j * (d + 1) * 4;
+
+      const float p_val = *(reinterpret_cast<float*>(&load32_shared(p_elem_addr)));
+      const float v_val = *(reinterpret_cast<float*>(&load32_shared(v_elem_addr)));
+
+      acc += p_val * v_val;
+    }
+
+    O_global[idx] = acc;
+  }
+}
+```

@@ -1,0 +1,38 @@
+{
+  "prob_id": 0,
+  "run": "built:muon_muon_0_beam_iters5_cyclotron",
+  "iterations": 5,
+  "per_iteration": {
+    "1": {
+      "usd": 0.51526,
+      "in_tok": 211176,
+      "out_tok": 47831
+    },
+    "2": {
+      "usd": 0.496716,
+      "in_tok": 193036,
+      "out_tok": 48911
+    },
+    "3": {
+      "usd": 0.963745,
+      "in_tok": 383343,
+      "out_tok": 90010
+    },
+    "4": {
+      "usd": 0.966744,
+      "in_tok": 392239,
+      "out_tok": 92048
+    },
+    "5": {
+      "usd": 1.125508,
+      "in_tok": 408569,
+      "out_tok": 117184
+    }
+  },
+  "run_total": {
+    "usd": 4.067973,
+    "in_tok": 1588363,
+    "out_tok": 395984,
+    "calls": 181
+  }
+}

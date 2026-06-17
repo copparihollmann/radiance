@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n                          ^\nkernel.cpp:113:41: error: use of undeclared identifier 'SMEM_A_OFF'\n  113 |             const uint32_t a_row_base = SMEM_A_OFF + th_r * K_PAD * 4;\n      |                                         ^\nkernel.cpp:113:61: error: use of undeclared identifier 'K_PAD'\n  113 |             const uint32_t a_row_base = SMEM_A_OFF + th_r * K_PAD * 4;\n      |                                                             ^\nkernel.cpp:114:41: error: use of undeclared identifier 'SMEM_B_OFF'\n  114 |             const uint32_t b_col_base = SMEM_B_OFF + th_c * 16 * K_PAD * 4;\n      |                                         ^\nkernel.cpp:114:66: error: use of undeclared identifier 'K_PAD'\n  114 |             const uint32_t b_col_base = SMEM_B_OFF + th_c * 16 * K_PAD * 4;\n      |                                                                  ^\nkernel.cpp:117:38: error: use of undeclared identifier 'K_TILE'\n  117 |             for (uint32_t k = 0; k < K_TILE; k++) {\n      |                                      ^\nkernel.cpp:118:31: error: use of undeclared identifier 'bits_to_float'\n  118 |                 float b_val = bits_to_float(load32_shared(b_col_base + k * 4));\n      |                               ^\nkernel.cpp:119:31: error: use of undeclared identifier 'bits_to_float'\n  119 |                 float a_val = bits_to_float(load32_shared(a_row_base + k * 4));\n      |                               ^\n16 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

@@ -1,0 +1,103 @@
+```cpp
+#include <stdint.h>
+
+// Definition of KernelArgs matching the harness
+struct KernelArgs {
+  float* in;
+  float* w;
+  float* out;
+  uint32_t OC, C, KH, KW, H, W, OH, OW, stride;
+};
+
+static inline void store_shared(uint32_t base, uint32_t offset, uint32_t data) {
+    asm volatile("sw.shared %2, %1(%0)" :: "r"(base), "I"(offset), "r"(data) : "memory");
+}
+
+static inline uint32_t load32_shared(uint32_t address) {
+    uint32_t data;
+    asm volatile("lw.shared %0, %1(%2)" : "=r"(data) : "I"(0), "r"(address) : "memory");
+    return data;
+}
+
+static inline void mu_barrier(unsigned barrier_id, unsigned num_warps) {
+    asm volatile ("vx_bar %0, %1" :: "r"(barrier_id), "r"(num_warps) : "memory");
+}
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  const uint32_t CKK = a->C * a->KH * a->KW; // 3 * 16 * 16 = 768
+  const uint32_t P = a->OH * a->OW;          // 4 * 4 = 16
+  const uint32_t smem_pad = 16;              // Padding to eliminate bank conflicts
+  const uint32_t smem_patch_stride = CKK + smem_pad; // 768 + 16 = 784 floats
+  const uint32_t smem_patches_total_size = P * smem_patch_stride * 4; // 16 * 784 * 4 = 50176 bytes
+
+  // (1) Stage W flat into SMEM (after patches).
+  const uint32_t smem_w = smem_patches_total_size;
+  for (uint32_t i = tid_in_threadblock; i < a->OC * CKK; i += threads_per_threadblock) {
+    store_shared(smem_w + i * 4, 0, __builtin_bit_cast(uint32_t, a->w[i]));
+  }
+
+  // (2) Gather im2col patches into SMEM [0..smem_w).
+  // Restructure loop to eliminate divisions/modulos and enable coalesced access.
+  for (uint32_t p = 0; p < P; p++) {
+    const uint32_t pr = p / a->OW; // p / 4
+    const uint32_t pc = p % a->OW; // p % 4
+    for (uint32_t ckk_base = 0; ckk_base < CKK; ckk_base += threads_per_threadblock) {
+      const uint32_t ckk = ckk_base + tid_in_threadblock;
+      if (ckk < CKK) {
+        const uint32_t c = ckk / (a->KH * a->KW);          // ckk / 256
+        const uint32_t kh = (ckk / a->KW) % a->KH;         // (ckk / 16) % 16
+        const uint32_t kw = ckk % a->KW;                   // ckk % 16
+        const uint32_t h_idx = pr * a->stride + kh;
+        const uint32_t w_idx = pc * a->stride + kw;
+        const uint32_t in_idx = c * (a->H * a->W) + h_idx * a->W + w_idx;
+        const uint32_t smem_addr = (p * smem_patch_stride + ckk) * 4;
+        store_shared(smem_addr, 0, __builtin_bit_cast(uint32_t, a->in[in_idx]));
+      }
+    }
+  }
+
+  // Cross-core SMEM staging barrier
+  mu_barrier(0, threads_per_threadblock / 16); // ID 0 for cross-core sync
+
+  // (3) Frugal matmul: OUT[oc*P + p] = sum_ckk W[oc][ckk] * patch[p][ckk].
+  for (uint32_t idx = tid_in_threadblock; idx < a->OC * P; idx += threads_per_threadblock) {
+    const uint32_t oc = idx / P;
+    const uint32_t p = idx % P;
+    const uint32_t wa_base = smem_w + oc * CKK * 4;
+    const uint32_t pa_base = p * smem_patch_stride * 4;
+
+    float acc = 0.0f;
+    uint32_t wa = wa_base;
+    uint32_t pa = pa_base;
+
+    // Unroll by 4 to hide FP32 latency (2 cycles)
+    for (uint32_t k = 0; k < CKK; k += 4) {
+      float w0 = __builtin_bit_cast(float, load32_shared(wa));
+      float p0 = __builtin_bit_cast(float, load32_shared(pa));
+      float w1 = __builtin_bit_cast(float, load32_shared(wa + 4));
+      float p1 = __builtin_bit_cast(float, load32_shared(pa + 4));
+      float w2 = __builtin_bit_cast(float, load32_shared(wa + 8));
+      float p2 = __builtin_bit_cast(float, load32_shared(pa + 8));
+      float w3 = __builtin_bit_cast(float, load32_shared(wa + 12));
+      float p3 = __builtin_bit_cast(float, load32_shared(pa + 12));
+
+      acc += w0 * p0;
+      acc += w1 * p1;
+      acc += w2 * p2;
+      acc += w3 * p3;
+
+      wa += 16;
+      pa += 16;
+    }
+    a->out[idx] = acc;
+  }
+}
+```

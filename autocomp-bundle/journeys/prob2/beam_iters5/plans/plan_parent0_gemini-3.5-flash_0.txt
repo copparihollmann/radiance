@@ -1,0 +1,141 @@
+An elegant and highly optimized plan to accelerate the single-head attention kernel by implementing cooperative shared-memory staging, transposed layouts to avoid bank conflicts, pre-scaling, and proper synchronization.
+
+### Optimization Plan
+
+1. **Cooperative Shared-Memory Staging**: 
+   Stage $Q$, $K$, and $V$ matrices completely into the 128 KiB Shared Memory (SMEM). This reduces slow DRAM access and leverages the high 256 B/cycle SMEM bandwidth.
+2. **Pre-scaling input matrix during Staging**:
+   Scale the $Q$ elements by $1/\sqrt{d} = 0.125$ *during* the initial SMEM loading phase. This entirely eliminates the scale multiplication from the critical path of the first GEMM phase.
+3. **Transposed SMEM Layout for $K$ and $V$**:
+   To avoid 16-way bank conflicts (where multiple threads access the same SMEM bank simultaneously), stage $K$ and $V$ in a **transposed (column-major) layout** with a column padding of 16 floats. This ensures that when warps perform parallel dot products, their memory accesses are perfectly coalesced and stride-1 across threads, yielding maximum memory throughput.
+4. **Coalesced Stride-1 Inner Loops**:
+   By transposing $K$ and $V$, both Phase 1 and Phase 3 inner loops perform contiguous stride-1 reads in SMEM, maximizing dual-port bank utilization.
+5. **Strict Register Budget Compliance**:
+   To strictly satisfy the **<= 31 distinct registers limit** (Register Wall constraint), we avoid deep unrolling or high-dimensional register tiling. Instead, we use a single accumulator per thread and keep the loops lightly unrolled (`#pragma unroll 4`).
+6. **Robust Cross-Core Barrier Sync**:
+   Since the threadblock spans 2 cores, any cooperative SMEM staging and write-to-read transitions require the cross-core barrier ID 0 with all 8 warps: `mu_barrier(0, 8)`.
+
+---
+
+### C++ Source Code
+
+```cpp
+#include <stdint.h>
+
+// Helper functions for float/bits conversion
+static inline float bits_to_float(uint32_t b) { 
+  union { uint32_t u; float f; } c; 
+  c.u = b; 
+  return c.f; 
+}
+static inline uint32_t float_to_bits(float f) { 
+  union { uint32_t u; float f; } c; 
+  c.f = f; 
+  return c.u; 
+}
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  
+  const uint32_t PAD = 16;
+  const uint32_t smem_q = 0;
+  const uint32_t smem_k = 64 * 64 * 4; // 16384 bytes
+  const uint32_t smem_v = smem_k + 64 * (64 + PAD) * 4; // 16384 + 20480 = 36864 bytes
+  const uint32_t smem_s = smem_v + 64 * (64 + PAD) * 4; // 36864 + 20480 = 57344 bytes
+
+  // 1. Cooperative SMEM Staging
+  // Stage Q (with pre-scaling)
+  for (uint32_t i = tid_in_threadblock; i < 4096; i += threads_per_threadblock) {
+    store_shared(smem_q + i * 4, 0, float_to_bits(a->Q[i] * 0.125f));
+  }
+  // Stage K (transposed layout to avoid bank conflicts)
+  for (uint32_t i = tid_in_threadblock; i < 4096; i += threads_per_threadblock) {
+    uint32_t row = i / 64;
+    uint32_t col = i % 64;
+    store_shared(smem_k + (col * (64 + PAD) + row) * 4, 0, float_to_bits(a->K[i]));
+  }
+  // Stage V (transposed layout to avoid bank conflicts)
+  for (uint32_t i = tid_in_threadblock; i < 4096; i += threads_per_threadblock) {
+    uint32_t row = i / 64;
+    uint32_t col = i % 64;
+    store_shared(smem_v + (col * (64 + PAD) + row) * 4, 0, float_to_bits(a->V[i]));
+  }
+
+  // Sync both cores (8 warps total) to complete staging
+  mu_barrier(0, 8);
+
+  // 2. Phase 1: Scores (Q * K^T)
+  for (uint32_t idx = tid_in_threadblock; idx < 4096; idx += threads_per_threadblock) {
+    uint32_t row = idx / 64;
+    uint32_t col = idx % 64;
+    float acc = 0.0f;
+    uint32_t q_addr = smem_q + row * 64 * 4;
+    uint32_t k_addr = smem_k + col * (64 + PAD) * 4;
+    
+    #pragma unroll 4
+    for (uint32_t k = 0; k < 64; k++) {
+      acc += bits_to_float(load32_shared(q_addr + k * 4)) * bits_to_float(load32_shared(k_addr + k * 4));
+    }
+    store_shared(smem_s + idx * 4, 0, float_to_bits(acc));
+  }
+
+  // Sync before Softmax
+  mu_barrier(0, 8);
+
+  // 3. Phase 2: Softmax per row (first 64 threads handle one row each)
+  if (tid_in_threadblock < 64) {
+    const uint32_t row = tid_in_threadblock;
+    const uint32_t row_offset = row * 64 * 4;
+    
+    // Find Max
+    float m = bits_to_float(load32_shared(smem_s + row_offset));
+    for (uint32_t j = 1; j < 64; j++) {
+      float v = bits_to_float(load32_shared(smem_s + row_offset + j * 4));
+      if (v > m) m = v;
+    }
+    
+    // Exponentials & Sum
+    float sum = 0.0f;
+    for (uint32_t j = 0; j < 64; j++) {
+      float e = mu_exp(bits_to_float(load32_shared(smem_s + row_offset + j * 4)) - m);
+      store_shared(smem_s + row_offset + j * 4, 0, float_to_bits(e));
+      sum += e;
+    }
+    
+    // Division & global scratch backup
+    float inv_sum = 1.0f / sum;
+    for (uint32_t j = 0; j < 64; j++) {
+      float e = bits_to_float(load32_shared(smem_s + row_offset + j * 4));
+      float val = e * inv_sum;
+      store_shared(smem_s + row_offset + j * 4, 0, float_to_bits(val));
+      a->scratch[row * 64 + j] = val;
+    }
+  } else {
+    asm volatile("nop");
+  }
+
+  // Sync before final product
+  mu_barrier(0, 8);
+
+  // 4. Phase 3: Output (P * V)
+  for (uint32_t idx = tid_in_threadblock; idx < 4096; idx += threads_per_threadblock) {
+    uint32_t row = idx / 64;
+    uint32_t col = idx % 64;
+    float acc = 0.0f;
+    uint32_t s_addr = smem_s + row * 64 * 4;
+    uint32_t v_addr = smem_v + col * (64 + PAD) * 4;
+    
+    #pragma unroll 4
+    for (uint32_t j = 0; j < 64; j++) {
+      acc += bits_to_float(load32_shared(s_addr + j * 4)) * bits_to_float(load32_shared(v_addr + j * 4));
+    }
+    a->O[idx] = acc;
+  }
+}
+```

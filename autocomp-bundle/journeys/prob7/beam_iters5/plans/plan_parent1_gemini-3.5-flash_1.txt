@@ -1,0 +1,61 @@
+An elegant and highly effective optimization plan to address the DRAM-bottlenecked global memory round-trips of the baseline attention kernel is to implement **Strategy 1: Reduce Data Movement** by staging the matrices in Shared Memory (SMEM). 
+
+The 128 KiB high-bandwidth dual-port SMEM is the primary hardware mechanism for avoiding redundant global memory latency (which is ~400 cycles compared to ~2 cycles for SMEM). Since the problem dimensions are small ($SEQ=128$, $HEAD\_DIM=64$), we can fit the active portions of $Q, K, V, S,$ and $O$ entirely in SMEM by carefully partitioning and reusing the SMEM space.
+
+---
+
+### Shared Memory Allocation Plan
+
+To respect the $128\text{ KiB}$ hardware limit, we will allocate the memory dynamically or as a single flat array and partition it into logical buffers.
+* **Buffer A (64 KiB / 16,384 floats):**
+  * **Phase 1-3:** Split into `smem_Q` (32 KiB, 128x64 floats) and `smem_K` (32 KiB, 128x64 floats).
+  * **Phase 4-6:** Reused for `smem_V` (32 KiB, 128x64 floats) and `smem_O` (32 KiB, 128x64 floats).
+* **Buffer B (64 KiB / 16,384 floats):**
+  * Dedicated to `smem_S` (64 KiB, 128x128 floats) to store the score matrix for in-place softmax computation.
+
+---
+
+### Step-by-Step Optimization Plan
+
+#### Step 1: Cooperative Loading of $Q$ and $K$
+Instead of each thread redundantly loading data from global memory inside nested loops, we will perform a cooperative, coalesced global-to-SMEM load.
+* Since $Q$ and $K$ each contain $128 \times 64 = 8192$ elements, the 128 threads in the threadblock will each load exactly 64 elements.
+* Ensure stride-1 sequential indexing across threads to maximize L0D/L1 cache coalescing:
+  ```cpp
+  for (uint32_t idx = tid_in_threadblock; idx < 128 * 64; idx += 128) {
+    // load Q[idx] and store to smem_Q[idx]
+    // load K[idx] and store to smem_K[idx]
+  }
+  ```
+* Synchronize using a cross-core barrier: `mu_barrier(0, nw)`. This guarantees that threads on both cores see the loaded $Q$ and $K$ matrices in SMEM.
+
+#### Step 2: Phase 1 (Score Computation) in SMEM
+* Each thread $i = \text{tid\_in\_threadblock}$ computes row $i$ of the score matrix $S$.
+* Compute the dot product between `smem_Q[i]` and `smem_K[j]` for $j = 0..127$, keeping the loops rolled to minimize register pressure.
+* Store the result in `smem_S[i * 128 + j]`.
+* Synchronize with `mu_barrier(0, nw)`.
+
+#### Step 3: Phase 2 (Softmax) in SMEM
+* Each thread $i = \text{tid\_in\_threadblock}$ performs the softmax operation on row $i$ of $S$ entirely in-place within `smem_S`.
+* All operations (finding maximums, subtracting, exponentiating, summing, and normalizing) read and write to `smem_S` using the 2-cycle `load32_shared` and `store_shared` intrinsics, completely eliminating DRAM traffic.
+* Synchronize with `mu_barrier(0, nw)`.
+
+#### Step 4: Cooperative Loading of $V$ and SMEM Reuse
+* Overwrite the now-stale `smem_Q` space with $V$ from global memory.
+* Cooperatively load $V$ into `smem_V` (offset 0 in Buffer A) using coalesced stride-1 loops across the 128 threads.
+* Synchronize with `mu_barrier(0, nw)`.
+
+#### Step 5: Phase 3 (Output Computation) in SMEM
+* Each thread $i$ computes row $i$ of the final output $O$ by multiplying the attention probabilities in `smem_S[i]` with columns of `smem_V`.
+* Store the computed values in `smem_O` (offset 32 KiB in Buffer A).
+* Synchronize with `mu_barrier(0, nw)`.
+
+#### Step 6: Cooperative Writing of $O$
+* Cooperatively transfer the final computed $O$ from `smem_O` to the global output buffer `a->O` using coalesced stride-1 accesses across adjacent threads.
+
+---
+
+### Respecting Key Constraints
+* **Register Wall Protection:** Loops will remain rolled, and we will avoid deep unrolling (`#pragma unroll`) and per-thread register tiling. We will use a single accumulator register per output and increment SMEM pointers to keep the distinct register count well below the hard limit of 31 registers.
+* **Intrinsics Usage:** All SMEM accesses will explicitly use `load32_shared` and `store_shared` to avoid addressing faults.
+* **Cross-Core Visibility:** We will strictly use `mu_barrier(0, nw)` (barrier ID 0) for all synchronization points since data staged in SMEM must be safely visible across both cores in the cluster.

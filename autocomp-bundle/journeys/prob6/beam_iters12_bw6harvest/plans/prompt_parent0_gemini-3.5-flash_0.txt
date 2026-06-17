@@ -1,0 +1,805 @@
+Reference patterns:
+
+### example_vecadd_ilp.hpp
+```cpp
+#include <mu_intrinsics.h>
+#include <mu_schedule.h>
+#include <stdint.h>
+
+#ifndef VECADD_ILP
+#define VECADD_ILP 1
+#endif
+
+#ifndef VECADD_NUM_WARPS
+#define VECADD_NUM_WARPS 4
+#endif
+
+#ifndef VECADD_OUTER_UNROLL
+#define VECADD_OUTER_UNROLL 1
+#endif
+
+extern "C" uint32_t __mu_num_warps = VECADD_NUM_WARPS;
+
+struct VecAddArgs {
+  __global float* A;
+  __global float* B;
+  __global float* C;
+  uint32_t n;
+};
+
+template <uint32_t ILP>
+static inline void vecadd_impl(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  auto* args = reinterpret_cast<VecAddArgs*>(raw_arg);
+
+  constexpr uint32_t kIlp = ILP;
+  constexpr uint32_t kWarpWidth = MU_NUM_THREADS;
+  constexpr uint32_t kOuter = VECADD_OUTER_UNROLL;
+  const uint32_t tid_in_warp = tid_in_threadblock % kWarpWidth;
+  const uint32_t warp_id = tid_in_threadblock / kWarpWidth;
+  const uint32_t warps_per_threadblock = threads_per_threadblock / kWarpWidth;
+  const uint32_t elems_per_chunk = kWarpWidth * kIlp;
+  uint32_t chunk;
+  uint32_t chunk_stride;
+
+#if MU_NUM_CLUSTERS == 1
+  (void)threadblock_id;
+  chunk = warp_id * elems_per_chunk;
+  chunk_stride = warps_per_threadblock * elems_per_chunk;
+#else
+  const uint32_t global_warp_id = threadblock_id * warps_per_threadblock + warp_id;
+  const uint32_t global_warp_stride = MU_NUM_CLUSTERS * warps_per_threadblock;
+  chunk = global_warp_id * elems_per_chunk;
+  chunk_stride = global_warp_stride * elems_per_chunk;
+#endif
+
+  const uint32_t outer_stride = chunk_stride * kOuter;
+  float a_vals[kIlp];
+  float b_vals[kIlp];
+  float c_vals[kIlp];
+
+  #pragma unroll 1
+  for (; chunk < args->n; chunk += outer_stride) {
+    #pragma unroll VECADD_OUTER_UNROLL
+    for (uint32_t outer = 0; outer < kOuter; ++outer) {
+      const uint32_t lane_base = chunk + outer * chunk_stride + tid_in_warp;
+
+      #pragma unroll
+      for (uint32_t i = 0; i < kIlp; ++i) {
+        const uint32_t idx = lane_base + i * kWarpWidth;
+        a_vals[i] = args->A[idx];
+        b_vals[i] = args->B[idx];
+      }
+
+      #pragma unroll
+      for (uint32_t i = 0; i < kIlp; ++i) {
+        c_vals[i] = a_vals[i] + b_vals[i];
+      }
+
+      #pragma unroll
+      for (uint32_t i = 0; i < kIlp; ++i) {
+        const uint32_t idx = lane_base + i * kWarpWidth;
+        args->C[idx] = c_vals[i];
+      }
+    }
+  }
+}
+
+static inline void vecadd(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  vecadd_impl<VECADD_ILP>(
+    raw_arg, tid_in_threadblock, threads_per_threadblock, threadblock_id);
+}
+```
+
+### Verified: shared-memory tiled matmul, +28% over global-memory baseline
+Stages A and bank-padded B into SMEM, one barrier, then accumulates from SMEM.
+The +16-float column pad avoids 16-way bank conflicts (lane stride 4 lines, 4 banks).
+Measured: 63,401 cycles vs 88,560 baseline (64x64x64 fp32).
+
+```cpp
+static inline float bits_to_float(uint32_t b) { union { uint32_t u; float f; } c; c.u = b; return c.f; }
+static inline uint32_t float_to_bits(float f) { union { uint32_t u; float f; } c; c.f = f; return c.u; }
+
+static inline void kernel_body(void* raw_arg, uint32_t tid, uint32_t nthreads, uint32_t) {
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t M = args->M, N = args->N, K = args->K;
+  const uint32_t num_warps = nthreads / MU_NUM_THREADS;
+  const uint32_t smem_a = 0, smem_b = M * K * 4, PAD = 16;
+  for (uint32_t i = tid; i < M * K; i += nthreads)
+    store_shared(smem_a + i * 4, 0, float_to_bits(args->A[i]));
+  for (uint32_t i = tid; i < K * N; i += nthreads) {
+    const uint32_t k = i / N, col = i % N;
+    store_shared(smem_b + (col * (K + PAD) + k) * 4, 0, float_to_bits(args->B[i]));
+  }
+  mu_barrier(1, num_warps);
+  for (uint32_t idx = tid; idx < M * N; idx += nthreads) {
+    const uint32_t row = idx / N, col = idx % N;
+    float acc = 0.0f;
+    const uint32_t a_base = smem_a + row * K * 4;
+    const uint32_t b_base = smem_b + col * (K + PAD) * 4;
+    #pragma unroll 8
+    for (uint32_t k = 0; k < K; k++)
+      acc += bits_to_float(load32_shared(a_base + k * 4)) * bits_to_float(load32_shared(b_base + k * 4));
+    args->C[idx] = acc;
+  }
+}
+```
+
+Next: add per-thread register tiling (compute 4 outputs per thread) to reuse smem reads.
+
+### Verified: SMEM matmul + register tiling (measured on 64x64x64 matmul)
+Measured kernel-only cycles:
+- baseline (global memory): 88560 cycles
+- SMEM staged, padded B layout: 63401 cycles (1.40x)
+- SMEM + 4 outputs/thread register tile: 46080 cycles (1.92x)
+- SMEM + 8 outputs/thread register tile: 42983 cycles (2.06x)
+- SMEM + 2x8 (2 rows x 8 cols) thread tile: 40207 cycles (2.20x)
+
+Register tiling: each thread computes several adjacent outputs in one row.
+The A operand is loaded once per k and reused across all columns, cutting
+SMEM loads almost in half. Keep accumulators in locals; use one base address
+per column (stride = (K + PAD) * 4 bytes). Past 8 outputs/thread, the inner
+loop becomes address-arithmetic/issue-bound — use 2D tiles (2 rows x 8 cols)
+and incremented pointers instead of per-iteration offset math.
+
+```cpp
+const uint32_t quarter = (M * N) / 4;
+for (uint32_t q = tid; q < quarter; q += nthreads) {
+  const uint32_t row = q / (N / 4);
+  const uint32_t col0 = (q % (N / 4)) * 4;
+  float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+  const uint32_t a_base = smem_a + row * K * 4;
+  const uint32_t stride = (K + PAD) * 4;
+  const uint32_t b0 = smem_b + col0 * stride;
+  #pragma unroll 4
+  for (uint32_t k = 0; k < K; k++) {
+    const uint32_t off = k * 4;
+    const float a = bits_to_float(load32_shared(a_base + off));
+    acc0 += a * bits_to_float(load32_shared(b0 + off));
+    acc1 += a * bits_to_float(load32_shared(b0 + stride + off));
+    acc2 += a * bits_to_float(load32_shared(b0 + 2 * stride + off));
+    acc3 += a * bits_to_float(load32_shared(b0 + 3 * stride + off));
+  }
+  const uint32_t c = row * N + col0;
+  args->C[c + 0] = acc0; args->C[c + 1] = acc1;
+  args->C[c + 2] = acc2; args->C[c + 3] = acc3;
+}
+```
+
+Use these reference patterns to inform your optimization plan.
+
+## Radiance Muon GPU — Hardware Architecture Summary
+
+### Overview and Programming Model
+
+Radiance Muon is a RISC-V SIMT GPU core implementing RV32IM + Zfinx (integer-encoded floating-point). The execution unit is a **threadblock** spanning 2 cores × 4 warps × 16 lanes = **128 threads total**. Each warp is 16 threads wide (`VLEN=16`). The programming interface is `kernel_body(void* raw_arg, uint32_t tid_in_threadblock, uint32_t threads_per_threadblock, uint32_t threadblock_id)`, launched via `mu_schedule(kernel_body, &args, NUM_WARPS=4)`. Thread indexing: `warp_id = tid / 16`, `lane_id = tid % 16`. Warps execute in SIMT fashion; divergent branches serialize across the warp. The ISA supports up to 256 architectural registers per thread (compiler currently limits to 128), enabling aggressive register tiling and ILP. Dynamic warp occupancy scales concurrent warps based on register usage, trading thread-level parallelism for register space.
+
+Synchronization uses `mu_barrier(barrier_id, num_warps)` where `num_warps` is the total warp count across both cores (8 warps for a full threadblock). Barriers must not be placed inside warp-divergent branches. `mu_fence()` / `mu_fence_smem()` enforce memory ordering. Exponentials use `mu_exp(float)` (never `expf`/`exp`).
+
+---
+
+### Memory Hierarchy
+
+**Shared Memory (SMEM):** 128 KiB per cluster, shared across both cores. Base address `0x0000_0000`. Banked 4×16 with 1R1W dual-port per bank; aggregate bandwidth **256 B/cycle** (read + write simultaneously). Addressed via `store_shared` / `load32_shared` / `load16_shared` intrinsics or `__local` pointers. SMEM is the primary staging area for inter-warp data sharing and reuse; it is the highest-bandwidth on-chip memory and should be used aggressively for operand reuse (e.g., tiling A/B matrices in matmul, staging softmax intermediates).
+
+**L0 Instruction Cache (L0i):** 4 KiB per core, direct-mapped, 64 B lines, 8 B/cycle bandwidth, 3-cycle read latency.
+
+**L0 Data Cache (L0d):** 16 KiB per core, direct-mapped, write-through, 64 B lines, 64 B/cycle bandwidth, 3-cycle read latency.
+
+**L1 Cache:** 64 KiB per cluster (unified), 4-way set-associative, write-through, 32 B lines, 32 B/cycle bandwidth. Target hit latency ~8 cycles. Shared across both cores; core accesses are serialized (RR arbitration). Non-blocking with MSHRs.
+
+**L2 Cache:** 512 KiB SoC-level, 8-way, 128 B lines, 32 B/cycle bandwidth (~20-cycle hit latency). Coherent; atomics handled at L2 only.
+
+**DRAM (GPU):** 2 GB, ~100-cycle latency (target), effectively the slowest tier. GPU addresses are transparently remapped (33rd bit appended at L2 egress).
+
+**Memory access pattern guidance:** Coalesced sequential per-lane accesses maximize L0D/L1 utilization. The coalescer merges per-lane global requests into coalesced transactions; stride-1 (consecutive 4-byte words across lanes) achieves maximum coalescing. SMEM staging eliminates redundant global loads for data reused across warps or iterations.
+
+---
+
+### Compute Units
+
+**Integer (INT32) SIMT:** 16 INT PEs per core, one per lane. Throughput: **1 INT32 op/thread/cycle**, 1 warp-instruction/cycle peak IPC. Full 16-wide warp executes in a single cycle.
+
+**Floating-Point (FP32) SIMT:** 8 FP32 PEs per core (half the lane count). Throughput: **0.5 FP32 op/thread/cycle** — a warp-wide FP32 instruction takes 2 cycles. FP16/BF16 throughput: **1 op/thread/cycle** (2× bit-scaling from FP32).
+
+**Special functions:** `mu_exp(float)` for fp32 exponential; `mu_fexp(_Float16)` / `mu_fnexp(_Float16)` for fp16 exp via dedicated instructions. No hardware tensor/matrix instructions in SIMT (mxgemmini is a separate accelerator not available to SIMT kernels).
+
+**Register file:** Physical RF is 16 KiB per core. With 128 regs/thread × 4 B × 16 lanes = 8 KiB per warp; at maximum register usage, 2 warps fit per core. With 32 regs/thread, up to 8 warps fit. More registers per thread → fewer concurrent warps but more ILP; fewer registers → more warps for latency hiding via TLP.
+
+**Operand bandwidth:** RF supports 3 read operands (rs1/rs2/rs3) per instruction; minimum RF bandwidth is 192 B/cycle for conflict-free operation.
+
+---
+
+### Key Optimization Constraints
+
+**FP32 is half-throughput:** FP32 compute is the primary bottleneck at 0.5 FLOP/thread/cycle. Maximizing FP32 utilization requires hiding the 2-cycle FP32 latency with independent instructions (ILP via loop unrolling, register tiling) or warp-level TLP.
+
+**ILP via large register tiles:** With up to 128 architectural registers, kernels should accumulate large per-thread output tiles (e.g., 4–8 FP32 accumulators per thread in matmul) and unroll inner loops to expose independent FP32 operations and hide FU latency.
+
+**SMEM is the bandwidth workhorse:** At 256 B/cycle aggregate, SMEM far exceeds L1 (32 B/cycle) and L0D (64 B/cycle). All reused data (matrix tiles, softmax row statistics, attention intermediates) should be staged in SMEM. SMEM bandwidth provisions 64 B/cycle for SIMT (one word per lane), matching L0D.
+
+**Barrier cost:** `mu_barrier` synchronizes all 8 warps across both cores. Minimize barrier frequency by maximizing work between synchronization points (larger tiles, more unrolling per phase).
+
+**Coalesced global access:** Global loads/stores should be stride-1 across lanes (lane `i` accesses address `base + i*4`) to maximize coalescing. Non-coalesced accesses generate multiple transactions and saturate the L1/L2 bandwidth budget.
+
+**Warp occupancy vs. register pressure:** Kernels with high register usage automatically reduce warp count, reducing TLP. Compensate with ILP (unrolled loops, multiple accumulators). Kernels with low register usage benefit from high warp count to hide memory latency.
+
+**No divergence in barriers:** Never place `mu_barrier` inside conditionals guarded by `tid`-dependent conditions without an explicit `else { asm volatile("nop"); }` workaround, to prevent compiler branch duplication causing deadlocks.
+## Instruction Formats
+
+### R-type
+
+### R-type
+R-type instructions will include current RISC-V R-type instructions, as well as R4-type instructions used by Vortex and floating point instructions. In particular, the `funct2` field in R4 will be delegated to the last two bits of `funct7`, with the upper 5 bits set to 0. It has this format:
+```
+63  60   59   58    52 51 44 43 36 35 28 27 20 19    17 16 9 8     7 6      0
+[pred] [resv] [funct7] [rs4] [rs3] [rs2] [rs1] [funct3] [rd] [opext] [opcode]
+  4b     1b      7b      8b    8b    8b    8b     3b     8b     2b      7b
+```
+#### Subtypes
+* R5 has `rs1` through `rs4`, as well as `rd`
+	* Assembly: `opcode.variant rd, rs1, rs2, rs3, rs4 @ pred`
+* R4 has `rs1` through `rs3`, as well as `rd`
+	* R4Frm used for floating points, with `frm` as `funct3`
+	* Assembly: `opcode.variant rd, rs1, rs2, rs3 @ pred`
+* R3 has `rs1` and `rs2`, as well as `rd` (this is what base RISC-V R-type is)
+	* R3Atomic for atomic, with `aq`, `rl`, `funct5` as `funct7` and `.global`, `.shared` address space qualifier encoded in opext.
+	* R3Frm for floating point
+	* Assembly: `opcode.variant rd, rs1, rs2 @ pred`
+
+**Special case for floating point operations.** The floating point rounding mode `frm` will remain located at `funct3`.
+
+---
+
+### I3-type
+
+### I3-type
+I3-type instructions will have up to 2 source registers and up to 1 destination register. This leaves 24 bits for immediate, which can be used directly or split across the two source registers as offsets.
+```
+63  60 59         36 35 28 27 20 19    17 16 9 8     7 6      0
+[pred] [ imm[23:0] ] [rs2] [rs1] [funct3] [rd] [opext] [opcode]
+  4b        24b        8b    8b     3b     8b     2b      7b
+```
+#### Subtypes
+* I3 has `rs1`, `rs2`, `rd`, and a 24-bit immediate
+	* Assembly: `opcode.variant rd, rs1, rs2, imm @ pred` 
+* II3 has `rs1`, `rs2`, `rd`, and two 12-bit immediates
+	* Assembly: `opcode.variant rd, imm1(rs1), imm2(rs2) @ pred` 
+
+---
+
+### S/SB-type
+
+### S/SB-type
+S/SB-type instructions has 2 source registers. The upper 8 bits of the 32-bit immediate is encoded in rd.
+```
+63  60 59         36 35 28 27 20 19    17 16           9 8     7 6      0
+[pred] [ imm[23:0] ] [rs2] [rs1] [funct3] [ imm[31:24] ] [opext] [opcode]
+  4b        24b        8b    8b     3b          8b          2b      7b
+```
+* S and SB both have `rs1`, `rs2`, and a 32-bit immediate
+	* S Assembly: `opcode.variant rs2, imm(rs1) @ pred`
+	* SB Assembly: `opcode.variant rs1, rs2, label @ pred`
+
+**Special case for SB instructions.** Base RISC-V branch PC offset has implicit bit 0. For Muon, bits 0 to 2 are explicitly encoded as 0s in the machine code (bit 36 to 38), leaving 29 remaining effective bits. The assembly behavior remains the same (immediate is specified in number of bytes), but the specified value gets rounded down to a multiple of 8.
+
+**Address Space Qualifier for Stores** We extend RISC-V `sb/sh/sw` with address space qualifiers `.global`, `.shared`, encoded using opext field as 00 and 01. 
+
+---
+
+### I2-type
+
+### I2-type
+I1-type instructions will have 1 source register and 1 destination register. This leaves the full 32bits for immediate. This instruction will replace the `I` and `UJ` type instructions in the original RISC-V specification, and will render `U` type instructions unnecessary.
+```
+63  60 59         36 35          28 27 20 19    17 16 9 8     7 6      0
+[pred] [ imm[23:0] ] [ imm[31:24] ] [rs1] [funct3] [rd] [opext] [opcode]
+  4b        24b            8b         8b     3b     8b     2b      7b
+```
+#### Subtypes
+* I2 has `rs1`, `rd`, and a 32-bit immediate (base RISC-V I-type)
+	* Assembly: `opcode.variant rd, rs1, imm @ pred`
+* U and J both have `rd` and a 32-bit immediate.
+	* U should no longer be necessary but is preserved for compatibility.
+		* `auipc` will be unnecessary since branch offsets can be 32-bit;
+		* `lui` will be unnecessary since the immediate for `addi` can be 32-bit;
+	* U Assembly: `opcode.variant rd, imm @ pred`
+	* J Assembly: `jal rd, label @ pred`
+
+**Special case for J instruction.** Similar to branches, implicit bit 0 is now explicit zeros for bits 0 to 2.
+**Special case for shift-immediate instructions.** Shift amount remains `imm[6:0]`. Shift opcode will still occupy the same bits in the immediate (`[11:7]`); however it will no longer overlap with where `funct7` is in R-types. 
+**Special case for CSR instructions.** The CSR source/dest used to be encoded in the imm12 field; it's now 32-bits (nice and wide, as it should be). The CSR immediate used to be encoded in the 5-bit rs1 address; it will still occupy rs1 in Muon but will expand to use 8 bits.
+**Address Space Qualifier for Loads** We extend RISC-V `lb/lh/lw` with address space qualifiers `.global`, `.shared`, encoded using opext field as 00 and 01. 
+
+## Control Flow and SIMT Divergence
+
+### vx_split
+
+#### `vx_split`
+
+```
+vx_split  rd, rs1, rs2
+```
+
+Used jointly with `vx_join` to serialize execution of divergent branches.
+
+* `rs1`: Per-lane condition value.  `vx_split` will set the current tmask as
+high for lanes that has non-zero `rs1` values, and push the tmask set high for
+lanes with zero `rs1` values to the IPDOM stack.  Original tmask is preserved,
+i.e. lanes not active before entering `vx_split` will not be made active in
+either tmask.
+* If `rs2` is set, use the `vx_split_n` variant, i.e. modify the current tmask
+to lanes with zero `rs1` values, and push the non-zero `rs1` tmask to the
+stack.
+* `rd` is unused.  This *deviates from Vortex* where `rd` is set to 1 if the
+condition is divergent, e.g. the value of `rs1` disagrees between
+currently-enabled lanes.
+
+Note that `vx_split` pushes two tmasks to the IPDOM stack, in this order:
+(1) the original tmask that restores the state before entering the instruction,
+and (2) the diverged tmask that will be executed later.  When pushing (2), the
+PC of the subsequent instruction after `vx_split` will also be pushed as part
+of the stack entry. When pushing (1), no valid PC will be pushed to the stack.
+
+These entries will be consumed by two later executions of `vx_join`, where the
+first one pops the diverged tmask + PC and initiates the pipeline to traverse
+the "else-path". The second one will pop the restored tmask, but since PC entry
+is invalid, execution PC is *not* altered, allowing the program to proceed to
+the branch exit.
+
+Note that for non-divergent branches, we skip pushing the (2) entry to the
+IPDOM stack.  Since the (1) entry does not alter PC and therefore prevents
+the second execution of `vx_join`, communicating the result of branch
+divergence from `vx_split` to `vx_join` via `rd` (so that `vx_join` can
+conditionally avoid popping from stack) becomes unnecessary.
+
+
+---
+
+### vx_join
+
+
+```
+vx_join  rs1
+```
+
+Pops `(tmask, optional PC)` entry from the IPDOM stack and modifies the
+architectural state accordingly.  Note it may not alter the PC depending on
+whether the corresponding `vx_split` pushed a valid PC or not.
+
+`rs1` is unused, which *deviates from Vortex* where a zero `rs1` value will
+indicate that the corresponding `vx_split` was non-divergent.
+Instead, we skip pushing the non-divergent tmask/PC to the IPDOM stack,
+eliminating the need for conditional stack-popping in `vx_join`.  See
+`vx_split` for details.
+
+
+---
+
+### vx_tmc
+
+#### `vx_tmc`
+
+```
+vx_tmc  rs1
+```
+
+* Set tmask to the value of `rs1` of the "leader" lane, i.e. the left-most
+active lane.
+
+
+---
+
+### vx_pred
+
+#### `vx_pred`
+
+```
+vx_pred  rd, rs1, rs2
+```
+
+* `rs1`: Per-lane condition value.  `vx_pred` will set the current tmask
+as high for lanes that has non-zero `rs1` values.  Original tmask is
+preserved, i.e. lanes not active before entering `vx_pred` will not be made
+active in the tmask.
+* If the *address* of `rd` is non-zero, use the `vx_pred_n` variant, i.e. tmask
+is set for lanes with zero `rs1` values.  Nothing is written back to `rd`.
+* If no lanes have a non-zero `rs1` value (zero for `vx_pred_n`), set tmask
+to the value of `rs2` of the "leader" lane, i.e. the left-most active lane.
+
+---
+
+### vx_wspawn
+
+#### `vx_wspawn`
+
+```
+vx_spawn rs1, rs2
+```
+
+Activates warps `[0, rs1)`, except the warp that executed this instruction, and
+sets their `PC` to `rs2`.  Sets tmask of newly active warps to all 1's.
+The values of `rs1` and `rs2` are taken from the "leader" lane.
+
+Note: `vx_wspawn` eventually be superceded by command processor's scheduling
+capabilities.
+
+
+---
+
+### vx_bar
+
+
+```
+vx_bar rs1, rs2
+```
+
+Waits for `rs2` warps in a single cluster to reach barrier with id given by `rs1`. 
+The values of `rs1` and `rs2` are taken from "leader" lane. TODO: how many barriers? 16?
+
+Note: `vx_bar` will eventually be superceded by neutrino / command processor barrier mechanism
+
+---
+
+### mu_barrier
+
+/** NOTE about barriers: Placing barriers around thread-divergent branches
+ *  may cause bugs.  The compiler might decide to duplicate mu_barrier() into
+ *  both paths of a warp-divergent branch, which will cause the barrier to
+ *  execute twice via SIMT serialization, and cause potential deadlocks.
+ *  mu_barrier() doesn't check for participating tmasks.
+ *
+ *  We wrap mu_barrier() with convergent/noduplicate/noinline, but that doesn't
+ *  seem to be sufficient.
+ *
+ *  This seems to happen the most around single-thread-guarded code, e.g.:
+ *
+ *    if (tid == 0) {
+ *        // do something
+ *    }
+ *    mu_barrier(...);
+ *
+ *  A workaround that _may_ work is to put an explicit else clause with a
+ *  nop in it:
+ *
+ *    if (tid == 0) {
+ *        // do something
+ *    } else {
+ *        asm volatile("nop");
+ *    }
+ *    mu_barrier(...);
+ *
+ *  Another workaround is to use -Os for the optimization, which keeps
+ *  the compiler from branch-duplicating to save code size.
+ *
+ *  None of these workarounds are fundamental, and we need proper compiler
+ *  support to reason about warp-convergence.  TODO.
+ */
+__attribute__((convergent))
+static void mu_barrier(unsigned barried_id, unsigned num_warps) {
+    asm volatile ("vx_bar %0, %1" :: "r"(barried_id), "r"(num_warps) : "memory");
+}
+
+### mu_barrier
+
+- Barriers: `mu_barrier(id, num_warps)` synchronizes all warps of the threadblock
+  (8 warps total when NUM_WARPS=4 since two cores).
+
+## Memory Operations
+
+### fence.{i,d,s}
+
+#### `fence.{i,d,s}`
+`fence.i` flushes the LSU global memory queues and the L0i cache.
+
+`fence.d` flushes the LSU global memory queues and the L0d cache.
+
+`fence.s` flushes the LSU shared memory queues. 
+
+All three instructions are blocking, and essentially have `seqcst` semantics.
+
+---
+
+### mu_fence
+
+__attribute__((convergent))
+inline void mu_fence() {
+    asm volatile ("fence" ::: "memory");
+}
+
+---
+
+### mu_fence_smem
+
+__attribute__((convergent))
+inline void mu_fence_smem() {
+    asm volatile ("fence.s" ::: "memory");
+}
+
+---
+
+### store_shared
+
+inline void store_shared(uint32_t base, uint32_t offset, uint32_t data) {
+    asm volatile("sw.shared %2, %1(%0)" :: "r"(base), "I"(offset), "r"(data)
+                 : "memory");
+}
+
+---
+
+### store64_shared
+
+inline void store64_shared(uint32_t base, uint32_t offset, uint64_t data) {
+    uint32_t lo = static_cast<uint32_t>(data);
+    uint32_t hi = static_cast<uint32_t>(data >> 32);
+    store_shared(base, offset,     lo);
+    store_shared(base, offset + 4, hi);
+}
+
+---
+
+### store_shared_from_global
+
+inline void store_shared_from_global(uint32_t dst, uint32_t src) {
+    uint32_t data;
+    asm volatile("lw.global %0, 0(%1)" : "=r"(data) : "r"(src) : "memory");
+    asm volatile("sw.shared %1, 0(%0)" :: "r"(dst), "r"(data) : "memory");
+}
+
+---
+
+### load16_shared (uint32_t address)
+
+inline uint16_t load16_shared(uint32_t address) {
+    uint16_t data;
+    asm volatile("lh.shared %0, %1(%2)" : "=r"(data) : "I"(0), "r"(address)
+                 : "memory");
+    return data;
+}
+
+---
+
+### load32_shared
+
+inline uint32_t load32_shared(uint32_t address) {
+    uint32_t data;
+    asm volatile("lw.shared %0, %1(%2)" : "=r"(data) : "I"(0), "r"(address)
+                 : "memory");
+    return data;
+}
+
+---
+
+### load16_shared (const T *address)
+
+template <typename T>
+inline std::remove_cv_t<T> load16_shared(const T *address) {
+    // need bit_cast to re-interpret uint16_t bits as _Float16
+    using U = std::remove_cv_t<T>;
+    static_assert(sizeof(U) == sizeof(uint16_t), "load16_shared<T*> expects 16-bit T");
+    uint16_t bits = load16_shared(reinterpret_cast<uint32_t>(address));
+    return __builtin_bit_cast(U, bits);
+}
+
+## Data Types and Constants
+
+### as_bf16
+
+static inline _Float16 as_bf16(uint16_t bits) {
+  return __builtin_bit_cast(_Float16, bits);
+}
+
+---
+
+### bf16x2
+
+struct bf16x2 { _Float16 lo, hi; };
+
+---
+
+### unpack_bf16x2
+
+static inline bf16x2 unpack_bf16x2(uint32_t packed) {
+  return { as_bf16((uint16_t)packed), as_bf16((uint16_t)(packed >> 16)) };
+}
+
+---
+
+### pack_bf16x2
+
+static inline uint32_t pack_bf16x2(_Float16 lo, _Float16 hi) {
+  return (uint32_t)__builtin_bit_cast(uint16_t, lo)
+       | ((uint32_t)__builtin_bit_cast(uint16_t, hi) << 16);
+}
+
+---
+
+### ONE_BF16_BITS / NEG_INF_BF16_BITS / as_bf16 usage note
+
+// You need to use __builtin_bit_cast(_Float16, ONE_BF16_BITS) for the compiler to correctly emit it.
+// use as_bf16 to quickly convert
+#define ONE_BF16_BITS ((uint16_t)0x3f80)
+#define NEG_INF_BF16_BITS ((uint16_t) 0xFF80)
+
+## Math and Arithmetic
+
+### mu_fexp
+
+inline _Float16 mu_fexp(_Float16 arg) {
+    _Float16 output;
+    asm volatile("fexp.h %0, %1" : "=r"(output) : "r"(arg));
+    return output;
+}
+
+---
+
+### mu_fnexp
+
+inline _Float16 mu_fnexp(_Float16 arg) {
+    _Float16 output;
+    asm volatile("fnexp.h %0, %1" : "=r"(output) : "r"(arg));
+    return output;
+}
+
+---
+
+### mu_exp
+
+- For exponentials use the harness-provided `mu_exp(float)`; never expf/exp.
+  Sigmoid: `1/(1 + mu_exp(-x))`.
+
+## Hardware Configuration and Intrinsics
+
+### mu_num_threads
+
+// This compiles to CSR reads which stalls the pipeline. Use sparingly & cache.
+inline int mu_num_threads() {
+    return vx_num_threads();
+}
+
+---
+
+### MU_NUM_THREADS / MU_NUM_WARPS / MU_NUM_CORES / MU_BLOCK_SIZE hardware config macros
+
+// This hard-codes hardware config into kernel, but this allows efficient
+// compile-time unrolling and constant propagation.
+#define MU_NUM_THREADS 16
+#define MU_NUM_WARPS 8
+#define MU_NUM_CORES 2
+#define MU_NUM_MAX_WARPS 8
+#define MU_NUM_CLUSTERS 1
+#define MU_BLOCK_NUM_WARPS(n) (MU_NUM_CORES * (n))
+#define MU_BLOCK_SIZE(n) (MU_BLOCK_NUM_WARPS(n) * MU_NUM_THREADS)
+#define MU_DOUBLE_BLOCK_SIZE(n) (MU_BLOCK_SIZE(n) * 2)
+
+## Kernel Interface and Harness
+
+### kernel_body
+
+Every generated kernel must define exactly:
+
+```cpp
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+);
+```
+
+The harness launches it with `mu_schedule(kernel_body, &kernel_args, NUM_WARPS)`:
+one threadblock spanning MU_NUM_CORES=2 cores x NUM_WARPS=4 warps x 16 lanes = 128
+threads. `tid_in_threadblock` is 0..127; warp id = tid / 16; lane id = tid % 16.
+
+---
+
+### KernelArgs
+
+The kernel receives a `KernelArgs*` (problem-specific struct defined in the harness)
+with `__global float*` buffers and shape fields. Use only these buffers.
+
+Problem context:
+fp32 matmul C[64,64] = A[64,768] @ B[768,64] on the radiance Muon SIMT GPU.
+smolvla-representative tile: M=64, N=64, K=768 — the 768 contraction depth mirrors
+smolvla's dominant 1024x768 @ 768x768 GEMM (12x deeper than a 64^3 tile, so each
+output reuses A/B rows 768 times → on-chip staging of the K-strip pays off far more).
+One threadblock: 2 cores x NUM_WARPS(4) warps x 16 lanes = 128 threads.
+Baseline: one output element per thread, K-loop in global memory. Optimize with
+shared-memory tiling (128 KiB SMEM), per-thread register tiles, loop unroll/ILP.
+Verification: relative 1e-4 against fixed golden; reassociation is allowed.
+
+The original code was:
+```
+// SMEM matmul, register-LEAN: stage full A,B into SMEM (fits at K<=192), 1 output/thread,
+// no unroll. Self-contained (inline __builtin_bit_cast — no top-level helpers, so it
+// survives the search's code extraction). The naive global-memory baseline is intractable
+// at this K (DRAM-bound, >80M cycles); this is the competent starting point to optimize.
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t M = args->M, N = args->N, K = args->K;
+  const uint32_t num_warps = threads_per_threadblock / MU_NUM_THREADS;
+  const uint32_t PAD = 16;
+  const uint32_t smem_a = 0;
+  const uint32_t smem_b = M * K * 4;
+
+  for (uint32_t i = tid_in_threadblock; i < M * K; i += threads_per_threadblock) {
+    store_shared(smem_a + i * 4, 0, __builtin_bit_cast(uint32_t, args->A[i]));
+  }
+  for (uint32_t i = tid_in_threadblock; i < K * N; i += threads_per_threadblock) {
+    const uint32_t k = i / N, col = i % N;
+    store_shared(smem_b + (col * (K + PAD) + k) * 4, 0, __builtin_bit_cast(uint32_t, args->B[i]));
+  }
+  mu_barrier(1, num_warps);
+
+  for (uint32_t idx = tid_in_threadblock; idx < M * N; idx += threads_per_threadblock) {
+    const uint32_t row = idx / N;
+    const uint32_t col = idx % N;
+    uint32_t a_addr = smem_a + row * K * 4;
+    uint32_t b_addr = smem_b + col * (K + PAD) * 4;
+    float acc = 0.0f;
+    for (uint32_t k = 0; k < K; k++) {
+      acc += __builtin_bit_cast(float, load32_shared(a_addr)) *
+             __builtin_bit_cast(float, load32_shared(b_addr));
+      a_addr += 4;
+      b_addr += 4;
+    }
+    args->C[idx] = acc;
+  }
+}
+
+```
+The latency of this code was 109835.
+Please carefully review the code to identify any inefficiencies. Performance can be improved by using the following strategies:
+<strategies>:
+1. fuse operations
+2. try new parameter values
+3. stage global loads into `__shared` memory before compute to enable warp reuse
+4. use `mu_fence_smem()` only once per tile boundary, not inside inner loops
+5. tile across both M and N dimensions per thread to increase register reuse
+6. stage into shared memory ONLY operands reused many times (matmul/attention tiles); never stage data read once (e.g. conv patch-embed im2col-once), which adds load+store+barrier overhead with no reuse payoff
+7. Utilize 64-bit wide loads from global memory to SMEM registers (loading two elements at once per thread) to reduce instruction fetch/decode overhead and fully saturate the 64 B/cycle L0d bandwidth.
+8. Avoid thread divergence penalties near matrix edges by substituting explicit branches (`vx_split`/`vx_join`) with Muon hardware predication (`vx_pred`) or branchless select operations.
+9. Minimize L0 Data Cache (L0d) thrashing during streaming write-backs of matrix C by using cache-bypassing store instructions or structuring write patterns to protect the small 16 KiB direct-mapped L0d.
+10. Programmatically tune the register footprint per thread to control dynamic warp occupancy, finding the optimal balance between high register reuse (ILP) and high warp count (TLP) to hide DRAM latency.
+
+You are an expert performance engineer generating high-performance code for this hardware target. Invent a new strategy inspired by the <strategies> to apply to the above code to reduce execution time, and explain how it will improve performance. The plan should be specific to this code and explain how to change it.
+Make sure to follow these rules:
+1. The threadblock spans 2 cores x 4 warps x 16 lanes = 128 threads; tid_in_threadblock is 0..127.
+2. Shared memory is 128 KiB per cluster; address 0 to 0x20000.
+3. FP32 SIMT ISA (RV32IM + Zfinx); 256 registers per thread.
+4. Memory loads are ~400-cycle latency; smem ~2 cycles.
+5. Barriers must include all warps: mu_barrier(id, total_warps).
+6. The kernel must define void kernel_body(void*, uint32_t, uint32_t, uint32_t); the harness calls it via mu_schedule.
+7. Use only the buffers in KernelArgs; do not print from the kernel.
+8. Use mu_exp() for exponentials (matches the golden); never call expf().
+9. HARD LIMIT: kernel_body must use <= 31 distinct registers. The target core has 256 physical registers shared across 8 always-active warps (32/warp), so a kernel using >32 distinct registers is rejected (unrunnable on RTL). Avoid deep #pragma unroll and per-thread register tiling (multiple accumulators); use one accumulator per thread and increment a single pointer. Shared memory staging is fine and encouraged; the register blowup comes from unroll/tiling.
+10. CROSS-CORE SMEM BARRIER (the #1 cause of silent failures): if ANY thread reads a shared-memory location that a thread on the OTHER core wrote (i.e. any cooperative SMEM staging across the whole 128-thread threadblock), the barrier between the write and the read MUST be mu_barrier(0, nw) where nw = threads_per_threadblock / MU_NUM_THREADS (barrier ID 0 = CROSS-CORE). mu_barrier(1, ...) is PER-CORE only: it does NOT make core 0's SMEM writes visible to core 1, so cross-core reads get stale data. This PASSES functional sim but FAILS under timing / on RTL with wrong results. Use ID 1 only for purely intra-core (single-core) staging. When unsure, use ID 0.
+11. REGISTER WALL (hard RTL limit): the 8 warps of a threadblock share one core's 256 physical registers (~32 distinct registers/warp, ~16 left for the kernel after the harness floor). Kernels whose distinct (warp,rd) writes exceed 256 are REJECTED (globalOverSubscription, $fatal on RTL). Avoid per-thread register tiling with many accumulators, deep #pragma unroll, and long unrolled reduction loops (the distinct-register count grows with unrolled trip count). Prefer one accumulator per output and a single incrementing pointer; for long sequences keep loops rolled (#pragma GCC unroll 1 if needed).
+12. The rewritten program should be semantically equivalent to the original program, within a small numerical tolerance.
+13. Keep the same function name and signature as the original program (helper functions can be renamed or deleted).
+14. Never use expf() or exp() for exponentials; always use mu_exp(float) for fp32 or mu_fexp/_Float16 for fp16. Using expf/exp will cause a compile or link error.
+15. mu_barrier(barrier_id, num_warps) must receive the total warp count across both cores (8 warps for a full threadblock with NUM_WARPS=4), not per-core warp count. Passing the wrong num_warps causes incorrect synchronization and silently wrong results or deadlocks.
+16. Never place mu_barrier() inside a warp-divergent branch (e.g., guarded by tid-dependent conditions) without an explicit else { asm volatile("nop"); } clause. The compiler may duplicate the barrier into both branch paths, causing deadlocks.
+17. Shared memory is at base address 0x00000000 and is 128 KiB total per cluster. Accessing beyond this range corrupts other memory-mapped regions (e.g., Gemmini MMIO at 0x00084000), causing undefined behavior or hardware faults.
+18. Limit the scope of the plan to the selected strategy.
+19. Do not count out any of the strategies unless they are clearly irrelevant to the code.
+20. The threadblock always has exactly 128 threads: 2 cores x 4 warps x 16 lanes. tid_in_threadblock is 0..127, warp_id = tid/16, lane_id = tid%16. Any algorithm partitioning that assumes a different thread count will produce incorrect results.
+21. Shared memory intrinsics (store_shared, load32_shared, load16_shared) must be used for SMEM accesses; using regular pointer dereferences to address 0 without __local qualification may not correctly target SMEM, causing wrong results or faults.
+22. Do not plan to use mxgemmini/tensor instructions in SIMT kernels; they are not available to SIMT code and will cause a compile or runtime error.
+
+Remember that this is phase 1 out of 12 optimization phases.

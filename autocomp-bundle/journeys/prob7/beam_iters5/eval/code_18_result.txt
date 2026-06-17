@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  100 |         float qi_k = *(float*)&load32_shared(SMEM_Q_BASE + (i * d + k) * sizeof(float));\n      |                               ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:101:31: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  101 |         float kj_k = *(float*)&load32_shared(SMEM_K_BASE + (j * d + k) * sizeof(float));\n      |                               ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:144:31: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  144 |         float p_ij = *(float*)&load32_shared(SMEM_S_BASE + (i * seq + j) * sizeof(float));\n      |                               ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:145:31: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  145 |         float v_jk = *(float*)&load32_shared(SMEM_V_BASE + (j * d + k) * sizeof(float));\n      |                               ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:158:28: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  158 |     float o_val = *(float*)&load32_shared(SMEM_O_BASE + i * sizeof(float));\n      |                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n5 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

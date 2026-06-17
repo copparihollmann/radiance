@@ -1,0 +1,81 @@
+#include <stdint.h>
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  (void)threads_per_threadblock;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  const uint32_t smem_a = 0;
+  const uint32_t smem_b = 2048; // 512 floats = 2048 bytes
+
+  // Thread mapping
+  const uint32_t lane_id = tid_in_threadblock & 15;       // 0..15
+  const uint32_t warp_id = tid_in_threadblock >> 4;       // 0..7
+  const uint32_t r = warp_id;                             // Row index within 8x16 tile (0..7)
+  const uint32_t c = lane_id;                             // Col index within 8x16 tile (0..15)
+
+  // Output blocks: 32 total 8x16 tiles in a 64x64 output
+  for (uint32_t block_idx = 0; block_idx < 32; block_idx++) {
+    const uint32_t block_r = (block_idx >> 2) << 3;       // (block_idx / 4) * 8
+    const uint32_t block_c = (block_idx &  3) << 4;       // (block_idx % 4) * 16
+
+    float acc = 0.0f;
+
+    // K-dimension streaming in steps of 64
+    const float* __restrict__ A_base = args->A + block_r * 64;
+    const float* __restrict__ B_base = args->B + block_c;
+
+    const uint32_t a_load_stride = 64 * 8;                // 8 rows per step
+    const uint32_t b_load_stride = 64 * 16;               // 16 cols per step
+
+    const float* __restrict__ a_k = A_base + r * 64 + lane_id; // Stride-1 across lanes
+    const float* __restrict__ b_k = B_base + lane_id * 64 + c; // Column-major access
+
+    for (uint32_t k_step = 0; k_step < 64; k_step += 16) {
+      // --- Stage A tile ---
+      #pragma GCC unroll 1
+      for (uint32_t i = 0; i < 2; ++i) { // 2 rows of A per warp
+        const uint32_t a_row = (warp_id * 2 + i);
+        if (a_row < 8) {
+          const float a_val = a_k[i * 64]; // Coalesced load (stride-1 lanes)
+          store_shared(smem_a, (a_row * 16 + lane_id) * 4, __builtin_bit_cast(uint32_t, a_val));
+        }
+      }
+
+      // --- Stage B tile ---
+      #pragma GCC unroll 1
+      for (uint32_t j = 0; j < 16; ++j) {
+        const float b_val = b_k[j * 64]; // Coalesced load (stride-1 lanes)
+        store_shared(smem_b, (lane_id * 16 + j) * 4, __builtin_bit_cast(uint32_t, b_val));
+      }
+
+      mu_barrier(0, 8); // Cross-core barrier
+
+      // --- Compute partial products ---
+      const float* __restrict__ smem_a_ptr = (float*)(smem_a + r * 16 * 4);
+      const float* __restrict__ smem_b_ptr = (float*)(smem_b + c * 4);
+
+      #pragma GCC unroll 1
+      for (uint32_t k_inner = 0; k_inner < 16; ++k_inner) {
+        const float a_elem = smem_a_ptr[k_inner];
+        const float b_elem = smem_b_ptr[k_inner * 16];
+        acc += a_elem * b_elem;
+      }
+
+      mu_barrier(0, 8); // Prepare for next K-step
+
+      a_k += 16;
+      b_k += 16 * 64;
+    }
+
+    // Write back final accumulated value
+    const uint32_t global_row = block_r + r;
+    const uint32_t global_col = block_c + c;
+    args->C[global_row * 64 + global_col] = acc;
+  }
+}

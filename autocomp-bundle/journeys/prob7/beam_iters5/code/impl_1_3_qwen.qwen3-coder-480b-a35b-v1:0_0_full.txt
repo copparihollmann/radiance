@@ -1,0 +1,123 @@
+```cpp
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t seq = a->seq;
+  const uint32_t d = a->d;
+  const uint32_t nw = threads_per_threadblock / MU_NUM_THREADS;
+
+  // SMEM layout:
+  // 0x00000: smem_Q     (128 * 64 * 4 = 32 KiB)
+  // 0x08000: smem_K     (128 * 64 * 4 = 32 KiB)
+  // 0x10000: smem_S     (128 * 128 * 4 = 64 KiB)
+  // For phase 3:
+  // 0x00000: smem_V     (128 * 64 * 4 = 32 KiB)
+  // 0x08000: smem_O     (128 * 64 * 4 = 32 KiB)
+
+  // Phase 1: S[i][j] = scale * Q[i]·K[j]
+  // Load Q and K into SMEM with coalesced access
+  for (uint32_t idx = tid_in_threadblock; idx < seq * d; idx += threads_per_threadblock) {
+      const __global float* src_q = a->Q + idx;
+      float val_q;
+      asm volatile("lw.global %0, 0(%1)" : "=r"(val_q) : "r"(src_q) : "memory");
+      store_shared(0x00000, idx * 4, __builtin_bit_cast(uint32_t, val_q));
+  }
+
+  for (uint32_t idx = tid_in_threadblock; idx < seq * d; idx += threads_per_threadblock) {
+      const __global float* src_k = a->K + idx;
+      float val_k;
+      asm volatile("lw.global %0, 0(%1)" : "=r"(val_k) : "r"(src_k) : "memory");
+      store_shared(0x08000, idx * 4, __builtin_bit_cast(uint32_t, val_k));
+  }
+
+  mu_barrier(0, nw); // Cross-core barrier after SMEM loads
+
+  // Compute S = Q @ K^T in SMEM
+  for (uint32_t i = tid_in_threadblock; i < seq; i += threads_per_threadblock) {
+      float acc = 0.0f;
+      for (uint32_t k = 0; k < d; k++) {
+          float q_val = __builtin_bit_cast(float, load32_shared(0x00000 + (i * d + k) * 4));
+          float k_val = __builtin_bit_cast(float, load32_shared(0x08000 + (/*j=*/0) * d * 4 + k * 4)); // Will be updated in loop below
+          acc += q_val * k_val;
+      }
+      // Now j loop to fill full row
+      for (uint32_t j = 0; j < seq; j++) {
+          acc = 0.0f;
+          for (uint32_t k = 0; k < d; k++) {
+              float q_val = __builtin_bit_cast(float, load32_shared(0x00000 + (i * d + k) * 4));
+              float k_val = __builtin_bit_cast(float, load32_shared(0x08000 + j * d * 4 + k * 4));
+              acc += q_val * k_val;
+          }
+          store_shared(0x10000 + (i * seq + j) * 4, 0, __builtin_bit_cast(uint32_t, acc * 0.125f));
+      }
+  }
+
+  mu_barrier(0, nw); // Cross-core barrier after S computation
+
+  // Phase 2: Softmax in-place on SMEM S
+  for (uint32_t i = tid_in_threadblock; i < seq; i += threads_per_threadblock) {
+      // Find max
+      float max_val = __builtin_bit_cast(float, load32_shared(0x10000 + (i * seq + 0) * 4));
+      for (uint32_t j = 1; j < seq; j++) {
+          float val = __builtin_bit_cast(float, load32_shared(0x10000 + (i * seq + j) * 4));
+          if (val > max_val) max_val = val;
+      }
+
+      // Exponentiate and sum
+      float sum = 0.0f;
+      for (uint32_t j = 0; j < seq; j++) {
+          float val = __builtin_bit_cast(float, load32_shared(0x10000 + (i * seq + j) * 4));
+          float exp_val = mu_exp(val - max_val);
+          store_shared(0x10000 + (i * seq + j) * 4, 0, __builtin_bit_cast(uint32_t, exp_val));
+          sum += exp_val;
+      }
+
+      // Normalize
+      float inv_sum = 1.0f / sum;
+      for (uint32_t j = 0; j < seq; j++) {
+          float val = __builtin_bit_cast(float, load32_shared(0x10000 + (i * seq + j) * 4));
+          store_shared(0x10000 + (i * seq + j) * 4, 0, __builtin_bit_cast(uint32_t, val * inv_sum));
+      }
+  }
+
+  mu_barrier(0, nw); // Cross-core barrier after softmax
+
+  // Phase 3: O = P @ V
+  // Reuse smem_Q space for V loading
+  for (uint32_t idx = tid_in_threadblock; idx < seq * d; idx += threads_per_threadblock) {
+      const __global float* src_v = a->V + idx;
+      float val_v;
+      asm volatile("lw.global %0, 0(%1)" : "=r"(val_v) : "r"(src_v) : "memory");
+      store_shared(0x00000, idx * 4, __builtin_bit_cast(uint32_t, val_v));
+  }
+
+  mu_barrier(0, nw); // Cross-core barrier after V load
+
+  // Compute output in smem_O (reuse smem_K space)
+  for (uint32_t i = tid_in_threadblock; i < seq; i += threads_per_threadblock) {
+      for (uint32_t k = 0; k < d; k++) {
+          float acc = 0.0f;
+          for (uint32_t j = 0; j < seq; j++) {
+              float p_val = __builtin_bit_cast(float, load32_shared(0x10000 + (i * seq + j) * 4));
+              float v_val = __builtin_bit_cast(float, load32_shared(0x00000 + (j * d + k) * 4));
+              acc += p_val * v_val;
+          }
+          store_shared(0x08000 + (i * d + k) * 4, 0, __builtin_bit_cast(uint32_t, acc));
+      }
+  }
+
+  mu_barrier(0, nw); // Cross-core barrier after O compute
+
+  // Copy result back to global memory
+  for (uint32_t idx = tid_in_threadblock; idx < seq * d; idx += threads_per_threadblock) {
+      float val_o = __builtin_bit_cast(float, load32_shared(0x08000 + idx * 4));
+      __global float* dst_o = a->O + idx;
+      asm volatile("sw.global %1, 0(%0)" :: "r"(dst_o), "r"(__builtin_bit_cast(uint32_t, val_o)) : "memory");
+  }
+}
+```

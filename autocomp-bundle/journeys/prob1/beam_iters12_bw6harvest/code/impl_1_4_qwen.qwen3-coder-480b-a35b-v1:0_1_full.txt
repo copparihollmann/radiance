@@ -1,0 +1,104 @@
+```cpp
+#include <mu_intrinsics.h>
+#include <mu_schedule.h>
+#include <stdint.h>
+
+// KernelArgs is defined by the harness; do not redefine.
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  // Problem constants – must match harness
+  constexpr uint32_t OC = 16;
+  constexpr uint32_t CKK = 768;
+  constexpr uint32_t P = 16;
+  constexpr uint32_t OW = 4;
+  constexpr uint32_t KH = 16;
+  constexpr uint32_t KW = 16;
+  constexpr uint32_t HWd = 64 * 64;
+  constexpr uint32_t Wd = 64;
+  constexpr uint32_t stride = 16;
+
+  // Zero-bank-conflict padding: 768 -> 769 (coprime to 16)
+  constexpr uint32_t CKK_PADDED = 769;
+  constexpr uint32_t smem_w_base = 0;                          // Start at 0
+  constexpr uint32_t smem_patches_base = OC * CKK_PADDED * 4; // After W
+
+  // === STAGE 1: Copy W into SMEM with MLP (unroll by 2) ===
+  for (uint32_t i = tid_in_threadblock; i < OC * CKK; i += threads_per_threadblock * 2) {
+    uint32_t w0, w1;
+    // Load two W elements
+    asm volatile("lw.global %0, 0(%1)" : "=r"(w0) : "r"(&a->w[i]) : "memory");
+    asm volatile("lw.global %0, 0(%1)" : "=r"(w1) : "r"(&a->w[i + threads_per_threadblock]) : "memory");
+    // Store directly into SMEM with zero-conflict stride
+    store_shared(smem_w_base + i * 4, 0, w0);
+    store_shared(smem_w_base + (i + threads_per_threadblock) * 4, 0, w1);
+  }
+
+  // === STAGE 2: Restructured im2col load into SMEM[smem_patches_base..] ===
+  for (uint32_t p = 0; p < P; ++p) {
+    const uint32_t p_row = p / OW;  // p >> 2
+    const uint32_t p_col = p % OW;  // p & 3
+    const uint32_t h_base = p_row * stride;
+    const uint32_t w_base = p_col * stride;
+
+    for (uint32_t ckk = tid_in_threadblock; ckk < CKK; ckk += threads_per_threadblock) {
+      const uint32_t c = ckk / (KH * KW);       // ckk >> 8
+      const uint32_t rem = ckk % (KH * KW);     // ckk & 255
+      const uint32_t kh = rem / KW;             // rem >> 4
+      const uint32_t kw = rem % KW;             // rem & 15
+
+      const uint32_t in_idx = c * HWd + (h_base + kh) * Wd + (w_base + kw);
+      uint32_t val;
+      asm volatile("lw.global %0, 0(%1)" : "=r"(val) : "r"(&a->in[in_idx]) : "memory");
+
+      // Write with padded stride to eliminate SMEM bank conflicts
+      store_shared(smem_patches_base + (p * CKK_PADDED + ckk) * 4, 0, val);
+    }
+  }
+
+  // === CRITICAL: Cross-core barrier to ensure SMEM visibility ===
+  mu_barrier(0, threads_per_threadblock / MU_NUM_THREADS); // 128/16 = 8 warps
+
+  // === STAGE 3: Compute output tiles with software pipelining ===
+  for (uint32_t idx = tid_in_threadblock; idx < OC * P; idx += threads_per_threadblock) {
+    const uint32_t oc = idx / P; // idx >> 4
+    const uint32_t p = idx % P;  // idx & 15
+
+    // Pointers into SMEM with zero-conflict strides
+    uint32_t w_addr = smem_w_base + oc * CKK_PADDED * 4;
+    uint32_t p_addr = smem_patches_base + p * CKK_PADDED * 4;
+
+    float acc = 0.0f;
+
+    // Prefetch initial pair to kickstart pipeline
+    float w_val = __builtin_bit_cast(float, load32_shared(w_addr));
+    float p_val = __builtin_bit_cast(float, load32_shared(p_addr));
+    w_addr += 4;
+    p_addr += 4;
+
+    // Main loop with 1-stage software pipelining
+    for (uint32_t k = 1; k < CKK; ++k) {
+      float w_next = __builtin_bit_cast(float, load32_shared(w_addr));
+      float p_next = __builtin_bit_cast(float, load32_shared(p_addr));
+      acc += w_val * p_val;
+      w_val = w_next;
+      p_val = p_next;
+      w_addr += 4;
+      p_addr += 4;
+    }
+
+    // Final MAC outside the loop
+    acc += w_val * p_val;
+
+    // Write out final accumulator
+    a->out[idx] = acc;
+  }
+}
+```

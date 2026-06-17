@@ -1,0 +1,128 @@
+An elegant and highly effective optimization strategy for this kernel is **Padding-65 Shared Memory Staging with Shift-Based Indexing**.
+
+### Optimization Strategy Description
+
+1. **Full Shared Memory Staging**: Rather than streaming inputs repeatedly from slow global memory (~400-cycle latency), we stage the entire $Q$, $K$, and $V$ matrices into the high-bandwidth, 2-cycle latency Shared Memory (SMEM). The total footprint for all tiled buffers is small enough to fit within the 128 KiB SMEM limit.
+2. **Padding-65 to Eliminate Bank Conflicts**: The hardware features a dual-ported banked SMEM architecture (4x16 banks). Strides of 64 map directly to the same banks, causing severe 16-way bank conflicts. By padding the row dimension of our SMEM allocations to 65 elements (e.g., `row * 65 + col`), we stagger the bank mapping such that both row-wise and column-wise parallel accesses are completely bank-conflict-free.
+3. **Shift-Based Indexing (Division Elimination)**: Divisions (`/ 64`) and modulos (`% 64`) are extremely expensive software routines on RISC-V SIMT. Since `SEQ` and `HEAD_DIM` are compile-time constants (64), we can replace them with fast bitwise shifts (`>> 6`) and masks (`& 63`). This drastically reduces instruction count and register usage.
+4. **Warp-Safe Rolled Loops**: To strictly comply with the **Register Wall** limit of $\le 31$ distinct registers, we keep all loops rolled, avoiding compiler register-bloat from loop unrolling.
+5. **Cross-Core Synchronization**: To cooperatively stage SMEM across both cores of the cluster, we use `mu_barrier(0, 8)` (Cross-Core barrier ID 0 with 8 total warps) to ensure that writes are visible to all threads before computation.
+
+### Code Implementation
+
+```cpp
+#include <stdint.h>
+
+// Assuming the existence of standard harness types and intrinsics:
+// mu_barrier, load32_shared, store_shared, mu_exp
+
+#define MU_NUM_THREADS 16
+
+// Offsets in bytes for 64x65 padded float matrices (4160 floats = 16640 bytes each)
+#define Q_OFFSET 0
+#define K_OFFSET 16640
+#define V_OFFSET 33280
+#define S_OFFSET 49920
+
+static inline float load_float_shared(uint32_t addr) {
+    uint32_t u = load32_shared(addr);
+    return __builtin_bit_cast(float, u);
+}
+
+static inline void store_float_shared(uint32_t addr, float f) {
+    uint32_t u = __builtin_bit_cast(uint32_t, f);
+    store_shared(addr, 0, u);
+}
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  (void)threads_per_threadblock;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const float scale = 0.125f; // 1/sqrt(64)
+
+  // Phase 1: Cooperative Staging of Q, K, and V from Global Memory to SMEM
+  for (uint32_t idx = tid_in_threadblock; idx < 4096; idx += 128) {
+    uint32_t r = idx >> 6;    // idx / 64
+    uint32_t c = idx & 63;    // idx % 64
+    uint32_t smem_addr_offset = (r * 65 + c) * 4;
+
+    store_float_shared(Q_OFFSET + smem_addr_offset, a->Q[idx]);
+    store_float_shared(K_OFFSET + smem_addr_offset, a->K[idx]);
+    store_float_shared(V_OFFSET + smem_addr_offset, a->V[idx]);
+  }
+  
+  // Synchronize across both cores (8 warps total)
+  mu_barrier(0, 8);
+
+  // Phase 2: Compute Attention Scores S = (Q * K^T) * scale
+  for (uint32_t idx = tid_in_threadblock; idx < 4096; idx += 128) {
+    uint32_t i = idx >> 6;
+    uint32_t j = idx & 63;
+    
+    float acc = 0.0f;
+    // Keep loop rolled to minimize register pressure
+    for (uint32_t k = 0; k < 64; k++) {
+      float q = load_float_shared(Q_OFFSET + (i * 65 + k) * 4);
+      float k_val = load_float_shared(K_OFFSET + (j * 65 + k) * 4);
+      acc += q * k_val;
+    }
+    store_float_shared(S_OFFSET + (i * 65 + j) * 4, acc * scale);
+  }
+
+  // Synchronize before Softmax
+  mu_barrier(0, 8);
+
+  // Phase 3: Softmax per row (highly-parallel, conflict-free row-wise reduction)
+  if (tid_in_threadblock < 64) {
+    uint32_t r = tid_in_threadblock;
+    uint32_t row_addr = S_OFFSET + r * 65 * 4;
+    
+    // Find maximum value in row for numerical stability
+    float m = load_float_shared(row_addr);
+    for (uint32_t j = 1; j < 64; j++) {
+      float v = load_float_shared(row_addr + j * 4);
+      if (v > m) {
+        m = v;
+      }
+    }
+    
+    // Compute Exponentials and Row Sum
+    float sum = 0.0f;
+    for (uint32_t j = 0; j < 64; j++) {
+      float v = load_float_shared(row_addr + j * 4);
+      float e = mu_exp(v - m);
+      store_float_shared(row_addr + j * 4, e);
+      sum += e;
+    }
+    
+    // Normalize Exponentials
+    float inv_sum = 1.0f / sum;
+    for (uint32_t j = 0; j < 64; j++) {
+      float e = load_float_shared(row_addr + j * 4);
+      store_float_shared(row_addr + j * 4, e * inv_sum);
+    }
+  }
+
+  // Synchronize after Softmax writes
+  mu_barrier(0, 8);
+
+  // Phase 4: Compute Output O = P * V
+  for (uint32_t idx = tid_in_threadblock; idx < 4096; idx += 128) {
+    uint32_t i = idx >> 6;
+    uint32_t k = idx & 63;
+    
+    float acc = 0.0f;
+    for (uint32_t j = 0; j < 64; j++) {
+      float p = load_float_shared(S_OFFSET + (i * 65 + j) * 4);
+      float v = load_float_shared(V_OFFSET + (j * 65 + k) * 4);
+      acc += p * v;
+    }
+    a->O[idx] = acc;
+  }
+}
+```

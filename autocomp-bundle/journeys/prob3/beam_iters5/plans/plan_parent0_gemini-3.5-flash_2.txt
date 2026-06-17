@@ -1,0 +1,113 @@
+### Plan to Optimize the Attention Kernel
+
+We will apply **Strategy 1: Cache reused data in local memory instead of reloading from main memory**. 
+
+#### Inefficiency Analysis
+In the baseline kernel, the intermediate matrix $S$ (of size $\text{SEQ} \times \text{SEQ} = 96 \times 96 = 9216$ elements, or $\approx 36.8 \text{ KiB}$) is written to and read from the global memory buffer `a->scratch`. Global memory accesses have an extremely high latency of $\approx 400$ cycles. 
+* **Phase 1** writes $9216$ floats to global memory.
+* **Phase 2** performs a sequential reduction over rows, reading each row multiple times from global memory and writing the softmax results back to global memory.
+* **Phase 3** reads from the global `a->scratch` buffer to compute the matrix multiplication $O = P V$.
+
+Since the entire $96 \times 96$ float matrix ($36.8\text{ KiB}$) fits comfortably inside the $128\text{ KiB}$ high-bandwidth Shared Memory (SMEM) space (latency of $\approx 2$ cycles), we can eliminate all global memory round-trips for the intermediate scores by staging them entirely in SMEM.
+
+#### Optimization Steps
+1. **Declare Shared Memory Pointer**:
+   Define `s_scratch` as a `__shared float*` pointing to the base of shared memory (`0x0`).
+2. **Phase 1 (Score Computation)**:
+   Change the destination of Phase 1 scores from `a->scratch[idx]` to `s_scratch[idx]`.
+3. **Cross-Core Synchronization**:
+   Since threads across both cores write to and read from arbitrary indices of `s_scratch`, we must use a cross-core barrier. Change `mu_barrier(1, num_warps)` to `mu_barrier(0, num_warps)` to guarantee cross-core visibility of SMEM writes.
+4. **Phase 2 (Softmax)**:
+   Perform all local maximum, exponential sum, and normalization operations directly on `s_scratch` instead of `a->scratch`.
+5. **Cross-Core Synchronization**:
+   Use `mu_barrier(0, num_warps)` again to ensure the normalized probabilities in `s_scratch` are visible to all threads before Phase 3.
+6. **Phase 3 (Output Computation)**:
+   Read the softmax probabilities from `s_scratch` instead of `a->scratch` to compute the final output `a->O`.
+
+---
+
+### Optimized Code Implementation
+
+```cpp
+#include <vx_intrinsics.h>
+#include <mu_intrinsics.h>
+#include <mu_schedule.h>
+#include <shared_mem.h>
+#include <stdint.h>
+
+struct KernelArgs {
+  __global float* Q;
+  __global float* K;
+  __global float* V;
+  __global float* O;
+  __global float* scratch;
+  uint32_t seq;
+  uint32_t d;
+};
+
+// Allocate a shared memory buffer starting at base address 0x0
+__shared float* const s_scratch = reinterpret_cast<__shared float*>(0x0);
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t seq = a->seq;
+  const uint32_t d = a->d;
+  const uint32_t num_warps = threads_per_threadblock / MU_NUM_THREADS;
+  const float scale = 0.125f; // 1/sqrt(64)
+
+  // Phase 1: Compute scores and stage them directly in SMEM
+  for (uint32_t idx = tid_in_threadblock; idx < seq * seq; idx += threads_per_threadblock) {
+    const uint32_t i = idx / seq;
+    const uint32_t j = idx % seq;
+    float acc = 0.0f;
+    for (uint32_t k = 0; k < d; k++) {
+      acc += a->Q[i * d + k] * a->K[j * d + k];
+    }
+    s_scratch[idx] = acc * scale;
+  }
+  
+  // Cross-core barrier (ID 0) to synchronize shared memory across both cores
+  mu_fence_smem();
+  mu_barrier(0, num_warps);
+
+  // Phase 2: Softmax per row entirely in SMEM
+  for (uint32_t row = tid_in_threadblock; row < seq; row += threads_per_threadblock) {
+    float m = s_scratch[row * seq];
+    for (uint32_t j = 1; j < seq; j++) {
+      const float v = s_scratch[row * seq + j];
+      if (v > m) m = v;
+    }
+    float sum = 0.0f;
+    for (uint32_t j = 0; j < seq; j++) {
+      const float e = mu_exp(s_scratch[row * seq + j] - m);
+      s_scratch[row * seq + j] = e;
+      sum += e;
+    }
+    const float inv = 1.0f / sum;
+    for (uint32_t j = 0; j < seq; j++) {
+      s_scratch[row * seq + j] *= inv;
+    }
+  }
+
+  // Cross-core barrier (ID 0) to synchronize shared memory across both cores
+  mu_fence_smem();
+  mu_barrier(0, num_warps);
+
+  // Phase 3: O = P V, reading P from SMEM
+  for (uint32_t idx = tid_in_threadblock; idx < seq * d; idx += threads_per_threadblock) {
+    const uint32_t i = idx / d;
+    const uint32_t k = idx % d;
+    float acc = 0.0f;
+    for (uint32_t j = 0; j < seq; j++) {
+      acc += s_scratch[i * seq + j] * a->V[j * d + k];
+    }
+    a->O[idx] = acc;
+  }
+}
+```

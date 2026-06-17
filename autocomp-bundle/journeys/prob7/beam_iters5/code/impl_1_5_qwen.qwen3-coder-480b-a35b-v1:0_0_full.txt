@@ -1,0 +1,124 @@
+```cpp
+#include <stdint.h>
+
+// Assume these headers provide necessary intrinsics and types
+// In a real implementation, they will be provided by the toolchain
+// #include <vx_intrinsics.h>
+// #include <mu_intrinsics.h>
+// #include <mu_schedule.h>
+
+struct KernelArgs {
+  __global float* Q;
+  __global float* K;
+  __global float* V;
+  __global float* scratch;
+  __global float* O;
+  uint32_t seq;
+  uint32_t d;
+};
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t seq = a->seq;
+  const uint32_t d = a->d;
+  const uint32_t nw = threads_per_threadblock / 16; // MU_NUM_THREADS is 16
+
+  // Shared Memory layout: 128 KiB total
+  // Strategy: Stage Q and K first (64 KiB), then reuse for V (32 KiB)
+  // Each matrix is seq * d = 128 * 64 = 8192 floats = 32 KiB
+  __shared float* const s_Q = reinterpret_cast<__shared float*>(0x00000000);
+  __shared float* const s_K = reinterpret_cast<__shared float*>(0x00008000); // 32 KiB offset
+  __shared float* const s_V = reinterpret_cast<__shared float*>(0x00000000); // Reuse Q's space
+
+  // --- Phase 1: Load Q and K into SMEM ---
+  // Cooperatively load Q and K from global memory to shared memory
+  for (uint32_t idx = tid_in_threadblock; idx < seq * d; idx += threads_per_threadblock) {
+    s_Q[idx] = a->Q[idx];
+    s_K[idx] = a->K[idx];
+  }
+
+  // Cross-core barrier to ensure all SMEM writes are visible
+  // nw is the total number of warps in the threadblock (across both cores)
+  asm volatile("vx_bar %0, %1" :: "r"(0), "r"(nw) : "memory");
+
+  // --- Compute Attention Scores S = Q @ K.T ---
+  for (uint32_t i = tid_in_threadblock; i < seq; i += threads_per_threadblock) {
+    const __shared float* qi = s_Q + i * d;
+    __global float* sp = a->scratch + i * seq;
+    for (uint32_t j = 0; j < seq; j++) {
+      const __shared float* kj = s_K + j * d;
+      float acc = 0.0f;
+      // Unroll manually to some extent to expose ILP without exploding register usage
+      // Limiting unroll depth is crucial to stay under 31 registers/thread
+#pragma GCC unroll 4
+      for (uint32_t k = 0; k < d; k++) {
+        acc += qi[k] * kj[k];
+      }
+      sp[j] = acc * 0.125f;
+    }
+  }
+
+  // Cross-core barrier before softmax
+  asm volatile("vx_bar %0, %1" :: "r"(0), "r"(nw) : "memory");
+
+  // --- Phase 2: Softmax in-place on scratch ---
+  for (uint32_t i = tid_in_threadblock; i < seq; i += threads_per_threadblock) {
+    __global float* sp = a->scratch + i * seq;
+
+    // Find max
+    float max_val = sp[0];
+    for (uint32_t j = 1; j < seq; j++) {
+      if (sp[j] > max_val) {
+        max_val = sp[j];
+      }
+    }
+
+    // Exponentiate and sum
+    float sum = 0.0f;
+    for (uint32_t j = 0; j < seq; j++) {
+      const float e = mu_exp(sp[j] - max_val);
+      sp[j] = e;
+      sum += e;
+    }
+
+    // Normalize
+    const float inv_sum = 1.0f / sum;
+    for (uint32_t j = 0; j < seq; j++) {
+      sp[j] *= inv_sum;
+    }
+  }
+
+  // Cross-core barrier before loading V
+  asm volatile("vx_bar %0, %1" :: "r"(0), "r"(nw) : "memory");
+
+  // --- Phase 3: Load V into SMEM ---
+  for (uint32_t idx = tid_in_threadblock; idx < seq * d; idx += threads_per_threadblock) {
+    s_V[idx] = a->V[idx];
+  }
+
+  // Cross-core barrier after loading V
+  asm volatile("vx_bar %0, %1" :: "r"(0), "r"(nw) : "memory");
+
+  // --- Compute Output O = P @ V ---
+  for (uint32_t i = tid_in_threadblock; i < seq; i += threads_per_threadblock) {
+    const __global float* sp = a->scratch + i * seq;
+    __global float* op = a->O + i * d;
+    for (uint32_t k = 0; k < d; k++) {
+      float acc = 0.0f;
+      // Again, unroll carefully to balance ILP and register pressure
+#pragma GCC unroll 4
+      for (uint32_t j = 0; j < seq; j++) {
+        acc += sp[j] * s_V[j * d + k];
+      }
+      op[k] = acc;
+    }
+  }
+  // Final sync not required as no further shared mem access
+}
+```

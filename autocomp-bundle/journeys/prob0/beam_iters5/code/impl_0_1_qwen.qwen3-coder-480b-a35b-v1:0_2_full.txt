@@ -1,0 +1,129 @@
+Looking at the requirements and constraints, I'll optimize the matmul kernel with tiling and shared memory staging while staying within the register limit.
+
+```cpp
+#include <stdint.h>
+
+// Forward declarations of harness-provided functions
+__attribute__((convergent)) static void mu_barrier(unsigned barrier_id, unsigned num_warps);
+inline uint32_t load32_shared(uint32_t address);
+inline void store_shared(uint32_t base, uint32_t offset, uint32_t data);
+
+#define MU_NUM_THREADS 16
+#define MU_BLOCK_SIZE(n) (2 * (n) * MU_NUM_THREADS)
+
+template <uint32_t TILE_M, uint32_t TILE_N, uint32_t TILE_K, uint32_t THREADBLOCK_WARPS>
+static inline void matmul_tiled_impl(void* raw_arg, uint32_t tid_in_threadblock, 
+                                     uint32_t threads_per_threadblock, uint32_t threadblock_id) {
+    auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+    
+    // Calculate thread position within threadblock
+    const uint32_t warp_id = tid_in_threadblock / MU_NUM_THREADS;
+    const uint32_t lane_id = tid_in_threadblock % MU_NUM_THREADS;
+    
+    // Tile positioning: each warp handles a TILE_M x TILE_N output tile
+    const uint32_t warps_per_row = TILE_N / MU_NUM_THREADS;
+    const uint32_t tile_row = warp_id / warps_per_row;
+    const uint32_t tile_col = warp_id % warps_per_row;
+    
+    // Shared memory allocation (using lower addresses)
+    const uint32_t smem_a_base = 0;
+    const uint32_t smem_b_base = smem_a_base + TILE_M * TILE_K * sizeof(float);
+    
+    // Thread's output position within its tile
+    const uint32_t local_row = lane_id / (TILE_N / MU_NUM_THREADS);
+    const uint32_t local_col = lane_id % (TILE_N / MU_NUM_THREADS);
+    
+    // Global output position
+    const uint32_t global_row = tile_row * TILE_M + local_row;
+    const uint32_t global_col = tile_col * TILE_N + local_col;
+    
+    float acc = 0.0f;
+    
+    // Loop over K dimension in TILE_K chunks
+    for (uint32_t k0 = 0; k0 < args->K; k0 += TILE_K) {
+        // Cooperatively load TILE_M x TILE_K chunk of A into shared memory
+        if (lane_id < TILE_K) {
+            for (uint32_t m = 0; m < TILE_M; m++) {
+                const uint32_t global_idx = (tile_row * TILE_M + m) * args->K + (k0 + lane_id);
+                const uint32_t smem_addr = smem_a_base + (m * TILE_K + lane_id) * sizeof(float);
+                if (global_idx < args->M * args->K) {
+                    store_shared(smem_a_base, (m * TILE_K + lane_id) * sizeof(float), 
+                                *((uint32_t*)&args->A[global_idx]));
+                }
+            }
+        }
+        
+        // Cooperatively load TILE_K x TILE_N chunk of B into shared memory
+        if (lane_id < TILE_N) {
+            for (uint32_t k = 0; k < TILE_K; k++) {
+                const uint32_t global_idx = (k0 + k) * args->N + (tile_col * TILE_N + lane_id);
+                const uint32_t smem_addr = smem_b_base + (k * TILE_N + lane_id) * sizeof(float);
+                if (global_idx < args->K * args->N) {
+                    store_shared(smem_b_base, (k * TILE_N + lane_id) * sizeof(float),
+                                *((uint32_t*)&args->B[global_idx]));
+                }
+            }
+        }
+        
+        // Synchronize to ensure all shared memory writes are visible
+        mu_barrier(0, THREADBLOCK_WARPS * 2); // Cross-core barrier
+        
+        // Compute partial product for this tile
+        if (global_row < args->M && global_col < args->N) {
+            for (uint32_t k = 0; k < TILE_K; k++) {
+                float a_val = *((float*)&load32_shared(smem_a_base + 
+                             (local_row * TILE_K + k) * sizeof(float)));
+                float b_val = *((float*)&load32_shared(smem_b_base + 
+                             (k * TILE_N + local_col) * sizeof(float)));
+                acc += a_val * b_val;
+            }
+        }
+        
+        // Synchronize before next iteration to avoid race conditions
+        mu_barrier(0, THREADBLOCK_WARPS * 2);
+    }
+    
+    // Write result
+    if (global_row < args->M && global_col < args->N) {
+        const uint32_t out_idx = global_row * args->N + global_col;
+        args->C[out_idx] = acc;
+    }
+}
+
+static inline void kernel_body(
+    void* raw_arg,
+    uint32_t tid_in_threadblock,
+    uint32_t threads_per_threadblock,
+    uint32_t threadblock_id
+) {
+    (void)threadblock_id;
+    
+    auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+    const uint32_t num_warps = threads_per_threadblock / MU_NUM_THREADS;
+    
+    // Specialize for common sizes to enable better optimizations
+    if (args->M == 64 && args->N == 64 && args->K == 64 && num_warps == 4) {
+        matmul_tiled_impl<8, 16, 16, 4>(raw_arg, tid_in_threadblock, 
+                                        threads_per_threadblock, threadblock_id);
+    } else if (args->M == 128 && args->N == 128 && args->K == 64 && num_warps == 4) {
+        matmul_tiled_impl<16, 16, 16, 4>(raw_arg, tid_in_threadblock, 
+                                         threads_per_threadblock, threadblock_id);
+    } else {
+        // Fallback to simple implementation with compile-time optimization
+        const uint32_t M = args->M;
+        const uint32_t N = args->N;
+        const uint32_t total = M * N;
+        
+        for (uint32_t idx = tid_in_threadblock; idx < total; idx += threads_per_threadblock) {
+            const uint32_t row = idx / N;
+            const uint32_t col = idx % N;
+            
+            float acc = 0.0f;
+            for (uint32_t k = 0; k < args->K; k++) {
+                acc += args->A[row * args->K + k] * args->B[k * args->N + col];
+            }
+            args->C[idx] = acc;
+        }
+    }
+}
+```

@@ -1,0 +1,119 @@
+Looking at the requirements and the hardware constraints, I need to create an optimized matrix multiplication kernel that respects the hard register limit of 31 distinct registers while maintaining good performance. Let me analyze the key constraints:
+
+1. **HARD LIMIT**: ≤ 31 distinct registers - this is the most critical constraint
+2. **Cross-core synchronization**: Must use `mu_barrier(0, 8)` for cooperative SMEM staging
+3. **Bank-conflict avoidance**: Need proper padding for SMEM accesses
+4. **Coalesced memory access**: Ensure efficient global memory usage
+
+Here's my optimized implementation:
+
+```cpp
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  (void)threads_per_threadblock;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t M = args->M, N = args->N, K = args->K;
+  
+  // Use fixed sizes for this optimized version (64x64xK)
+  const uint32_t TILE_M = 64;
+  const uint32_t TILE_N = 64;
+  const uint32_t BLOCK_K = 16;
+  
+  // Shared memory layout with padding to avoid bank conflicts
+  // A: 64 rows * 17 cols (padded from 16) = 1088 floats
+  // B: 16 rows * 65 cols (padded from 64) = 1040 floats
+  const uint32_t smem_a = 0;
+  const uint32_t smem_b = 1088 * 4; // 4352 bytes offset
+  
+  // Thread mapping: 128 threads -> 8 warps -> 4 threads per column, 32 rows
+  const uint32_t lane_id = tid_in_threadblock & 15;
+  const uint32_t warp_id = tid_in_threadblock >> 4;
+  const uint32_t th_x = warp_id & 3; // 0-3 for N dimension (4 warps)
+  const uint32_t th_y = (warp_id >> 2) * 16 + lane_id; // 0-63 for M dimension
+  
+  // Each thread processes 2x2 elements in the tile
+  const uint32_t global_m_base = (tid_in_threadblock / 32) * 2;
+  const uint32_t global_n_base = (tid_in_threadblock % 32) * 2;
+  
+  for (uint32_t by = 0; by < TILE_M; by += 32) {
+    for (uint32_t bx = 0; bx < TILE_N; bx += 32) {
+      float acc00 = 0.0f, acc01 = 0.0f, acc10 = 0.0f, acc11 = 0.0f;
+      
+      for (uint32_t k = 0; k < K; k += BLOCK_K) {
+        // Stage A tile (32x16) - each thread loads 4 elements
+        for (uint32_t i = 0; i < 4; i++) {
+          uint32_t idx = tid_in_threadblock + i * 128;
+          if (idx < 32 * 16) {
+            uint32_t am = by + (idx / 16);
+            uint32_t ak = k + (idx % 16);
+            if (am < M && ak < K) {
+              uint32_t smem_addr = smem_a + ((idx / 16) * 17 + (idx % 16)) * 4;
+              float val = args->A[am * K + ak];
+              store_shared(smem_addr, 0, __builtin_bit_cast(uint32_t, val));
+            }
+          }
+        }
+        
+        // Stage B tile (16x32) - each thread loads 4 elements
+        for (uint32_t i = 0; i < 4; i++) {
+          uint32_t idx = tid_in_threadblock + i * 128;
+          if (idx < 16 * 32) {
+            uint32_t bk = k + (idx / 32);
+            uint32_t bn = bx + (idx % 32);
+            if (bk < K && bn < N) {
+              uint32_t smem_addr = smem_b + ((idx / 32) * 65 + (idx % 32)) * 4;
+              float val = args->B[bk * N + bn];
+              store_shared(smem_addr, 0, __builtin_bit_cast(uint32_t, val));
+            }
+          }
+        }
+        
+        // Cross-core synchronization
+        mu_barrier(0, 8);
+        
+        // Compute 2x2 output tile per thread
+        for (uint32_t kk = 0; kk < BLOCK_K; kk++) {
+          // Load A values (2 rows)
+          uint32_t a_addr0 = smem_a + (((th_y & 1) * 16 + (kk & 15)) * 17 + (th_x * 8 + ((kk >> 4) * 4))) * 4;
+          uint32_t a_addr1 = smem_a + ((((th_y & 1) + 1) * 16 + (kk & 15)) * 17 + (th_x * 8 + ((kk >> 4) * 4))) * 4;
+          float a0 = __builtin_bit_cast(float, load32_shared(a_addr0));
+          float a1 = __builtin_bit_cast(float, load32_shared(a_addr1));
+          
+          // Load B values (2 cols)
+          uint32_t b_addr0 = smem_b + (kk * 65 + (th_y * 2 + 0)) * 4;
+          uint32_t b_addr1 = smem_b + (kk * 65 + (th_y * 2 + 1)) * 4;
+          float b0 = __builtin_bit_cast(float, load32_shared(b_addr0));
+          float b1 = __builtin_bit_cast(float, load32_shared(b_addr1));
+          
+          acc00 += a0 * b0;
+          acc01 += a0 * b1;
+          acc10 += a1 * b0;
+          acc11 += a1 * b1;
+        }
+        
+        // Synchronize before next iteration
+        mu_barrier(0, 8);
+      }
+      
+      // Write back results
+      uint32_t gm0 = by + (th_y & 1) * 16 + (th_x * 8);
+      uint32_t gm1 = by + ((th_y & 1) + 1) * 16 + (th_x * 8);
+      uint32_t gn = bx + th_y * 2;
+      
+      if (gm0 < M && gn < N) {
+        args->C[gm0 * N + gn] = acc00;
+        if (gn + 1 < N) args->C[gm0 * N + gn + 1] = acc01;
+      }
+      if (gm1 < M && gn < N) {
+        args->C[gm1 * N + gn] = acc10;
+        if (gn + 1 < N) args->C[gm1 * N + gn + 1] = acc11;
+      }
+    }
+  }
+}
+```

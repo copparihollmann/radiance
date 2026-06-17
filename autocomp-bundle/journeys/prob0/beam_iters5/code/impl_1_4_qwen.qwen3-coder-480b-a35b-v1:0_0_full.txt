@@ -1,0 +1,106 @@
+```cpp
+#include <stdint.h>
+
+struct KernelArgs {
+  float* A;
+  float* B;
+  float* C;
+  uint32_t M;
+  uint32_t N;
+  uint32_t K;
+};
+
+// Hardware configuration helper macros
+#define MU_NUM_THREADS 16
+#define MU_NUM_WARPS 8
+
+__attribute__((convergent))
+static void mu_barrier(unsigned barrier_id, unsigned num_warps) {
+    asm volatile ("vx_bar %0, %1" :: "r"(barrier_id), "r"(num_warps) : "memory");
+}
+
+inline void store_shared(uint32_t base, uint32_t offset, uint32_t data) {
+    asm volatile("sw.shared %2, %1(%0)" :: "r"(base), "I"(offset), "r"(data)
+                 : "memory");
+}
+
+inline uint32_t load32_shared(uint32_t address) {
+    uint32_t data;
+    asm volatile("lw.shared %0, %1(%2)" : "=r"(data) : "I"(0), "r"(address)
+                 : "memory");
+    return data;
+}
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  const uint32_t total_elements = args->M * args->N;
+  const uint32_t k_tiles = (args->K + 63) / 64; // Assuming K is divisible by 64 for simplicity, else needs padding logic
+  
+  // Shared memory layout:
+  // sA: 0 - 16383 (64*64*4 = 16KB)
+  // sB: 16384 - 32767 (64*65*4 = 16.25KB to avoid bank conflicts)
+  
+  const uint32_t sA_base = 0;
+  const uint32_t sB_base = 16384;
+  
+  for (uint32_t idx = tid_in_threadblock; idx < total_elements; idx += threads_per_threadblock) {
+    const uint32_t row = idx / args->N;
+    const uint32_t col = idx % args->N;
+    
+    float acc = 0.0f;
+    
+    // Iterate over K in chunks of 64
+    for (uint32_t k_tile = 0; k_tile < k_tiles; k_tile++) {
+      // 1. Cooperatively load tile of A into sA
+      // Each thread loads 32 elements (64*64 / 128 = 32)
+      for (uint32_t i = 0; i < 32; i++) {
+        uint32_t local_k = (tid_in_threadblock * 32 + i) % 64;
+        uint32_t local_row = (tid_in_threadblock * 32 + i) / 64;
+        uint32_t global_idx = (row * 64 + local_row) * args->K + (k_tile * 64 + local_k);
+        if (global_idx < args->M * args->K) { // Boundary check
+          float val = args->A[global_idx];
+          uint32_t smem_addr = sA_base + (local_row * 64 + local_k) * 4;
+          store_shared(0, smem_addr, __builtin_bit_cast(uint32_t, val));
+        }
+      }
+
+      // 2. Cooperatively load transposed tile of B into sB
+      // Each thread loads 32 elements
+      for (uint32_t i = 0; i < 32; i++) {
+        uint32_t local_k = (tid_in_threadblock * 32 + i) % 64;
+        uint32_t local_col = (tid_in_threadblock * 32 + i) / 64;
+        uint32_t global_idx = (k_tile * 64 + local_k) * args->N + (col * 64 + local_col);
+        if (global_idx < args->K * args->N) { // Boundary check
+          float val = args->B[global_idx];
+          // Store transposed with padding: B^T[j][i] -> sB[i * 65 + j]
+          uint32_t smem_addr = sB_base + (local_col * 65 + local_k) * 4;
+          store_shared(0, smem_addr, __builtin_bit_cast(uint32_t, val));
+        }
+      }
+      
+      // Cross-core barrier to ensure sA and sB are fully loaded
+      mu_barrier(0, 8); 
+      
+      // 3. Compute partial product using SMEM
+      uint32_t ptr_A = sA_base + ((row % 64) * 64) * 4;
+      uint32_t ptr_B = sB_base + (col % 64); // Will be adjusted in loop
+      
+      for (uint32_t k = 0; k < 64; k++) {
+        float a = __builtin_bit_cast(float, load32_shared(ptr_A + k * 4));
+        float b = __builtin_bit_cast(float, load32_shared(ptr_B * 4)); 
+        acc += a * b;
+        ptr_B += 65; // Move to next row in transposed B
+      }
+    }
+    
+    args->C[idx] = acc;
+  }
+}
+```

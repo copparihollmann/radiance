@@ -1,0 +1,209 @@
+Looking at the requirements and the hardware constraints, I need to create a highly optimized matmul kernel that stays within the 31 distinct register limit while maximizing performance. Let me analyze the key constraints:
+
+1. **Register Wall**: ≤ 31 distinct registers (critical!)
+2. **Cross-core synchronization**: Must use `mu_barrier(0, 8)` for cross-core SMEM visibility
+3. **FP32 throughput**: 0.5 ops/thread/cycle (bottleneck)
+4. **SMEM bandwidth**: 256 B/cycle (use aggressively)
+
+The strategy will be to:
+- Use a 2D threadblock partitioning (4×32 threads covering 64×32 output tile)
+- Each thread computes 4 vertical elements (4 accumulators)  
+- Stage tiles in SMEM with proper bank conflict avoidance
+- Minimize register usage by avoiding deep unrolling/register tiling
+
+```cpp
+#include <stdint.h>
+
+#define MU_NUM_THREADS 16
+
+struct KernelArgs {
+  float* A;
+  float* B;
+  float* C;
+  uint32_t M;
+  uint32_t N;
+  uint32_t K;
+};
+
+static inline float bits_to_float(uint32_t b) { union { uint32_t u; float f; } c; c.u = b; return c.f; }
+static inline uint32_t float_to_bits(float f) { union { uint32_t u; float f; } c; c.f = f; return c.u; }
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t M = args->M;
+  const uint32_t N = args->N;
+  const uint32_t K = args->K;
+
+  const uint32_t tid = tid_in_threadblock;
+  const uint32_t num_warps = threads_per_threadblock / MU_NUM_THREADS; // 8 warps
+
+  // Shared memory layout with padding to avoid bank conflicts
+  // A_tile: 16 rows × 17 cols (pad 1 to avoid 16-way conflicts) = 272 floats
+  // B_tile: 16 rows × 33 cols (pad 1 to avoid 16-way conflicts) = 528 floats
+  const uint32_t smem_a_base = 0;
+  const uint32_t smem_b_base = 272 * 4;  // 1088 bytes offset
+
+  // Thread mapping: 4 rows × 32 columns per threadblock
+  const uint32_t thread_row = tid >> 5;     // tid / 32 -> 0-3
+  const uint32_t thread_col = tid & 31;     // tid % 32 -> 0-31
+
+  // Each thread processes 4 consecutive rows
+  const uint32_t base_row = thread_row << 2; // thread_row * 4
+
+  // Process output in 64x32 tiles
+  for (uint32_t tile_m = 0; tile_m < M; tile_m += 64) {
+    for (uint32_t tile_n = 0; tile_n < N; tile_n += 32) {
+      // Bounds checking
+      if (tile_m >= M || tile_n >= N) continue;
+      
+      float acc0 = 0.0f;
+      float acc1 = 0.0f;
+      float acc2 = 0.0f;
+      float acc3 = 0.0f;
+
+      // Process K in tiles of 16
+      for (uint32_t k = 0; k < K; k += 16) {
+        // Cooperatively load A tile (16x16) into SMEM
+        // Each thread loads 2 elements
+        uint32_t local_idx = tid;
+        if (local_idx < 128) {
+          uint32_t a_row = local_idx >> 4;  // local_idx / 16
+          uint32_t a_col = local_idx & 15;  // local_idx % 16
+          
+          uint32_t global_row = tile_m + a_row;
+          uint32_t global_col = k + a_col;
+          
+          if (global_row < M && global_col < K) {
+            uint32_t addr = smem_a_base + (a_row * 17 + a_col) * 4;
+            float val = args->A[global_row * K + global_col];
+            store_shared(addr, 0, float_to_bits(val));
+          } else {
+            uint32_t addr = smem_a_base + (a_row * 17 + a_col) * 4;
+            store_shared(addr, 0, float_to_bits(0.0f));
+          }
+        }
+
+        local_idx = tid + 128;
+        if (local_idx < 256) {
+          uint32_t a_row = local_idx >> 4;  // local_idx / 16
+          uint32_t a_col = local_idx & 15;  // local_idx % 16
+          
+          uint32_t global_row = tile_m + a_row;
+          uint32_t global_col = k + a_col;
+          
+          if (global_row < M && global_col < K) {
+            uint32_t addr = smem_a_base + (a_row * 17 + a_col) * 4;
+            float val = args->A[global_row * K + global_col];
+            store_shared(addr, 0, float_to_bits(val));
+          } else {
+            uint32_t addr = smem_a_base + (a_row * 17 + a_col) * 4;
+            store_shared(addr, 0, float_to_bits(0.0f));
+          }
+        }
+
+        // Cooperatively load B tile (16x32) into SMEM
+        // Each thread loads 4 elements (one per row)
+        if (thread_col < 32) {
+          for (uint32_t b_row = 0; b_row < 16; b_row += 4) {
+            uint32_t global_k = k + b_row;
+            uint32_t global_n = tile_n + thread_col;
+            
+            uint32_t smem_row = b_row;
+            uint32_t addr = smem_b_base + (smem_row * 33 + thread_col) * 4;
+            
+            if (global_k < K && global_n < N) {
+              float val = args->B[global_k * N + global_n];
+              store_shared(addr, 0, float_to_bits(val));
+            } else {
+              store_shared(addr, 0, float_to_bits(0.0f));
+            }
+            
+            global_k = k + b_row + 1;
+            smem_row = b_row + 1;
+            addr = smem_b_base + (smem_row * 33 + thread_col) * 4;
+            
+            if (global_k < K && global_n < N) {
+              float val = args->B[global_k * N + global_n];
+              store_shared(addr, 0, float_to_bits(val));
+            } else {
+              store_shared(addr, 0, float_to_bits(0.0f));
+            }
+            
+            global_k = k + b_row + 2;
+            smem_row = b_row + 2;
+            addr = smem_b_base + (smem_row * 33 + thread_col) * 4;
+            
+            if (global_k < K && global_n < N) {
+              float val = args->B[global_k * N + global_n];
+              store_shared(addr, 0, float_to_bits(val));
+            } else {
+              store_shared(addr, 0, float_to_bits(0.0f));
+            }
+            
+            global_k = k + b_row + 3;
+            smem_row = b_row + 3;
+            addr = smem_b_base + (smem_row * 33 + thread_col) * 4;
+            
+            if (global_k < K && global_n < N) {
+              float val = args->B[global_k * N + global_n];
+              store_shared(addr, 0, float_to_bits(val));
+            } else {
+              store_shared(addr, 0, float_to_bits(0.0f));
+            }
+          }
+        }
+
+        // Synchronize to make SMEM writes visible to all threads
+        mu_barrier(0, num_warps);
+
+        // Compute partial products
+        for (uint32_t kk = 0; kk < 16; kk++) {
+          // Load B value for this column and k
+          uint32_t b_addr = smem_b_base + (kk * 33 + thread_col) * 4;
+          float b_val = bits_to_float(load32_shared(b_addr));
+          
+          // Load A values for this k and our 4 rows
+          uint32_t a_addr0 = smem_a_base + ((base_row + 0) * 17 + kk) * 4;
+          uint32_t a_addr1 = smem_a_base + ((base_row + 1) * 17 + kk) * 4;
+          uint32_t a_addr2 = smem_a_base + ((base_row + 2) * 17 + kk) * 4;
+          uint32_t a_addr3 = smem_a_base + ((base_row + 3) * 17 + kk) * 4;
+          
+          acc0 += bits_to_float(load32_shared(a_addr0)) * b_val;
+          acc1 += bits_to_float(load32_shared(a_addr1)) * b_val;
+          acc2 += bits_to_float(load32_shared(a_addr2)) * b_val;
+          acc3 += bits_to_float(load32_shared(a_addr3)) * b_val;
+        }
+
+        // Synchronize before next iteration
+        mu_barrier(0, num_warps);
+      }
+
+      // Write back results
+      uint32_t out_row0 = tile_m + base_row + 0;
+      uint32_t out_row1 = tile_m + base_row + 1;
+      uint32_t out_row2 = tile_m + base_row + 2;
+      uint32_t out_row3 = tile_m + base_row + 3;
+      uint32_t out_col = tile_n + thread_col;
+      
+      if (out_row0 < M && out_col < N) {
+        args->C[out_row0 * N + out_col] = acc0;
+      }
+      if (out_row1 < M && out_col < N) {
+        args->C[out_row1 * N + out_col] = acc1;
+      }
+      if (out_row2 < M && out_col < N) {
+        args->C[out_row2 * N + out_col] = acc2;
+      }
+      if (out_row3 < M && out_col < N) {
+        args->C[out_row3 * N + out_col] = acc3;
+      }
+    }
+  }
+}
+```

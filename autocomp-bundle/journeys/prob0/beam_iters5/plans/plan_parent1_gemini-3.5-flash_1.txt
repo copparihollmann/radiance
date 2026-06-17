@@ -1,0 +1,101 @@
+An elegant and highly effective strategy to optimize this kernel while strictly adhering to the 31-register hard constraint is **Cooperative Shared-Memory Tiling with Transposed Padding and Pointer-Increment Indexing**.
+
+### How This Strategy Improves Performance
+
+1. **Full Shared-Memory Staging**: Since the matrices $A$ and $B$ are only 16 KiB each ($64 \times 64 \times 4$ bytes), we can stage both matrices entirely into the 128 KiB SMEM. This completely eliminates 400-cycle global memory DRAM loads during the inner products, replacing them with extremely low-latency (2-cycle) SMEM loads.
+2. **Conflict-Free Transposed Layout for $B$**: We store matrix $B$ transposed in SMEM with a padded stride of 65 elements per row (instead of 64). Storing $B$ transposed ensures that when threads in a warp read $B[k, \text{col}]$, they access consecutive memory banks. Padding the row stride by 1 element ensures that all 16 threads in a warp map to distinct SMEM banks, completely eliminating SMEM bank conflicts.
+3. **Register-Efficient Pointer-Increment Indexing**: Instead of performing costly divisions, modulos, or multiplications inside the loops, we precalculate the starting SMEM offsets outside the loops and simply increment the pointers using lightweight additions (e.g., `smem_addr_B += 8` and `addr_A += 512`). This keeps the instruction count minimal, maximizes Instruction-Level Parallelism (ILP), and maintains an incredibly lean register footprint of ~11 registers—well below the 31-register hardware limit.
+
+---
+
+### Optimized Code Implementation
+
+```cpp
+#include <stdint.h>
+
+struct KernelArgs {
+  float* A;
+  float* B;
+  float* C;
+  uint32_t M;
+  uint32_t N;
+  uint32_t K;
+};
+
+// Hardware configuration helper macros
+#define MU_NUM_THREADS 16
+#define MU_NUM_WARPS 8
+
+__attribute__((convergent))
+static void mu_barrier(unsigned barrier_id, unsigned num_warps) {
+    asm volatile ("vx_bar %0, %1" :: "r"(barrier_id), "r"(num_warps) : "memory");
+}
+
+inline void store_shared(uint32_t base, uint32_t offset, uint32_t data) {
+    asm volatile("sw.shared %2, %1(%0)" :: "r"(base), "I"(offset), "r"(data)
+                 : "memory");
+}
+
+inline uint32_t load32_shared(uint32_t address) {
+    uint32_t data;
+    asm volatile("lw.shared %0, %1(%2)" : "=r"(data) : "I"(0), "r"(address)
+                 : "memory");
+    return data;
+}
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  (void)threads_per_threadblock;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  // 1. Cooperative load of Matrix A to SMEM (Base address 0)
+  for (uint32_t i = tid_in_threadblock; i < 4096; i += 128) {
+    float val = args->A[i];
+    store_shared(i * 4, 0, __builtin_bit_cast(uint32_t, val));
+  }
+
+  // 2. Cooperative load of Matrix B (transposed and padded to stride 65 in SMEM)
+  // B_T is stored at SMEM base address 16384.
+  uint32_t c = tid_in_threadblock & 63;
+  uint32_t r = tid_in_threadblock >> 6;
+  uint32_t smem_addr_B = 16384 + (c * 65 + r) * 4;
+
+  for (uint32_t i = tid_in_threadblock; i < 4096; i += 128) {
+    float val = args->B[i];
+    store_shared(smem_addr_B, 0, __builtin_bit_cast(uint32_t, val));
+    smem_addr_B += 8; // r increases by 2 each step, which increases address by 2 * 4 = 8 bytes
+  }
+
+  // Use cross-core barrier (ID 0) to ensure both cores see the staged SMEM data
+  mu_barrier(0, 8);
+
+  // 3. Compute C using register-efficient pointer increments
+  uint32_t col = tid_in_threadblock & 63;
+  uint32_t row = tid_in_threadblock >> 6;
+  uint32_t addr_A = row * 256;          // row * 64 * 4
+  uint32_t addr_B = 16384 + col * 260;  // 16384 + col * 65 * 4
+
+  for (uint32_t idx = tid_in_threadblock; idx < 4096; idx += 128) {
+    float acc = 0.0f;
+    uint32_t ptr_A = addr_A;
+    uint32_t ptr_B = addr_B;
+
+    #pragma GCC unroll 2
+    for (uint32_t k = 0; k < 64; k++) {
+      float a = __builtin_bit_cast(float, load32_shared(ptr_A));
+      float b = __builtin_bit_cast(float, load32_shared(ptr_B));
+      acc += a * b;
+      ptr_A += 4;
+      ptr_B += 4;
+    }
+
+    args->C[idx] = acc;
+    addr_A += 512; // row increases by 2 each step, which increases address by 2 * 64 * 4 = 512 bytes
+  }
+}
+```

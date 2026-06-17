@@ -1,0 +1,113 @@
+#include <vx_intrinsics.h>
+#include <mu_intrinsics.h>
+#include <mu_schedule.h>
+#include <shared_mem.h>
+#include <math.h>
+#include <stdint.h>
+
+static inline float bits_to_float(uint32_t b) { 
+  union { uint32_t u; float f; } c; 
+  c.u = b; 
+  return c.f; 
+}
+
+static inline uint32_t float_to_bits(float f) { 
+  union { uint32_t u; float f; } c; 
+  c.f = f; 
+  return c.u; 
+}
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t seq = 96;
+  const uint32_t d = 64;
+  const uint32_t num_warps = threads_per_threadblock / MU_NUM_THREADS;
+  const float scale = 0.125f;
+
+  // Shared Memory Layout (Total = ~111.36 KB)
+  const uint32_t smem_Q = 0;             // 96 * 64 * 4 = 24,576 bytes
+  const uint32_t smem_K = 24576;         // 96 * 65 * 4 = 24,960 bytes (padded)
+  const uint32_t smem_V = 49536;         // 96 * 64 * 4 = 24,576 bytes
+  const uint32_t smem_scratch = 74112;   // 96 * 97 * 4 = 37,248 bytes (padded)
+
+  // Phase 0: Stage Q, K, V into SMEM
+  for (uint32_t idx = tid_in_threadblock; idx < seq * d; idx += threads_per_threadblock) {
+    const uint32_t r = idx / d;
+    const uint32_t c = idx % d;
+    store_shared(smem_Q + idx * 4, 0, float_to_bits(a->Q[idx]));
+    store_shared(smem_K + (r * 65 + c) * 4, 0, float_to_bits(a->K[idx]));
+    store_shared(smem_V + idx * 4, 0, float_to_bits(a->V[idx]));
+  }
+
+  // Cross-core barrier after loading inputs
+  mu_barrier(0, num_warps);
+
+  // Phase 1: Compute QK^T (scaled scores)
+  for (uint32_t idx = tid_in_threadblock; idx < seq * seq; idx += threads_per_threadblock) {
+    const uint32_t i = idx / seq;
+    const uint32_t j = idx % seq;
+    float acc = 0.0f;
+    const uint32_t q_base = smem_Q + i * d * 4;
+    const uint32_t k_base = smem_K + j * 65 * 4;
+
+    for (uint32_t k = 0; k < d; k++) {
+      float q_val = bits_to_float(load32_shared(q_base + k * 4));
+      float k_val = bits_to_float(load32_shared(k_base + k * 4));
+      acc += q_val * k_val;
+    }
+    store_shared(smem_scratch + (i * 97 + j) * 4, 0, float_to_bits(acc * scale));
+  }
+
+  // Cross-core barrier after score computation
+  mu_barrier(0, num_warps);
+
+  // Phase 2: Softmax per row
+  for (uint32_t row = tid_in_threadblock; row < seq; row += threads_per_threadblock) {
+    const uint32_t scratch_row_base = smem_scratch + row * 97 * 4;
+    float m = bits_to_float(load32_shared(scratch_row_base));
+
+    for (uint32_t j = 1; j < seq; j++) {
+      float v = bits_to_float(load32_shared(scratch_row_base + j * 4));
+      if (v > m) m = v;
+    }
+
+    float sum = 0.0f;
+    for (uint32_t j = 0; j < seq; j++) {
+      float diff = bits_to_float(load32_shared(scratch_row_base + j * 4)) - m;
+      float e = mu_exp(diff);
+      store_shared(scratch_row_base + j * 4, 0, float_to_bits(e));
+      sum += e;
+    }
+
+    const float inv_sum = 1.0f / sum;
+    for (uint32_t j = 0; j < seq; j++) {
+      float val = bits_to_float(load32_shared(scratch_row_base + j * 4));
+      store_shared(scratch_row_base + j * 4, 0, float_to_bits(val * inv_sum));
+    }
+  }
+
+  // Final cross-core barrier before output phase
+  mu_barrier(0, num_warps);
+
+  // Phase 3: Output projection O = P @ V
+  for (uint32_t idx = tid_in_threadblock; idx < seq * d; idx += threads_per_threadblock) {
+    const uint32_t i = idx / d;
+    const uint32_t k = idx % d;
+    float acc = 0.0f;
+    const uint32_t p_base = smem_scratch + i * 97 * 4;
+    const uint32_t v_col_base = smem_V + k * 4;
+
+    for (uint32_t j = 0; j < seq; j++) {
+      float p_val = bits_to_float(load32_shared(p_base + j * 4));
+      float v_val = bits_to_float(load32_shared(v_col_base + j * 64 * 4));
+      acc += p_val * v_val;
+    }
+    a->O[idx] = acc;
+  }
+}

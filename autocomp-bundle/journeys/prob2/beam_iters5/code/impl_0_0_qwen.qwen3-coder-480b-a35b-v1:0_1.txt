@@ -1,0 +1,137 @@
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  const uint32_t seq = 64;
+  const uint32_t d = 64;
+  const uint32_t pad = 16;
+
+  // Shared memory layout
+  const uint32_t smem_q_base = 0;
+  const uint32_t smem_k_base = smem_q_base + seq * d * 4;
+  const uint32_t smem_v_base = smem_k_base + d * (seq + pad) * 4;
+  const uint32_t smem_p_base = smem_v_base + d * (seq + pad) * 4;
+
+  const __global float* Q = a->Q;
+  const __global float* K = a->K;
+  const __global float* V = a->V;
+  float* O = a->O;
+  (void)a->scratch; // Not used in this optimized version
+
+  // 1. Cooperative Q load and scale
+  for (uint32_t i = tid_in_threadblock; i < seq * d; i += threads_per_threadblock) {
+    float val = Q[i] * 0.125f;
+    uint32_t addr = smem_q_base + i * 4;
+    asm volatile("sw.shared %1, 0(%0)" :: "r"(addr), "r"(*reinterpret_cast<uint32_t*>(&val)) : "memory");
+  }
+
+  // 2. Cooperative K load (transposed)
+  for (uint32_t i = tid_in_threadblock; i < seq * d; i += threads_per_threadblock) {
+    uint32_t row = i / d;
+    uint32_t col = i % d;
+    uint32_t smem_addr = smem_k_base + (col * (seq + pad) + row) * 4;
+    asm volatile("sw.shared %1, 0(%0)" :: "r"(smem_addr), "r"(*reinterpret_cast<const uint32_t*>(&K[i])) : "memory");
+  }
+
+  // 3. Cooperative V load (transposed)
+  for (uint32_t i = tid_in_threadblock; i < seq * d; i += threads_per_threadblock) {
+    uint32_t row = i / d;
+    uint32_t col = i % d;
+    uint32_t smem_addr = smem_v_base + (col * (seq + pad) + row) * 4;
+    asm volatile("sw.shared %1, 0(%0)" :: "r"(smem_addr), "r"(*reinterpret_cast<const uint32_t*>(&V[i])) : "memory");
+  }
+
+  // Cross-core sync after staging
+  mu_barrier(0, 8);
+
+  // 4. Compute S = Q * K^T
+  for (uint32_t idx = tid_in_threadblock; idx < seq * seq; idx += threads_per_threadblock) {
+    uint32_t i = idx / seq; // Row in Q
+    uint32_t j = idx % seq; // Col in K^T (Row in K)
+
+    float acc = 0.0f;
+    uint32_t q_row_addr = smem_q_base + i * d * 4;
+    uint32_t k_col_addr = smem_k_base + j * (seq + pad) * 4;
+
+    #pragma GCC unroll 4
+    for (uint32_t k = 0; k < d; k++) {
+      uint32_t q_addr = q_row_addr + k * 4;
+      uint32_t k_addr = k_col_addr + k * 4;
+      float q_val, k_val;
+      asm volatile("lw.shared %0, 0(%1)" : "=r"(*reinterpret_cast<uint32_t*>(&q_val)) : "r"(q_addr) : "memory");
+      asm volatile("lw.shared %0, 0(%1)" : "=r"(*reinterpret_cast<uint32_t*>(&k_val)) : "r"(k_addr) : "memory");
+      acc += q_val * k_val;
+    }
+
+    uint32_t s_addr = smem_p_base + idx * 4;
+    asm volatile("sw.shared %1, 0(%0)" :: "r"(s_addr), "r"(*reinterpret_cast<uint32_t*>(&acc)) : "memory");
+  }
+
+  // Sync before softmax
+  mu_barrier(0, 8);
+
+  // 5. Softmax (only first 64 threads participate)
+  if (tid_in_threadblock < seq) {
+    uint32_t row = tid_in_threadblock;
+    uint32_t row_addr = smem_p_base + row * seq * 4;
+
+    // Find max
+    float max_val;
+    asm volatile("lw.shared %0, 0(%1)" : "=r"(*reinterpret_cast<uint32_t*>(&max_val)) : "r"(row_addr) : "memory");
+    for (uint32_t j = 1; j < seq; j++) {
+      float val;
+      asm volatile("lw.shared %0, 0(%1)" : "=r"(*reinterpret_cast<uint32_t*>(&val)) : "r"(row_addr + j * 4) : "memory");
+      if (val > max_val) max_val = val;
+    }
+
+    // Compute exp and sum
+    float sum = 0.0f;
+    for (uint32_t j = 0; j < seq; j++) {
+      float val;
+      asm volatile("lw.shared %0, 0(%1)" : "=r"(*reinterpret_cast<uint32_t*>(&val)) : "r"(row_addr + j * 4) : "memory");
+      float exp_val = mu_exp(val - max_val);
+      sum += exp_val;
+      asm volatile("sw.shared %1, 0(%0)" :: "r"(row_addr + j * 4), "r"(*reinterpret_cast<uint32_t*>(&exp_val)) : "memory");
+    }
+
+    // Normalize and write to global memory
+    float inv_sum = 1.0f / sum;
+    for (uint32_t j = 0; j < seq; j++) {
+      float val;
+      asm volatile("lw.shared %0, 0(%1)" : "=r"(*reinterpret_cast<uint32_t*>(&val)) : "r"(row_addr + j * 4) : "memory");
+      float norm_val = val * inv_sum;
+      asm volatile("sw.shared %1, 0(%0)" :: "r"(row_addr + j * 4), "r"(*reinterpret_cast<uint32_t*>(&norm_val)) : "memory");
+      O[row * seq + j] = norm_val;
+    }
+  } else {
+    asm volatile("nop");
+  }
+
+  // Sync before final GEMM
+  mu_barrier(0, 8);
+
+  // 6. Compute O = P * V
+  for (uint32_t idx = tid_in_threadblock; idx < seq * d; idx += threads_per_threadblock) {
+    uint32_t i = idx / d; // Row in P
+    uint32_t j = idx % d; // Col in V
+
+    float acc = 0.0f;
+    uint32_t p_row_addr = smem_p_base + i * seq * 4;
+    uint32_t v_col_addr = smem_v_base + j * (seq + pad) * 4;
+
+    #pragma GCC unroll 4
+    for (uint32_t k = 0; k < seq; k++) {
+      float p_val, v_val;
+      asm volatile("lw.shared %0, 0(%1)" : "=r"(*reinterpret_cast<uint32_t*>(&p_val)) : "r"(p_row_addr + k * 4) : "memory");
+      asm volatile("lw.shared %0, 0(%1)" : "=r"(*reinterpret_cast<uint32_t*>(&v_val)) : "r"(v_col_addr + k * 4) : "memory");
+      acc += p_val * v_val;
+    }
+
+    O[idx] = acc;
+  }
+}

@@ -1,0 +1,104 @@
+```cpp
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t seq = a->seq;
+  const uint32_t d = a->d;
+  const uint32_t nw = threads_per_threadblock / MU_NUM_THREADS;
+
+  // Shared memory layout:
+  // s_K/V: 0x00000 - 0x07FFF (32 KiB = 8192 floats)
+  // s_scratch: 0x08000 - 0x17FFF (64 KiB = 16384 floats)
+  // s_Q/O: 0x18000 - 0x1FFFF (32 KiB = 8192 floats)
+  const uint32_t s_K_base = 0x00000;
+  const uint32_t s_scratch_base = 0x08000;
+  const uint32_t s_Q_base = 0x18000;
+
+  const __global float* Q = a->Q;
+  const __global float* K = a->K;
+  const __global float* V = a->V;
+  __global float* O = a->O;
+
+  // Phase 1: Load Q and K into shared memory
+  for (uint32_t i = tid_in_threadblock; i < seq * d; i += threads_per_threadblock) {
+    store_shared(s_Q_base, i * 4, Q[i]);
+    store_shared(s_K_base, i * 4, K[i]);
+  }
+  mu_barrier(0, nw); // Cross-core sync after loading Q and K
+
+  // Phase 1: Compute S = scale * Q * K^T in shared memory
+  // Each thread computes one element of the output matrix
+  for (uint32_t idx = tid_in_threadblock; idx < seq * seq; idx += threads_per_threadblock) {
+    uint32_t i = idx / seq; // row
+    uint32_t j = idx % seq; // col
+    
+    float acc = 0.0f;
+    for (uint32_t k = 0; k < d; k++) {
+      float q_val = load32_shared(s_Q_base + (i * d + k) * 4);
+      float k_val = load32_shared(s_K_base + (j * d + k) * 4); // Note: K is not transposed in memory
+      acc += q_val * k_val;
+    }
+    store_shared(s_scratch_base, idx * 4, acc * 0.125f);
+  }
+  mu_barrier(0, nw); // Cross-core sync after computing S
+
+  // Phase 2: Softmax in shared memory
+  for (uint32_t i = tid_in_threadblock; i < seq; i += threads_per_threadblock) {
+    // Find max
+    float m = load32_shared(s_scratch_base + (i * seq + 0) * 4);
+    for (uint32_t j = 1; j < seq; j++) {
+      float val = load32_shared(s_scratch_base + (i * seq + j) * 4);
+      if (val > m) m = val;
+    }
+
+    // Compute exp and sum
+    float sum = 0.0f;
+    for (uint32_t j = 0; j < seq; j++) {
+      float val = load32_shared(s_scratch_base + (i * seq + j) * 4);
+      float e = mu_exp(val - m);
+      store_shared(s_scratch_base, (i * seq + j) * 4, e);
+      sum += e;
+    }
+
+    // Normalize
+    float inv_sum = 1.0f / sum;
+    for (uint32_t j = 0; j < seq; j++) {
+      float val = load32_shared(s_scratch_base + (i * seq + j) * 4);
+      store_shared(s_scratch_base, (i * seq + j) * 4, val * inv_sum);
+    }
+  }
+  mu_barrier(0, nw); // Cross-core sync after softmax
+
+  // Phase 3: Load V into shared memory (reuse s_K space)
+  for (uint32_t i = tid_in_threadblock; i < seq * d; i += threads_per_threadblock) {
+    store_shared(s_K_base, i * 4, V[i]);
+  }
+  mu_barrier(0, nw); // Cross-core sync after loading V
+
+  // Phase 3: Compute O = P * V in shared memory
+  // Each thread computes one element of the output matrix
+  for (uint32_t idx = tid_in_threadblock; idx < seq * d; idx += threads_per_threadblock) {
+    uint32_t i = idx / d; // row
+    uint32_t k = idx % d; // col
+
+    float acc = 0.0f;
+    for (uint32_t j = 0; j < seq; j++) {
+      float p_val = load32_shared(s_scratch_base + (i * seq + j) * 4);
+      float v_val = load32_shared(s_K_base + (j * d + k) * 4);
+      acc += p_val * v_val;
+    }
+    store_shared(s_Q_base, idx * 4, acc); // Store in s_O space
+  }
+  mu_barrier(0, nw); // Cross-core sync after computing O
+
+  // Phase 3: Write O from shared memory to global memory
+  for (uint32_t i = tid_in_threadblock; i < seq * d; i += threads_per_threadblock) {
+    O[i] = load32_shared(s_Q_base + i * 4);
+  }
+}
+```

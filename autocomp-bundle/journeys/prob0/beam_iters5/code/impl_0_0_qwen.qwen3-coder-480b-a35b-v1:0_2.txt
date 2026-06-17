@@ -1,0 +1,102 @@
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  const uint32_t M = args->M;
+  const uint32_t N = args->N;
+  const uint32_t K = args->K;
+
+  // Shared memory allocation
+  constexpr uint32_t PAD = 16; // To avoid bank conflicts (64 + 16 = 80, not power of 2)
+  constexpr uint32_t TILE_DIM = 64;
+  constexpr uint32_t SMEM_A_OFFSET = 0;
+  constexpr uint32_t SMEM_B_OFFSET = (TILE_DIM * (TILE_DIM + PAD)) * sizeof(float); // After A
+
+  // Pointers to shared memory regions
+  float* smem_A = reinterpret_cast<float*>(SMEM_A_OFFSET);
+  float* smem_B_transposed = reinterpret_cast<float*>(SMEM_B_OFFSET);
+
+  // Input matrix pointers
+  const __global float* A = args->A;
+  const __global float* B = args->B;
+  float* __global C = args->C;
+
+  // Total elements in tile
+  const uint32_t elems_per_tile = TILE_DIM * TILE_DIM;
+  const uint32_t total_outputs = M * N;
+
+  // Iterate over output blocks in C
+  for (uint32_t c_idx_base = 0; c_idx_base < total_outputs; c_idx_base += elems_per_tile) {
+    const uint32_t c_row_base = (c_idx_base / N);
+    const uint32_t c_col_base = (c_idx_base % N);
+
+    // Bounds check: stop if out of bounds (only first iteration matters if full tiles)
+    if (c_row_base >= M || c_col_base >= N) break;
+
+    // Load A tile (size: TILE_DIM x TILE_DIM) cooperatively into shared memory
+    for (uint32_t i = tid_in_threadblock; i < elems_per_tile; i += threads_per_threadblock) {
+      const uint32_t local_row = i / TILE_DIM;
+      const uint32_t local_k = i % TILE_DIM;
+      const uint32_t global_row = c_row_base + local_row;
+      const uint32_t global_k = local_k;
+      
+      float val = 0.0f;
+      if (global_row < M && global_k < K) {
+        val = A[global_row * K + global_k];
+      }
+      const uint32_t smem_addr = local_row * (TILE_DIM + PAD) + local_k;
+      store_shared(reinterpret_cast<uint32_t>(smem_A), smem_addr * sizeof(float), __builtin_bit_cast(uint32_t, val));
+    }
+
+    // Load B tile (transposed) (size: TILE_DIM x TILE_DIM) cooperatively into shared memory
+    for (uint32_t i = tid_in_threadblock; i < elems_per_tile; i += threads_per_threadblock) {
+      const uint32_t local_k = i / TILE_DIM;
+      const uint32_t local_col = i % TILE_DIM;
+      const uint32_t global_k = local_k;
+      const uint32_t global_col = c_col_base + local_col;
+
+      float val = 0.0f;
+      if (global_k < K && global_col < N) {
+        val = B[global_k * N + global_col];
+      }
+      const uint32_t smem_addr = local_col * (TILE_DIM + PAD) + local_k;
+      store_shared(reinterpret_cast<uint32_t>(smem_B_transposed), smem_addr * sizeof(float), __builtin_bit_cast(uint32_t, val));
+    }
+
+    // Cross-core synchronization after writing to shared memory
+    mu_barrier(0, threads_per_threadblock / MU_NUM_THREADS); // ID 0 to span both cores
+
+    // Compute partial products for each thread-assigned output element
+    for (uint32_t idx = tid_in_threadblock; idx < elems_per_tile; idx += threads_per_threadblock) {
+      const uint32_t c_local_row = idx / TILE_DIM;
+      const uint32_t c_local_col = idx % TILE_DIM;
+      const uint32_t global_row = c_row_base + c_local_row;
+      const uint32_t global_col = c_col_base + c_local_col;
+
+      if (global_row < M && global_col < N) {
+        float acc = 0.0f;
+        
+        // Dot product along the reduced dimension
+        for (uint32_t k = 0; k < TILE_DIM; ++k) {
+          float a_val = load32_shared(
+              reinterpret_cast<uint32_t>(&smem_A[c_local_row * (TILE_DIM + PAD) + k])
+          );
+          float b_val = load32_shared(
+              reinterpret_cast<uint32_t>(&smem_B_transposed[c_local_col * (TILE_DIM + PAD) + k])
+          );
+          acc += a_val * b_val;
+        }
+
+        C[global_row * N + global_col] = acc;
+      }
+    }
+
+    // Final sync before moving to next tile iteration if needed
+    mu_barrier(0, threads_per_threadblock / MU_NUM_THREADS);
+  }
+}

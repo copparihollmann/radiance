@@ -1,0 +1,29 @@
+### Optimization Plan: Padding Shared Memory Tile Dimensions to Avoid Bank Conflicts (Strategy 6)
+
+To significantly reduce execution latency while adhering strictly to the hardware's $\le 31$ register limit, we will transition the global memory baseline to a shared-memory (SMEM) staged approach. By loading the entire $A$ and $B$ matrices into SMEM, we replace the slow $\sim 400$-cycle DRAM latency with fast $\sim 2$-cycle SMEM accesses. 
+
+However, a naive SMEM layout of $64 \times 64$ would cause severe bank conflicts. The dual-port SMEM on the Radiance core is banked $4 \times 16$ (64 banks). If the inner dimension is exactly 64, consecutive rows align perfectly to the same bank indices. When multiple threads in a warp access different rows at the same column index $k$, their addresses modulo 64 map to the exact same bank, causing up to a 16-way lane serialization (bank conflict).
+
+To resolve this, we will apply **Strategy 6: Pad Shared Memory Tile Dimensions to Avoid Bank Conflicts**.
+
+#### Step-by-Step Implementation Details:
+
+1. **SMEM Allocation and Padding**:
+   - Define a padding of `PAD = 4` (to maintain 16-byte alignment while staggering banks).
+   - `smem_A` starts at SMEM offset `0`. Size: $64 \times (64 + \text{PAD}) \times 4$ bytes = 17,408 bytes.
+   - `smem_B_transposed` starts at offset `17408`. We will store $B$ transposed to make its column reads consecutive (stride-1) in memory. Size: $64 \times (64 + \text{PAD}) \times 4$ bytes = 17,408 bytes.
+
+2. **Cooperative Loading & Transposition**:
+   - Each of the 128 threads cooperatively loads 32 elements of $A$ and $B$ from global memory.
+   - For $A$, thread `tid` maps $i \in [0, 4095]$ to `row = i / 64` and `k = i % 64`, then stores it at `smem_A[row * (64 + PAD) + k]`.
+   - For $B$, we transpose it during loading to optimize the inner loop: thread `tid` loads `B[k * 64 + col]` and stores it at `smem_B_transposed[col * (64 + PAD) + k]`.
+   - We synchronize all 8 warps across both cores using `mu_barrier(0, 8)` to ensure all SMEM writes are visible.
+
+3. **Compute Loop with Zero Bank Conflicts**:
+   - Each thread computes its share of the 4096 outputs. For `idx = tid; idx < 4096; idx += 128`:
+     - Determine `row = idx / 64` and `col = idx % 64`.
+     - Compute the dot product:
+       $$\text{acc} = \sum_{k=0}^{63} \text{smem\_A}[\text{row} \times (64 + \text{PAD}) + k] \times \text{smem\_B\_transposed}[\text{col} \times (64 + \text{PAD}) + k]$$
+   - Write the accumulated result back to `C[idx]`.
+
+Because we keep the inner loop rolled and use a single accumulator per thread, the architectural register count will remain safely around $\sim 22$ registers, well below the critical 31-register threshold.

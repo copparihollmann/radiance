@@ -1,0 +1,116 @@
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  const uint32_t PAD = 16;
+  const uint32_t smem_q = 0;
+  const uint32_t smem_k = 64 * 64 * 4;                  // 16384 bytes
+  const uint32_t smem_v = smem_k + 64 * (64 + PAD) * 4; // 36864 bytes
+  const uint32_t smem_s = smem_v + 64 * (64 + PAD) * 4; // 57344 bytes (< 128KB)
+
+  // 1. Cooperative SMEM Staging
+  // Stage Q (pre-scaled)
+  for (uint32_t i = tid_in_threadblock; i < 4096; i += threads_per_threadblock) {
+    float scaled = a->Q[i] * 0.125f;
+    store_shared(smem_q + i * 4, 0, *(uint32_t*)&scaled);
+  }
+
+  // Stage K in transposed layout to avoid bank conflicts
+  for (uint32_t i = tid_in_threadblock; i < 4096; i += threads_per_threadblock) {
+    uint32_t row = i / 64;
+    uint32_t col = i % 64;
+    uint32_t transposed_index = col * (64 + PAD) + row;
+    store_shared(smem_k + transposed_index * 4, 0, *(uint32_t*)&a->K[i]);
+  }
+
+  // Stage V in transposed layout to avoid bank conflicts
+  for (uint32_t i = tid_in_threadblock; i < 4096; i += threads_per_threadblock) {
+    uint32_t row = i / 64;
+    uint32_t col = i % 64;
+    uint32_t transposed_index = col * (64 + PAD) + row;
+    store_shared(smem_v + transposed_index * 4, 0, *(uint32_t*)&a->V[i]);
+  }
+
+  // Sync both cores (8 warps) to ensure all data is staged
+  mu_barrier(0, 8);
+
+  // 2. Phase 1: Scores (Q * K^T)
+  for (uint32_t idx = tid_in_threadblock; idx < 4096; idx += threads_per_threadblock) {
+    uint32_t row = idx / 64;
+    uint32_t col = idx % 64;
+
+    float acc = 0.0f;
+    uint32_t q_base = smem_q + row * 64 * 4;
+    uint32_t k_base = smem_k + col * (64 + PAD) * 4;
+
+    #pragma GCC unroll 4
+    for (uint32_t k = 0; k < 64; k++) {
+      float q_val = *(float*)&load32_shared(q_base + k * 4);
+      float k_val = *(float*)&load32_shared(k_base + k * 4);
+      acc += q_val * k_val;
+    }
+    store_shared(smem_s + idx * 4, 0, *(uint32_t*)&acc);
+  }
+
+  // Sync before Softmax
+  mu_barrier(0, 8);
+
+  // 3. Phase 2: Softmax per row (first 64 threads handle one row each)
+  if (tid_in_threadblock < 64) {
+    const uint32_t row = tid_in_threadblock;
+    const uint32_t row_offset = row * 64 * 4;
+
+    // Find Max
+    float max_val = *(float*)&load32_shared(smem_s + row_offset);
+    for (uint32_t j = 1; j < 64; j++) {
+      float val = *(float*)&load32_shared(smem_s + row_offset + j * 4);
+      if (val > max_val) max_val = val;
+    }
+
+    // Exponentials & Sum
+    float sum = 0.0f;
+    for (uint32_t j = 0; j < 64; j++) {
+      float val = *(float*)&load32_shared(smem_s + row_offset + j * 4);
+      float exp_val = mu_exp(val - max_val);
+      store_shared(smem_s + row_offset + j * 4, 0, *(uint32_t*)&exp_val);
+      sum += exp_val;
+    }
+
+    // Normalize and write to scratch
+    float inv_sum = 1.0f / sum;
+    for (uint32_t j = 0; j < 64; j++) {
+      float exp_val = *(float*)&load32_shared(smem_s + row_offset + j * 4);
+      float norm_val = exp_val * inv_sum;
+      store_shared(smem_s + row_offset + j * 4, 0, *(uint32_t*)&norm_val);
+      a->scratch[row * 64 + j] = norm_val;
+    }
+  } else {
+    asm volatile("nop");
+  }
+
+  // Sync before final product
+  mu_barrier(0, 8);
+
+  // 4. Phase 3: Output (P * V)
+  for (uint32_t idx = tid_in_threadblock; idx < 4096; idx += threads_per_threadblock) {
+    uint32_t row = idx / 64;
+    uint32_t col = idx % 64;
+
+    float acc = 0.0f;
+    uint32_t s_base = smem_s + row * 64 * 4;
+    uint32_t v_base = smem_v + col * (64 + PAD) * 4;
+
+    #pragma GCC unroll 4
+    for (uint32_t j = 0; j < 64; j++) {
+      float p_val = *(float*)&load32_shared(s_base + j * 4);
+      float v_val = *(float*)&load32_shared(v_base + j * 4);
+      acc += p_val * v_val;
+    }
+    a->O[idx] = acc;
+  }
+}

@@ -1,0 +1,197 @@
+```cpp
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t seq = a->seq;
+  const uint32_t d = a->d;
+  const uint32_t num_warps = threads_per_threadblock / MU_NUM_THREADS;
+  const float scale = 0.125f;
+
+  // Shared memory layout
+  const uint32_t smem_k_offset = 0;
+  const uint32_t smem_v_offset = smem_k_offset + 96 * 64 * sizeof(float);
+  const uint32_t smem_s_offset = smem_v_offset + 96 * 64 * sizeof(float);
+  const uint32_t smem_red_offset = smem_s_offset + 96 * 96 * sizeof(float);
+  
+  // Pointers to shared memory regions
+  float* smem_K = reinterpret_cast<float*>(smem_k_offset);
+  float* smem_V = reinterpret_cast<float*>(smem_v_offset);
+  float* smem_S = reinterpret_cast<float*>(smem_s_offset);
+  float* smem_red = reinterpret_cast<float*>(smem_red_offset);
+
+  const __global float* Q = a->Q;
+  const __global float* K = a->K;
+  const __global float* V = a->V;
+  __global float* O = a->O;
+  (void)a->scratch; // Not used anymore
+
+  const uint32_t warp_id = tid_in_threadblock / 16;
+  const uint32_t lane_id = tid_in_threadblock % 16;
+
+  // Phase 0: Cooperative loading of K and V into shared memory
+  // Load K: 96x64 matrix, 128 threads -> each thread loads 48 elements
+  for (uint32_t i = tid_in_threadblock; i < 96 * 64; i += threads_per_threadblock) {
+    const uint32_t row = i / 64;
+    const uint32_t col = i % 64;
+    smem_K[row * 64 + col] = K[row * d + col];
+  }
+
+  // Load V: 96x64 matrix, 128 threads -> each thread loads 48 elements
+  for (uint32_t i = tid_in_threadblock; i < 96 * 64; i += threads_per_threadblock) {
+    const uint32_t row = i / 64;
+    const uint32_t col = i % 64;
+    smem_V[row * 64 + col] = V[row * d + col];
+  }
+
+  // Cross-core synchronization after loading K and V
+  mu_barrier(0, num_warps);
+
+  // Phase 1: Compute QK^T scores in shared memory
+  // Each thread computes scores for one element of the 96x96 matrix
+  for (uint32_t idx = tid_in_threadblock; idx < 96 * 96; idx += threads_per_threadblock) {
+    const uint32_t i = idx / 96; // Row in S (query index)
+    const uint32_t j = idx % 96; // Col in S (key index)
+    
+    float acc = 0.0f;
+    for (uint32_t k = 0; k < 64; k++) {
+      acc += Q[i * d + k] * smem_K[j * 64 + k];
+    }
+    smem_S[i * 96 + j] = acc * scale;
+  }
+
+  // Cross-core synchronization after computing scores
+  mu_barrier(0, num_warps);
+
+  // Phase 2: Hierarchical softmax with warp-level reductions
+  // Distribute 96 rows among 8 warps (12 rows per warp)
+  for (uint32_t row_base = 0; row_base < 96; row_base += 12) {
+    const uint32_t local_row_idx = warp_id * 12 + (lane_id / 8); // 0-11 rows per warp
+    const uint32_t elem_start = (lane_id % 8) * 12; // 0, 12, ..., 84 starting positions
+    
+    if (local_row_idx < 12 && row_base + local_row_idx < 96) {
+      const uint32_t row = row_base + local_row_idx;
+      
+      // Local max reduction - find max of up to 12 elements
+      float local_max = -__builtin_inff();
+      #pragma GCC unroll 1
+      for (uint32_t k = 0; k < 12 && elem_start + k < 96; k++) {
+        const float val = smem_S[row * 96 + elem_start + k];
+        if (val > local_max) local_max = val;
+      }
+      
+      // Store local max in reduction buffer
+      smem_red[warp_id * 16 + lane_id] = local_max;
+      mu_barrier(0, num_warps); // Ensure all writes are visible
+      
+      // Warp-level reduction to find row max
+      if (lane_id < 8) {
+        float max_val = smem_red[warp_id * 16 + lane_id];
+        float other = smem_red[warp_id * 16 + lane_id + 8];
+        if (other > max_val) max_val = other;
+        smem_red[warp_id * 16 + lane_id] = max_val;
+      }
+      mu_barrier(0, num_warps);
+      
+      if (lane_id < 4) {
+        float max_val = smem_red[warp_id * 16 + lane_id];
+        float other = smem_red[warp_id * 16 + lane_id + 4];
+        if (other > max_val) max_val = other;
+        smem_red[warp_id * 16 + lane_id] = max_val;
+      }
+      mu_barrier(0, num_warps);
+      
+      if (lane_id < 2) {
+        float max_val = smem_red[warp_id * 16 + lane_id];
+        float other = smem_red[warp_id * 16 + lane_id + 2];
+        if (other > max_val) max_val = other;
+        smem_red[warp_id * 16 + lane_id] = max_val;
+      }
+      mu_barrier(0, num_warps);
+      
+      if (lane_id == 0) {
+        float max_val = smem_red[warp_id * 16 + 0];
+        float other = smem_red[warp_id * 16 + 1];
+        if (other > max_val) max_val = other;
+        // Broadcast row max to all lanes in warp
+        smem_red[warp_id * 16 + 0] = max_val;
+      }
+      mu_barrier(0, num_warps);
+      
+      const float row_max = smem_red[warp_id * 16 + 0];
+      
+      // Compute local sum of exponentials
+      float local_sum = 0.0f;
+      #pragma GCC unroll 1
+      for (uint32_t k = 0; k < 12 && elem_start + k < 96; k++) {
+        const float val = smem_S[row * 96 + elem_start + k];
+        const float exp_val = mu_exp(val - row_max);
+        smem_S[row * 96 + elem_start + k] = exp_val; // Store exp value for later use
+        local_sum += exp_val;
+      }
+      
+      // Store local sum in reduction buffer
+      smem_red[warp_id * 16 + lane_id] = local_sum;
+      mu_barrier(0, num_warps); // Ensure all writes are visible
+      
+      // Warp-level reduction to find row sum
+      if (lane_id < 8) {
+        float sum_val = smem_red[warp_id * 16 + lane_id];
+        sum_val += smem_red[warp_id * 16 + lane_id + 8];
+        smem_red[warp_id * 16 + lane_id] = sum_val;
+      }
+      mu_barrier(0, num_warps);
+      
+      if (lane_id < 4) {
+        float sum_val = smem_red[warp_id * 16 + lane_id];
+        sum_val += smem_red[warp_id * 16 + lane_id + 4];
+        smem_red[warp_id * 16 + lane_id] = sum_val;
+      }
+      mu_barrier(0, num_warps);
+      
+      if (lane_id < 2) {
+        float sum_val = smem_red[warp_id * 16 + lane_id];
+        sum_val += smem_red[warp_id * 16 + lane_id + 2];
+        smem_red[warp_id * 16 + lane_id] = sum_val;
+      }
+      mu_barrier(0, num_warps);
+      
+      if (lane_id == 0) {
+        float sum_val = smem_red[warp_id * 16 + 0];
+        sum_val += smem_red[warp_id * 16 + 1];
+        // Broadcast row sum inverse to all lanes in warp
+        smem_red[warp_id * 16 + 0] = 1.0f / sum_val;
+      }
+      mu_barrier(0, num_warps);
+      
+      const float row_sum_inv = smem_red[warp_id * 16 + 0];
+      
+      // Normalize elements
+      #pragma GCC unroll 1
+      for (uint32_t k = 0; k < 12 && elem_start + k < 96; k++) {
+        smem_S[row * 96 + elem_start + k] *= row_sum_inv;
+      }
+    }
+  }
+
+  // Cross-core synchronization after softmax
+  mu_barrier(0, num_warps);
+
+  // Phase 3: Compute O = P * V where P is softmax(S)
+  // Output matrix is 96x64
+  for (uint32_t idx = tid_in_threadblock; idx < 96 * 64; idx += threads_per_threadblock) {
+    const uint32_t i = idx / 64; // Row in O (query index)
+    const uint32_t k = idx % 64; // Col in O (head dim index)
+    
+    float acc = 0.0f;
+    for (uint32_t j = 0; j < 96; j++) {
+      acc += smem_S[i * 96 + j] * smem_V[j * 64 + k];
+    }
+    O[i * d + k] = acc;
+  }
+}
+```

@@ -1,0 +1,46 @@
+### Plan to Optimize the Attention Kernel
+
+We will utilize **Shared Memory Staging and Cooperative Load/Store** (based on Strategy 11 and 15) to eliminate the massive uncoalesced DRAM latency bottleneck. 
+
+At a sequence length of 128 and dimension of 64, the sizes of the matrices involved are:
+*   $Q$: $128 \times 64$ floats = 32 KiB
+*   $K$: $128 \times 64$ floats = 32 KiB
+*   $V$: $128 \times 64$ floats = 32 KiB
+*   $O$: $128 \times 64$ floats = 32 KiB
+*   $S$ (Scores): $128 \times 128$ floats = 64 KiB
+
+Since the cluster provides **128 KiB of ultra-fast Shared Memory (SMEM)**, we can fit all active data structures at any phase of the kernel in SMEM, eliminating DRAM round-trips for the intermediate score matrix $S$ entirely.
+
+#### SMEM Allocation & Double Buffering Strategy
+1.  **Phases 1 & 2 (Score Calculation and Softmax)**:
+    *   `smem_q` at offset `0` (32 KiB)
+    *   `smem_k` at offset `32768` (32 KiB)
+    *   `smem_s` at offset `65536` (64 KiB)
+    *   *Total SMEM:* Exactly 128 KiB.
+2.  **Phase 3 (Output Generation and Projection)**:
+    *   We no longer need $Q$ and $K$. We reuse `smem_q` (offset `0`) to stage $V$ (32 KiB).
+    *   We reuse `smem_k` (offset `32768`) to stage $O$ (32 KiB).
+
+---
+
+### Step-by-Step Optimization Plan
+
+1.  **Coalesced Stage-In of Q and K**:
+    *   Load $Q$ and $K$ cooperatively from global memory to SMEM using stride-1 accesses across all 128 threads to achieve 100% memory coalescing.
+    *   Use a cross-core barrier `mu_barrier(0, 8)` to ensure all data is visible to both cores.
+
+2.  **S-Matrix and Softmax Computation in SMEM**:
+    *   Compute $S[i][j] = 0.125 \times Q[i] \cdot K[j]$ row-by-row, with each thread handling one row `i`.
+    *   Perform in-place row-wise softmax on `smem_s` (Phase 2), avoiding any slow global memory latency.
+    *   Synchronize with `mu_barrier(0, 8)`.
+
+3.  **Coalesced Stage-In of V**:
+    *   Overwrite the first 32 KiB of SMEM with $V$ from global memory using cooperative, fully coalesced loads.
+    *   Synchronize with `mu_barrier(0, 8)`.
+
+4.  **Output Accumulation and Coalesced Stage-Out**:
+    *   Each thread `i` computes its row of $O[i][k]$ using $P[i][j]$ and $V[j][k]$ from SMEM. The computed outputs are written to the repurposed SMEM space at offset `32768`.
+    *   Synchronize with `mu_barrier(0, 8)`.
+    *   Perform a fully coalesced, stride-1 copy from SMEM back to global memory $O$ across all threads.
+
+This architecture-optimized approach avoids all bank conflicts during global memory transactions, reduces register footprint to fewer than 20 registers per thread (well below the 31-register limit), and completely eliminates the expensive DRAM bottleneck.

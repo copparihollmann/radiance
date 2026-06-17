@@ -1,0 +1,90 @@
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  const uint32_t M = args->M;
+  const uint32_t N = args->N;
+  const uint32_t K = args->K;
+
+  const uint32_t TILE_DIM = 64;
+  const uint32_t PAD = 16; // To avoid bank conflicts, pad by 16 floats = 64 bytes
+  const uint32_t ROW_STRIDE = TILE_DIM + PAD;
+
+  // Shared memory allocation
+  // smem_A: [TILE_DIM][ROW_STRIDE] => 64 * 80 * 4 = 20480 bytes
+  // smem_B_transposed: [TILE_DIM][ROW_STRIDE] => 64 * 80 * 4 = 20480 bytes
+  // Total: 40960 bytes < 128 KiB
+  __local float* smem_A = (__local float*)0;
+  __local float* smem_B_transposed = (__local float*)(TILE_DIM * ROW_STRIDE * sizeof(float));
+
+  const __global float* A = args->A;
+  const __global float* B = args->B;
+  float* C = args->C;
+
+  const uint32_t total_tiles_k = (K + TILE_DIM - 1) / TILE_DIM;
+
+  for (uint32_t tile_row = 0; tile_row < M; tile_row += TILE_DIM) {
+    for (uint32_t tile_col = 0; tile_col < N; tile_col += TILE_DIM) {
+
+      // Cooperatively load and transpose tiles into SMEM
+      for (uint32_t i = tid_in_threadblock; i < TILE_DIM * TILE_DIM; i += threads_per_threadblock) {
+        uint32_t local_row = i / TILE_DIM;
+        uint32_t local_col = i % TILE_DIM;
+
+        uint32_t global_row_A = tile_row + local_row;
+        uint32_t global_col_A = local_col;
+        float a_val = 0.0f;
+        if (global_row_A < M && global_col_A < K) {
+          a_val = A[global_row_A * K + global_col_A];
+        }
+        uint32_t smem_offset_A = local_row * ROW_STRIDE + local_col;
+        store_shared((uint32_t)smem_A, smem_offset_A * sizeof(float), __builtin_bit_cast(uint32_t, a_val));
+      }
+
+      for (uint32_t i = tid_in_threadblock; i < TILE_DIM * TILE_DIM; i += threads_per_threadblock) {
+        uint32_t local_row = i / TILE_DIM;
+        uint32_t local_col = i % TILE_DIM;
+
+        uint32_t global_row_B = local_row;
+        uint32_t global_col_B = tile_col + local_col;
+        float b_val = 0.0f;
+        if (global_row_B < K && global_col_B < N) {
+          b_val = B[global_row_B * N + global_col_B];
+        }
+        // Transpose B while storing
+        uint32_t smem_offset_B = local_col * ROW_STRIDE + local_row;
+        store_shared((uint32_t)smem_B_transposed, smem_offset_B * sizeof(float), __builtin_bit_cast(uint32_t, b_val));
+      }
+
+      // Cross-core barrier to ensure all SMEM writes are visible
+      mu_barrier(0, threads_per_threadblock / 16); // 8 warps
+
+      // Compute partial results for this tile
+      for (uint32_t idx = tid_in_threadblock; idx < TILE_DIM * TILE_DIM; idx += threads_per_threadblock) {
+        uint32_t local_row = idx / TILE_DIM;
+        uint32_t local_col = idx % TILE_DIM;
+
+        float acc = 0.0f;
+        for (uint32_t k = 0; k < TILE_DIM; k++) {
+          float a_elem = load32_shared((uint32_t)&smem_A[local_row * ROW_STRIDE + k]);
+          float b_elem = load32_shared((uint32_t)&smem_B_transposed[local_col * ROW_STRIDE + k]);
+          acc += a_elem * b_elem;
+        }
+
+        uint32_t global_row = tile_row + local_row;
+        uint32_t global_col = tile_col + local_col;
+        if (global_row < M && global_col < N) {
+          C[global_row * N + global_col] = acc;
+        }
+      }
+
+      // Barrier before next tile iteration to ensure reads complete before next writes
+      mu_barrier(0, threads_per_threadblock / 16); // 8 warps
+    }
+  }
+}

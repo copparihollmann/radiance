@@ -1,0 +1,1 @@
+Baseline only — no optimization search was run (search quota-blocked). baseline.cpp = the constructed reference kernel. Baseline cycles in results/metrics/results.csv (prob11 attn seq96 d72 = 3,465,399; prob13 tall-skinny 8x256x768 = 3,548,850).

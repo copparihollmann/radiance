@@ -1,0 +1,9 @@
+prob,run,source,provenance,baseline_total,best_total,speedup_total,speedup_net,iterations,candidates,compiled,correct,improved,best_correct_latency,total_usd,total_tokens
+0,built:muon_muon_0_beam_iters5_cyclotron,reconstructed,hand-verified SMEM (RTL-confirmed); search beam_best==baseline,480918,419797,1.146,2.431,5,73,7,7,0,42941,4.068,1984347
+1,built:muon_muon_1_beam_iters12_bw6harvest_cyclotron,reconstructed,generated: constexpr shapes + bank-pad SMEM,102215,79286,1.289,1.478,12,298,57,57,0,65563,21.98,9707286
+1,built:muon_muon_1_beam_iters5_cyclotron,transform_ledger,generated: constexpr shapes + bank-pad SMEM,102215,79286,1.289,1.478,4,15,1,1,1,65475,4.849,2136301
+2,built:muon_muon_2_beam_iters5_cyclotron,transform_ledger,generated,1308352,1292929,1.012,1.016,5,15,0,0,0,,3.447,1510567
+3,built:muon_muon_3_beam_iters5_cyclotron,transform_ledger,generated (==baseline),2759774,2759774,1.000,1.000,5,18,1,1,0,591732,3.662,1672396
+6,built:muon_muon_6_beam_iters12_bw6harvest_cyclotron,reconstructed,generated; baseline already SMEM-staged,487016,480444,1.014,1.064,12,109,1,1,0,109835,7.428,3422947
+7,built:muon_muon_7_beam_iters5_cyclotron,transform_ledger,baseline times out @bw6 (memory wall),NA,NA,NA,NA,5,36,14,14,9,421627,7.089,3224111
+10,built:muon_muon_10_beam_iters12_bw6harvest_cyclotron,reconstructed,generated; baseline already SMEM-staged,998938,987528,1.012,1.019,12,271,13,13,0,610402,19.459,8496394

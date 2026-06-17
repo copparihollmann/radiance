@@ -1,0 +1,119 @@
+#include <stdint.h>
+
+struct KernelArgs {
+  const __global float* A;
+  const __global float* B;
+  __global float* C;
+  uint32_t M;
+  uint32_t N;
+  uint32_t K;
+};
+
+// Custom helper to store to shared memory using runtime-calculated addresses
+static inline void store32_shared(uint32_t address, uint32_t data) {
+  asm volatile("sw.shared %1, 0(%0)" :: "r"(address), "r"(data) : "memory");
+}
+
+static inline uint32_t load32_shared(uint32_t address) {
+  uint32_t data;
+  asm volatile("lw.shared %0, 0(%1)" : "=r"(data) : "r"(address) : "memory");
+  return data;
+}
+
+static inline float bits_to_float(uint32_t bits) {
+  return __builtin_bit_cast(float, bits);
+}
+
+static inline uint32_t float_to_bits(float f) {
+  return __builtin_bit_cast(uint32_t, f);
+}
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  const uint32_t N = args->N;
+  const uint32_t K = args->K;
+  const uint32_t total_outputs = args->M * N;
+
+  // Early exit if no work
+  if (total_outputs == 0) return;
+
+  // Shared memory layout
+  const uint32_t smem_A_base = 0;            // 64 rows * 16 cols * 4 = 4096 bytes
+  const uint32_t smem_B_base = 4096;         // 16 rows * 64 cols * 4 = 4096 bytes
+  const uint32_t smem_C_base = 8192;         // 64 rows * 64 cols * 4 = 16384 bytes
+
+  // Zero-initialize shared memory accumulator
+  for (uint32_t i = tid_in_threadblock; i < 4096; i += threads_per_threadblock) {
+    store32_shared(smem_C_base + i * 4, 0);
+  }
+  mu_barrier(0, threads_per_threadblock / 16); // Cross-core sync
+
+  // Iterate over K in tiles of 16
+  for (uint32_t k_tile_start = 0; k_tile_start < K; k_tile_start += 16) {
+    // Phase 1: Load A and B tiles into shared memory
+    {
+      // Load tile of A: 64 rows, 16 cols
+      for (uint32_t idx = tid_in_threadblock; idx < 1024; idx += threads_per_threadblock) {
+        uint32_t r = idx / 16;
+        uint32_t c = idx % 16;
+        uint32_t global_offset = r * K + k_tile_start + c;
+        float val = args->A[global_offset];
+        store32_shared(smem_A_base + idx * 4, float_to_bits(val));
+      }
+
+      // Load tile of B: 16 rows, 64 cols
+      for (uint32_t idx = tid_in_threadblock; idx < 1024; idx += threads_per_threadblock) {
+        uint32_t k_idx = idx / 64;
+        uint32_t col = idx % 64;
+        uint32_t global_offset = (k_tile_start + k_idx) * N + col;
+        float val = args->B[global_offset];
+        store32_shared(smem_B_base + idx * 4, float_to_bits(val));
+      }
+    }
+
+    mu_barrier(0, threads_per_threadblock / 16); // Cross-core sync after loading
+
+    // Phase 2: Compute GEMM on the tile and accumulate in shared memory
+    {
+      // Each thread computes 32 outputs (64x64 total / 128 threads)
+      for (uint32_t op = 0; op < 32; op++) {
+        uint32_t output_index = op * threads_per_threadblock + tid_in_threadblock;
+        uint32_t row = output_index / 64;
+        uint32_t col = output_index % 64;
+
+        float acc = bits_to_float(load32_shared(smem_C_base + output_index * 4));
+
+        // Pointers into shared memory for A and B
+        uint32_t a_row_ptr = smem_A_base + row * 16 * 4;
+        uint32_t b_col_ptr = smem_B_base + col * 4;
+
+        // Manually unroll K-inner loop by 2 to help hide latency
+        for (uint32_t k = 0; k < 16; k += 2) {
+          float a0 = bits_to_float(load32_shared(a_row_ptr + k * 4));
+          float b0 = bits_to_float(load32_shared(b_col_ptr + k * 256));
+          float a1 = bits_to_float(load32_shared(a_row_ptr + (k + 1) * 4));
+          float b1 = bits_to_float(load32_shared(b_col_ptr + (k + 1) * 256));
+
+          acc += a0 * b0;
+          acc += a1 * b1;
+        }
+
+        store32_shared(smem_C_base + output_index * 4, float_to_bits(acc));
+      }
+    }
+
+    mu_barrier(0, threads_per_threadblock / 16); // Sync before next K tile
+  }
+
+  // Phase 3: Write final results back to global memory
+  for (uint32_t i = tid_in_threadblock; i < 4096; i += threads_per_threadblock) {
+    args->C[i] = bits_to_float(load32_shared(smem_C_base + i * 4));
+  }
+}

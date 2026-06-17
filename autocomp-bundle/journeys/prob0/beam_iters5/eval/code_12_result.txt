@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n/bin/../lib/libclangDriver.so.18.1+0x8a357)\n#25 0x00007eac62eae8f9 clang::driver::Driver::ExecuteCompilation(clang::driver::Compilation&, llvm::SmallVectorImpl<std::pair<int, clang::driver::Command const*>>&) (/scratch2/agustin/radiance-kernels/llvm/llvm-muon/bin/../lib/libclangDriver.so.18.1+0xae8f9)\n#26 0x0000564fb55dccc1 clang_main(int, char**, llvm::ToolContext const&) (/scratch2/agustin/radiance-kernels/llvm/llvm-muon/bin/clang+++0xdcc1)\n#27 0x0000564fb55ed407 main (/scratch2/agustin/radiance-kernels/llvm/llvm-muon/bin/clang+++0x1e407)\n#28 0x00007eac5fe2a1ca (/lib/x86_64-linux-gnu/libc.so.6+0x2a1ca)\n#29 0x00007eac5fe2a28b __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x2a28b)\n#30 0x0000564fb55d9c15 _start (/scratch2/agustin/radiance-kernels/llvm/llvm-muon/bin/clang+++0xac15)\nclang++: error: clang frontend command failed with exit code 134 (use -v to see invocation)\nclang version 18.1.7 (https://github.com/richardyrh/llvm.git f8573da7cbd7e76c6e46847d4afa852eaab4f7e0)\nTarget: riscv32-unknown-unknown-elf\nThread model: posix\nInstalledDir: /scratch2/agustin/radiance-kernels/llvm/llvm-muon/bin\nclang++: note: diagnostic msg: \n********************\n\nPLEASE ATTACH THE FOLLOWING FILES TO THE BUG REPORT:\nPreprocessed source(s) and associated run script(s) are located at:\nclang++: note: diagnostic msg: /tmp/kernel-820e1c.cpp\nclang++: note: diagnostic msg: /tmp/kernel-820e1c.sh\nclang++: note: diagnostic msg: \n\n********************\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

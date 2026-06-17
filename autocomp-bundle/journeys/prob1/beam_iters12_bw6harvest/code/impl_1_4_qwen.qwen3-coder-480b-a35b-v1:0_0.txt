@@ -1,0 +1,116 @@
+#pragma once
+#include <mu_intrinsics.h>
+#include <mu_schedule.h>
+#include <stdint.h>
+
+struct KernelArgs {
+  __global float* in;
+  __global float* w;
+  __global float* out;
+  uint32_t C;
+  uint32_t H;
+  uint32_t W;
+  uint32_t KH;
+  uint32_t KW;
+  uint32_t OC;
+  uint32_t OH;
+  uint32_t OW;
+  uint32_t stride;
+};
+
+// Optimized kernel implementation with zero bank conflicts, closed-form addressing, and minimal register usage
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  // Problem dimensions (hardcoded for this kernel)
+  constexpr uint32_t OC = 16;
+  constexpr uint32_t CKK = 768;
+  constexpr uint32_t CKK_PADDED = 769; // Ensures no shared memory bank conflicts
+  constexpr uint32_t P = 16;
+  constexpr uint32_t SMEM_W_BASE = P * CKK_PADDED * 4;
+
+  // Phase 1: Stage weight matrix W into shared memory with MLP (unroll by 2)
+  for (uint32_t i = tid_in_threadblock; i < OC * CKK; i += threads_per_threadblock << 1) {
+    uint32_t w0, w1;
+    asm volatile("lw.global %0, 0(%1)" : "=r"(w0) : "r"(&a->w[i]) : "memory");
+    asm volatile("lw.global %0, 0(%1)" : "=r"(w1) : "r"(&a->w[i + threads_per_threadblock]) : "memory");
+    store_shared(SMEM_W_BASE + i * 4, 0, w0);
+    store_shared(SMEM_W_BASE + (i + threads_per_threadblock) * 4, 0, w1);
+  }
+
+  // Phase 2: Gather im2col patches using closed-form bitwise computation
+  const uint32_t tid_group = tid_in_threadblock >> 4;
+  const uint32_t tid_lane = tid_in_threadblock & 15;
+  
+  for (uint32_t p = 0; p < P; ++p) {
+    const uint32_t p_row = p >> 2;
+    const uint32_t p_col = p & 3;
+    const uint32_t base_h = p_row * 16;
+    const uint32_t base_w = p_col * 16;
+
+    for (uint32_t step = 0; step < 6; step += 2) {
+      const uint32_t k0 = (step + 0) * 128 + tid_in_threadblock;
+      const uint32_t k1 = (step + 1) * 128 + tid_in_threadblock;
+
+      const uint32_t c0 = k0 >> 8;
+      const uint32_t r0 = k0 & 255;
+      const uint32_t kh0 = r0 >> 4;
+      const uint32_t kw0 = r0 & 15;
+
+      const uint32_t c1 = k1 >> 8;
+      const uint32_t r1 = k1 & 255;
+      const uint32_t kh1 = r1 >> 4;
+      const uint32_t kw1 = r1 & 15;
+
+      const uint32_t idx0 = c0 * 4096 + (base_h + kh0) * 64 + (base_w + kw0);
+      const uint32_t idx1 = c1 * 4096 + (base_h + kh1) * 64 + (base_w + kw1);
+
+      uint32_t val0, val1;
+      asm volatile("lw.global %0, 0(%1)" : "=r"(val0) : "r"(&a->in[idx0]) : "memory");
+      asm volatile("lw.global %0, 0(%1)" : "=r"(val1) : "r"(&a->in[idx1]) : "memory");
+
+      store_shared((p * CKK_PADDED + k0) * 4, 0, val0);
+      store_shared((p * CKK_PADDED + k1) * 4, 0, val1);
+    }
+  }
+
+  // Cross-core synchronization barrier for shared memory visibility
+  mu_barrier(0, threads_per_threadblock / 16);
+
+  // Phase 3: Compute matmul with software pipelining and zero bank conflicts
+  for (uint32_t idx = tid_in_threadblock; idx < OC * P; idx += threads_per_threadblock) {
+    const uint32_t oc = idx >> 4;
+    const uint32_t p = idx & 15;
+
+    uint32_t w_ptr = SMEM_W_BASE + oc * CKK * 4;
+    uint32_t p_ptr = p * CKK_PADDED * 4;
+
+    float sum = 0.0f;
+    
+    // Prefetch first pair of operands
+    float w_val = __builtin_bit_cast(float, load32_shared(w_ptr));
+    float p_val = __builtin_bit_cast(float, load32_shared(p_ptr));
+    w_ptr += 4;
+    p_ptr += 4;
+
+    #pragma GCC unroll 1
+    for (uint32_t k = 1; k < CKK; ++k) {
+      float w_next = __builtin_bit_cast(float, load32_shared(w_ptr));
+      float p_next = __builtin_bit_cast(float, load32_shared(p_ptr));
+      sum += w_val * p_val;
+      w_val = w_next;
+      p_val = p_next;
+      w_ptr += 4;
+      p_ptr += 4;
+    }
+    sum += w_val * p_val;
+    
+    a->out[idx] = sum;
+  }
+}

@@ -1,0 +1,137 @@
+An elegant and highly optimized plan to accelerate the FP32 matrix multiplication on the Radiance Muon GPU.
+
+### Optimization Plan
+
+To overcome the slow memory latency (~400 cycles) of global memory DRAM accesses and remain strictly below the hard limit of **31 registers** per thread, we will restructure the GEMM computation using **2D Shared Memory (SMEM) Tiling**, **SMEM Intermediate C Staging**, and **Bank Conflict Elimination**.
+
+#### 1. K-Dimension Tiling (K_tile = 32)
+Since $K = 768$ is too large to fit entirely in the 128 KiB SMEM alongside $B$, we will partition the $K$ dimension into 24 chunks of size $K_{tile} = 32$. In each step, we collaboratively load a $64 \times 32$ slice of $A$ and a $32 \times 64$ slice of $B$ into SMEM. 
+
+#### 2. Intermediate Staging of Matrix C in SMEM
+Instead of performing slow DRAM reads/writes for accumulating $C$, we will allocate a $64 \times 64$ float tile in SMEM initialized to 0. During each $K$-tile step:
+- The 128 threads load $A$ and $B$ tiles.
+- A cross-core barrier `mu_barrier(0, 8)` synchronizes all 8 warps across the cluster.
+- Each thread updates its 32 assigned elements of $C$ by loading the accumulator from SMEM, performing 32 multiply-accumulate (MAC) operations using registers, and storing them back. 
+- At the very end of the $K$-loop, we write the finalized $C$ tile from SMEM back to DRAM in a single coalesced pass.
+
+#### 3. Complete Bank Conflict Elimination via Non-Power-of-Two Padding
+To prevent bank conflicts when loading transposed columns of $B$ from SMEM, we will introduce a padding factor of 1 to the leading dimension of $B$ in SMEM:
+$$\text{smem\_b\_stride} = K_{tile} + 1 = 33 \text{ elements}$$
+Because 33 is odd, consecutive thread lane strides do not map to the same SMEM banks, eliminating bank conflicts entirely.
+
+#### 4. Extreme Register Minimization (<= 31 Registers)
+We will partition the 128 threads into an $8 \times 16$ grid where each thread is responsible for 8 rows and 4 columns of $C$. By updating only 4 accumulators at a time inside a compact loop, we keep our register footprint extremely low (under 20 registers), far below the strict RTL register limit.
+
+---
+
+### Optimized Code
+
+```cpp
+#include <vx_intrinsics.h>
+#include <mu_intrinsics.h>
+#include <mu_schedule.h>
+#include <shared_mem.h>
+#include <stdint.h>
+
+#ifndef MU_NUM_THREADS
+#define MU_NUM_THREADS 16
+#endif
+
+struct KernelArgs {
+  __global float* A;
+  __global float* B;
+  __global float* C;
+  uint32_t M;
+  uint32_t N;
+  uint32_t K;
+};
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t K = args->K;
+  const uint32_t num_warps = threads_per_threadblock / MU_NUM_THREADS; // 8 warps
+
+  // SMEM Allocation (Total: 33,024 bytes / ~32.25 KiB)
+  const uint32_t smem_a = 0;                         // 64 * 32 * 4 = 8192 bytes
+  const uint32_t smem_b = 8192;                      // 64 * 33 * 4 = 8448 bytes (padded)
+  const uint32_t smem_c = 16640;                     // 64 * 64 * 4 = 16384 bytes
+
+  // Step 1: Initialize SMEM C tile to 0
+  for (uint32_t i = tid_in_threadblock; i < 4096; i += 128) {
+    store_shared(smem_c + i * 4, 0, 0);
+  }
+  mu_barrier(0, num_warps);
+
+  // Step 2: Loop over K-tiles of size 32
+  for (uint32_t chunk = 0; chunk < K / 32; chunk++) {
+    
+    // Load A tile (64 x 32 = 2048 elements)
+    for (uint32_t p = 0; p < 16; p++) {
+      uint32_t idx = tid_in_threadblock + p * 128;
+      uint32_t r = idx / 32;
+      uint32_t c_tile = idx % 32;
+      uint32_t g_idx = r * K + chunk * 32 + c_tile;
+      store_shared(smem_a + idx * 4, 0, __builtin_bit_cast(uint32_t, args->A[g_idx]));
+    }
+
+    // Load B tile (32 x 64 = 2048 elements) with Padding=1
+    for (uint32_t p = 0; p < 16; p++) {
+      uint32_t idx = tid_in_threadblock + p * 128;
+      uint32_t r_tile = idx / 64;
+      uint32_t col = idx % 64;
+      uint32_t g_idx = (chunk * 32 + r_tile) * 64 + col;
+      uint32_t s_offset = col * 33 + r_tile; // 33-element stride to avoid bank conflicts
+      store_shared(smem_b + s_offset * 4, 0, __builtin_bit_cast(uint32_t, args->B[g_idx]));
+    }
+
+    // Cross-core barrier to finalize SMEM writes
+    mu_barrier(0, num_warps);
+
+    // Compute partial gemm using 8x16 thread configuration
+    uint32_t thread_row = tid_in_threadblock / 16;
+    uint32_t thread_col = tid_in_threadblock % 16;
+
+    for (uint32_t r_offset = 0; r_offset < 8; r_offset++) {
+      uint32_t r = thread_row * 8 + r_offset;
+      uint32_t c_base = thread_col * 4;
+
+      // Load intermediate accumulators from SMEM
+      uint32_t c_offset = r * 64 + c_base;
+      float acc0 = __builtin_bit_cast(float, load32_shared(smem_c + (c_offset + 0) * 4));
+      float acc1 = __builtin_bit_cast(float, load32_shared(smem_c + (c_offset + 1) * 4));
+      float acc2 = __builtin_bit_cast(float, load32_shared(smem_c + (c_offset + 2) * 4));
+      float acc3 = __builtin_bit_cast(float, load32_shared(smem_c + (c_offset + 3) * 4));
+
+      // Compute K-tile accumulation
+      #pragma unroll 4
+      for (uint32_t k = 0; k < 32; k++) {
+        float val_a = __builtin_bit_cast(float, load32_shared(smem_a + (r * 32 + k) * 4));
+        acc0 += val_a * __builtin_bit_cast(float, load32_shared(smem_b + ((c_base + 0) * 33 + k) * 4));
+        acc1 += val_a * __builtin_bit_cast(float, load32_shared(smem_b + ((c_base + 1) * 33 + k) * 4));
+        acc2 += val_a * __builtin_bit_cast(float, load32_shared(smem_b + ((c_base + 2) * 33 + k) * 4));
+        acc3 += val_a * __builtin_bit_cast(float, load32_shared(smem_b + ((c_base + 3) * 33 + k) * 4));
+      }
+
+      // Store updated values back to SMEM C
+      store_shared(smem_c + (c_offset + 0) * 4, 0, __builtin_bit_cast(uint32_t, acc0));
+      store_shared(smem_c + (c_offset + 1) * 4, 0, __builtin_bit_cast(uint32_t, acc1));
+      store_shared(smem_c + (c_offset + 2) * 4, 0, __builtin_bit_cast(uint32_t, acc2));
+      store_shared(smem_c + (c_offset + 3) * 4, 0, __builtin_bit_cast(uint32_t, acc3));
+    }
+
+    // Sync before the next iteration begins loading new tiles
+    mu_barrier(0, num_warps);
+  }
+
+  // Step 3: Coalesced write-back from SMEM C to global DRAM C
+  for (uint32_t i = tid_in_threadblock; i < 4096; i += 128) {
+    args->C[i] = __builtin_bit_cast(float, load32_shared(smem_c + i * 4));
+  }
+}
+```

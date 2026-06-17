@@ -1,0 +1,35 @@
+I will apply **Strategy 7: Implement hierarchical warp-and-block reductions in shared memory for softmax row statistics (max and sum) to replace inefficient serial scans and global memory round-trips.**
+
+### Optimization Plan
+
+1. **Shared Memory Allocation & Layout:**
+   We will stage the $K$ and $V$ matrices and the softmax intermediate scores $S$ entirely in the 128 KiB Shared Memory (SMEM) to eliminate slow global memory round-trips.
+   * `smem_K`: $96 \times 64 \times 4$ bytes = 24 KiB
+   * `smem_V`: $96 \times 64 \times 4$ bytes = 24 KiB
+   * `smem_S`: $96 \times 96 \times 4$ bytes = 36 KiB
+   * `smem_red`: $8 \text{ warps} \times 16 \text{ lanes} \times 4$ bytes = 512 bytes (for fast warp-level reductions)
+   * Total SMEM = ~85 KiB, fitting comfortably within the 128 KiB budget.
+
+2. **Cooperative Global-to-SMEM Loading:**
+   At the beginning of the kernel, all 128 threads (8 warps) will cooperatively load $K$ and $V$ from global memory into `smem_K` and `smem_V`. Since the threads span two physical cores, we will synchronize them using a cross-core barrier: `mu_barrier(0, 8)`.
+
+3. **Phase 1 (Scores Calculation in SMEM):**
+   Instead of writing $Q K^T$ directly to global memory, we will compute the scaled dot-product scores and store them in `smem_S`. Since $Q$ is streamed once, each thread can load its $Q$ elements directly, multiply with the staged $K$ in SMEM, and store the result to `smem_S`.
+
+4. **Phase 2 (Hierarchical Softmax Warp Reductions):**
+   Instead of a single thread doing a slow, non-coalesced serial scan of 96 elements over global memory, we will distribute the 96 rows across the 8 warps (each warp processes 12 rows). For each row:
+   * **Local Scan:** Each of the 16 threads in a warp computes the local maximum of $96 / 16 = 6$ elements.
+   * **Warp-level Tree Reduction:** The threads perform a parallel tree reduction in `smem_red` to determine the exact row maximum.
+   * **Exponentiation & Summation:** Each thread computes the sum of $e^{x - \text{row\_max}}$ for its 6 elements.
+   * **Warp-level Sum Reduction:** The threads perform another tree reduction in `smem_red` to compute the row sum.
+   * **Normalization:** Each thread scales its 6 elements by $1 / \text{row\_sum}$ and writes the final softmax probabilities back to `smem_S`.
+   
+   To avoid bank conflicts and maximize performance, we will use `mu_fence_smem()` to synchronize intermediate states within the warp during the tree reduction.
+
+5. **Phase 3 (Output Computation from SMEM):**
+   Using the normalized softmax values in `smem_S` and $V$ in `smem_V`, we compute the output matrix $O$ and write it back to global memory.
+
+6. **Register Footprint Management (Budget <= 31):**
+   To respect the critical RTL physical register file limit:
+   * We will keep all loops rolled (`#pragma GCC unroll 1`) to prevent the compiler from caching multiple loaded values in registers.
+   * We will reuse a single accumulator register per output and increment pointers instead of maintaining multiple independent base-address registers.

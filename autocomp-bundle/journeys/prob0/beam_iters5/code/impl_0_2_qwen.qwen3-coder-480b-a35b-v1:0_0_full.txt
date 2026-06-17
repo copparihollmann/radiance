@@ -1,0 +1,79 @@
+```cpp
+#include <vx_intrinsics.h>
+#include <mu_intrinsics.h>
+#include <mu_schedule.h>
+#include <shared_mem.h>
+#include <stdint.h>
+
+struct KernelArgs {
+  __global float* A;
+  __global float* B;
+  __global float* C;
+  uint32_t M;
+  uint32_t K;
+  uint32_t N;
+};
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  // Shared memory allocation
+  __shared float* const smem = reinterpret_cast<__shared float*>(0x0);
+  __shared float* As = smem;             // 8x16 = 128 floats
+  __shared float* Bs = smem + 128;       // 16x16 = 256 floats
+
+  const uint32_t tid = tid_in_threadblock;
+  const uint32_t i = tid >> 4; // tid / 16
+  const uint32_t j = tid & 15; // tid % 16
+
+  // Loop over 64x64 output tiles (8x4 thread blocks)
+  for (uint32_t block_row = 0; block_row < 8; ++block_row) {
+    for (uint32_t block_col = 0; block_col < 4; ++block_col) {
+      float acc = 0.0f;
+
+      // Loop over 4 K-tiles of 16 elements each
+      for (uint32_t k_tile = 0; k_tile < 4; ++k_tile) {
+        // --- Coalesced Load Phase ---
+
+        // Load A tile (8 rows x 16 cols) -> 128 elements
+        // Linearized index: (global_row * 64) + global_k_col
+        uint32_t a_gidx = (((block_row << 3) + i) << 6) + (k_tile << 4) + j;
+        As[tid] = args->A[a_gidx];
+
+        // Load B tile (16 rows x 16 cols) -> 256 elements
+        // First half (rows 0-7)
+        uint32_t b_gidx1 = (((k_tile << 4) + i) << 6) + ((block_col << 4) + j);
+        Bs[tid] = args->B[b_gidx1];
+        // Second half (rows 8-15)
+        uint32_t b_gidx2 = (((k_tile << 4) + i + 8) << 6) + ((block_col << 4) + j);
+        Bs[tid + 128] = args->B[b_gidx2];
+
+        // --- Synchronize Before Compute ---
+        // Ensures all SMEM writes are visible to all threads in the threadblock (cross-core)
+        mu_barrier(0, 8); // ID 0 for cross-core, 8 warps total
+
+        // --- Compute Phase ---
+        #pragma GCC unroll 1 // Prevent excessive unrolling to stay under register limit
+        for (uint32_t k = 0; k < 16; ++k) {
+          acc += As[(i << 4) + k] * Bs[(k << 4) + j];
+        }
+
+        // --- Synchronize Before Next Load ---
+        // Ensures compute is done before next tile overwrites SMEM
+        mu_barrier(0, 8);
+      }
+
+      // --- Write Back Result ---
+      // Linearized index: (global_row * 64) + global_col
+      uint32_t c_gidx = (((block_row << 3) + i) << 6) + (block_col << 4) + j;
+      args->C[c_gidx] = acc;
+    }
+  }
+}
+```

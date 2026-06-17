@@ -1,0 +1,94 @@
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t seq = 64;
+  const uint32_t d = 64;
+  const uint32_t num_warps = threads_per_threadblock / 16;
+  const float scale = 0.125f; // 1/sqrt(64)
+
+  // Layout 64 KiB of Shared Memory: Q, K, V, and S (scores) each take 16 KiB
+  __local float* s_Q = (__local float*)0x00000000;
+  __local float* s_K = (__local float*)0x00004000;  // 16KB offset
+  __local float* s_V = (__local float*)0x00008000;  // 32KB offset
+  __local float* s_S = (__local float*)0x0000C000;  // 48KB offset
+
+  // Phase 0: Coalesced global loads into SMEM
+  for (uint32_t idx = tid_in_threadblock; idx < 4096; idx += threads_per_threadblock) {
+    s_Q[idx] = a->Q[idx];
+  }
+  for (uint32_t idx = tid_in_threadblock; idx < 4096; idx += threads_per_threadblock) {
+    s_K[idx] = a->K[idx];
+  }
+  for (uint32_t idx = tid_in_threadblock; idx < 4096; idx += threads_per_threadblock) {
+    s_V[idx] = a->V[idx];
+  }
+
+  // Cross-core barrier to ensure SMEM staging is complete across both cores
+  mu_barrier(0, num_warps);
+
+  // Phase 1: Compute attention scores (S = Q K^T * scale)
+  for (uint32_t idx = tid_in_threadblock; idx < 4096; idx += threads_per_threadblock) {
+    uint32_t i = idx / 64;
+    uint32_t j = idx % 64;
+    float acc = 0.0f;
+    #pragma GCC unroll 1
+    for (uint32_t k = 0; k < 64; k++) {
+      acc += s_Q[i * 64 + k] * s_K[j * 64 + k];
+    }
+    s_S[idx] = acc * scale;
+  }
+
+  // Cross-core barrier to guarantee scores are fully computed
+  mu_barrier(0, num_warps);
+
+  // Phase 2: Row-wise Softmax
+  // Distribute 64 rows evenly: 32 rows to Core 0, 32 rows to Core 1
+  uint32_t row = 999;
+  if (tid_in_threadblock < 32) {
+    row = tid_in_threadblock;
+  } else if (tid_in_threadblock >= 64 && tid_in_threadblock < 96) {
+    row = tid_in_threadblock - 64;
+  }
+
+  if (row < 64) {
+    uint32_t row_offset = row * 64;
+    float m = s_S[row_offset];
+    #pragma GCC unroll 1
+    for (uint32_t j = 1; j < 64; j++) {
+      float v = s_S[row_offset + j];
+      if (v > m) m = v;
+    }
+    float sum = 0.0f;
+    #pragma GCC unroll 1
+    for (uint32_t j = 0; j < 64; j++) {
+      float e = mu_exp(s_S[row_offset + j] - m);
+      s_S[row_offset + j] = e;
+      sum += e;
+    }
+    float inv = 1.0f / sum;
+    #pragma GCC unroll 1
+    for (uint32_t j = 0; j < 64; j++) {
+      s_S[row_offset + j] *= inv;
+    }
+  }
+
+  // Cross-core barrier to finalize softmax probabilities prior to product step
+  mu_barrier(0, num_warps);
+
+  // Phase 3: Compute output product (O = S V)
+  for (uint32_t idx = tid_in_threadblock; idx < 4096; idx += threads_per_threadblock) {
+    uint32_t i = idx / 64;
+    uint32_t k = idx % 64;
+    float acc = 0.0f;
+    #pragma GCC unroll 1
+    for (uint32_t j = 0; j < 64; j++) {
+      acc += s_S[i * 64 + j] * s_V[j * 64 + k];
+    }
+    a->O[idx] = acc;
+  }
+}

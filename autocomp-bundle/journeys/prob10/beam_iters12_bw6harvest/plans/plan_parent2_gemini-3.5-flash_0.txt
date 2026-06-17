@@ -1,0 +1,114 @@
+An elegant and highly optimized strategy to improve the performance of this large-K matrix multiplication is **Register-Tiled, Conflict-Free Shared-Memory Staged K-Streaming**.
+
+### Explanation of the Strategy
+
+1. **Grid and Register Tiling**: 
+   Instead of computing a single output element per thread (which creates massive redundant global memory traffic), we partition $C$ into $32 \times 16$ blocks. Each of the 128 threads is mapped to compute exactly 4 elements of $C$ along the row dimension. This reduces global memory loads by more than $10\times$ while requiring only 4 registers for accumulators, staying safely under the hard limit of 31 registers.
+
+2. **Perfect Global Memory Coalescing**:
+   During each phase of K-streaming (tile size $K_{tile} = 64$), threads cooperatively load a $32 \times 64$ block of $A$ and a $64 \times 16$ block of $B$ into Shared Memory (SMEM). The threads are mapped such that consecutive lanes in a warp load contiguous elements from DRAM, achieving perfect global memory coalescing.
+
+3. **On-the-Fly Staging Transpose and Zero Bank Conflicts**:
+   We store $B$ in SMEM transposed as `B_smem[col][row]`. This allows sequential stride-1 reads in the inner compute loop. To eliminate bank conflicts:
+   * We pad the column dimension in SMEM with exactly 1 element (`K_PAD = 65`). This forces a stride-1 bank distribution across the lanes accessing $B_{smem}$ columns, resulting in **zero bank conflicts**.
+   * For $A_{smem}$, all threads in a warp share the same row, meaning their SMEM accesses are broadcasted by the hardware simultaneously with **zero bank conflicts**.
+
+4. **Register Wall Protection**:
+   By keeping the accumulation registers to exactly 4 and using moderate/rolled loops, we guarantee that the compiler will use fewer than 24 distinct registers, satisfying the RTL hardware safety constraints.
+
+### C++ Source Code
+
+```cpp
+#include <stdint.h>
+
+#define K_PAD 65
+#define MU_NUM_THREADS 16
+
+static inline float bits_to_float(uint32_t b) { union { uint32_t u; float f; } c; c.u = b; return c.f; }
+static inline uint32_t float_to_bits(float f) { union { uint32_t u; float f; } c; c.f = f; return c.u; }
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t K = args->K;
+  const uint32_t N = args->N;
+
+  const uint32_t tid = tid_in_threadblock;
+  const uint32_t num_warps = threads_per_threadblock / MU_NUM_THREADS; // 8 warps total
+
+  // Thread mapping for computing C in a 32x16 block
+  const uint32_t th_r = tid / 16; // 0..7
+  const uint32_t th_c = tid % 16; // 0..15
+
+  const uint32_t smem_a = 0;
+  const uint32_t smem_b = 32 * K_PAD * 4; // A tile has 32 rows
+
+  // C is 64x64. We tile it using 32x16 blocks (2 row blocks, 4 col blocks = 8 blocks total)
+  for (uint32_t block = 0; block < 8; block++) {
+    const uint32_t block_row = block / 4;
+    const uint32_t block_col = block % 4;
+    const uint32_t row_start = block_row * 32;
+    const uint32_t col_start = block_col * 16;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+
+    for (uint32_t kk = 0; kk < K; kk += 64) {
+      // 1. Cooperative load A to SMEM (32x64 floats)
+      #pragma GCC unroll 4
+      for (uint32_t i = 0; i < 16; i++) {
+        uint32_t idx = i * 128 + tid;
+        uint32_t r = idx / 64;
+        uint32_t c = idx % 64;
+        float val = args->A[(row_start + r) * K + (kk + c)];
+        store_shared(smem_a + (r * K_PAD + c) * 4, 0, float_to_bits(val));
+      }
+
+      // 2. Cooperative load B to SMEM (transposed, 64x16 floats)
+      #pragma GCC unroll 4
+      for (uint32_t i = 0; i < 8; i++) {
+        uint32_t idx = i * 128 + tid;
+        uint32_t r = idx / 16;
+        uint32_t c = idx % 16;
+        float val = args->B[(kk + r) * N + (col_start + c)];
+        store_shared(smem_b + (c * K_PAD + r) * 4, 0, float_to_bits(val));
+      }
+
+      // Cross-core SMEM visibility barrier
+      mu_barrier(0, num_warps);
+
+      // 3. Compute accumulation
+      uint32_t b_base = smem_b + th_c * K_PAD * 4;
+      uint32_t a_base = smem_a + (th_r * 4) * K_PAD * 4;
+
+      #pragma GCC unroll 4
+      for (uint32_t k = 0; k < 64; k++) {
+        uint32_t k4 = k * 4;
+        float b = bits_to_float(load32_shared(b_base + k4));
+        acc0 += bits_to_float(load32_shared(a_base + k4)) * b;
+        acc1 += bits_to_float(load32_shared(a_base + k4 + 1 * K_PAD * 4)) * b;
+        acc2 += bits_to_float(load32_shared(a_base + k4 + 2 * K_PAD * 4)) * b;
+        acc3 += bits_to_float(load32_shared(a_base + k4 + 3 * K_PAD * 4)) * b;
+      }
+
+      // Barrier to prevent staging write-over before reads complete
+      mu_barrier(0, num_warps);
+    }
+
+    // Write-back values to C (Contiguous write-backs per warp to match memory system)
+    const uint32_t r_base = row_start + th_r * 4;
+    const uint32_t c = col_start + th_c;
+    args->C[(r_base + 0) * N + c] = acc0;
+    args->C[(r_base + 1) * N + c] = acc1;
+    args->C[(r_base + 2) * N + c] = acc2;
+    args->C[(r_base + 3) * N + c] = acc3;
+  }
+}
+```

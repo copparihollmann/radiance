@@ -1,0 +1,98 @@
+```cpp
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t M = args->M, N = args->N, K = args->K;
+  const uint32_t num_warps = threads_per_threadblock / MU_NUM_THREADS;
+
+  // Tile sizes
+  const uint32_t M_TILE = 16;
+  const uint32_t N_TILE = 32;
+  const uint32_t K_TILE = 64;
+  const uint32_t PAD = 16;
+
+  // Shared memory layout
+  const uint32_t smem_a = 0;
+  const uint32_t smem_b = M_TILE * K_TILE * sizeof(float);
+
+  // Thread mapping: 16 rows x 8 columns -> each thread handles 1x4 outputs
+  const uint32_t thread_r = tid_in_threadblock / 8;  // Row within threadblock (0..15)
+  const uint32_t thread_c = tid_in_threadblock % 8;  // Column group index (0..7)
+
+  // Loop over M and N tiles
+  for (uint32_t tile_m = 0; tile_m < M; tile_m += M_TILE) {
+    for (uint32_t tile_n = 0; tile_n < N; tile_n += N_TILE) {
+
+      // Initialize a single accumulator per thread
+      float accumulator = 0.0f;
+
+      // Loop over K tiles
+      for (uint32_t k = 0; k < K; k += K_TILE) {
+
+        // Stage A tile: M_TILE x K_TILE into smem_a
+        #pragma GCC unroll 1
+        for (uint32_t i = tid_in_threadblock; i < M_TILE * K_TILE; i += threads_per_threadblock) {
+          const uint32_t local_row = i / K_TILE;
+          const uint32_t local_col = i % K_TILE;
+          const uint32_t global_idx = (tile_m + local_row) * K + (k + local_col);
+          store_shared(smem_a + i * sizeof(float), 0, __builtin_bit_cast(uint32_t, args->A[global_idx]));
+        }
+
+        // Stage B tile: K_TILE x N_TILE (transposed) into smem_b
+        #pragma GCC unroll 1
+        for (uint32_t i = tid_in_threadblock; i < K_TILE * N_TILE; i += threads_per_threadblock) {
+          const uint32_t local_row = i / N_TILE;
+          const uint32_t local_col = i % N_TILE;
+          const uint32_t global_idx = (k + local_row) * N + (tile_n + local_col);
+          const uint32_t smem_idx = (local_col * (K_TILE + PAD) + local_row);
+          store_shared(smem_b + smem_idx * sizeof(float), 0, __builtin_bit_cast(uint32_t, args->B[global_idx]));
+        }
+
+        // Cross-core barrier: Ensure all threads have loaded data into SMEM
+        mu_barrier(0, num_warps);
+
+        // Compute partial product using one register and pointer arithmetic
+        uint32_t ptr_a = smem_a + thread_r * K_TILE * sizeof(float);
+        uint32_t ptr_b = smem_b + thread_c * 4 * (K_TILE + PAD) * sizeof(float);
+
+        #pragma GCC unroll 1
+        for (uint32_t kk = 0; kk < K_TILE; ++kk) {
+          const float a_val = __builtin_bit_cast(float, load32_shared(ptr_a));
+          const float b0 = __builtin_bit_cast(float, load32_shared(ptr_b + 0 * (K_TILE + PAD) * sizeof(float)));
+          const float b1 = __builtin_bit_cast(float, load32_shared(ptr_b + 1 * (K_TILE + PAD) * sizeof(float)));
+          const float b2 = __builtin_bit_cast(float, load32_shared(ptr_b + 2 * (K_TILE + PAD) * sizeof(float)));
+          const float b3 = __builtin_bit_cast(float, load32_shared(ptr_b + 3 * (K_TILE + PAD) * sizeof(float)));
+
+          accumulator += a_val * b0;
+          accumulator += a_val * b1;
+          accumulator += a_val * b2;
+          accumulator += a_val * b3;
+
+          ptr_a += sizeof(float);
+          ptr_b += sizeof(float);
+        }
+
+        // Synchronize before next tile iteration
+        mu_barrier(0, num_warps);
+      }
+
+      // Write back final result (4 values per thread)
+      const uint32_t global_row = tile_m + thread_r;
+      const uint32_t global_col_base = tile_n + thread_c * 4;
+
+      if (global_row < M) {
+        const uint32_t base_idx = global_row * N + global_col_base;
+        args->C[base_idx + 0] = accumulator;
+        args->C[base_idx + 1] = accumulator;
+        args->C[base_idx + 2] = accumulator;
+        args->C[base_idx + 3] = accumulator;
+      }
+    }
+  }
+}
+```

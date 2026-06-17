@@ -1,0 +1,99 @@
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+  
+  const uint32_t tid = tid_in_threadblock;
+  const uint32_t M = args->M;
+  const uint32_t N = args->N;
+  const uint32_t K = args->K;
+  
+  // Shared memory layout with padding to avoid bank conflicts
+  const uint32_t smem_a = 0;  // 8 rows * 32 cols = 256 floats
+  const uint32_t smem_b = 1024;  // 32 rows * 64 cols = 2048 floats (+padding)
+  
+  // Thread mapping: each thread handles 1x4 outputs in C
+  const uint32_t thread_row = tid / 64;  // 0-1 (2 rows per thread)
+  const uint32_t thread_col_group = (tid % 64) * 4;  // Column group (0, 4, 8, ... 252)
+  
+  // Process 2 rows at a time to reduce register pressure
+  for (uint32_t m_base = 0; m_base < M; m_base += 2) {
+    if (m_base + thread_row >= M) continue;
+    
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    
+    // Iterate over K in blocks of 32
+    for (uint32_t k_base = 0; k_base < K; k_base += 32) {
+      // Load A tile (2 rows x 32 columns) cooperatively
+      // Each thread loads 1 element for each row
+      {
+        const uint32_t a_idx = tid;
+        if (a_idx < 64) {  // Only first 64 threads participate in loading A
+          const uint32_t a_row = a_idx / 32;
+          const uint32_t a_col = a_idx % 32;
+          
+          if (m_base + a_row < M) {
+            const float a_val = args->A[(m_base + a_row) * K + k_base + a_col];
+            store_shared(smem_a + (a_idx * 4), 0, __builtin_bit_cast(uint32_t, a_val));
+          }
+        }
+      }
+      
+      // Load B tile (32 rows x 64 columns) cooperatively
+      // All 128 threads participate in loading B
+      {
+        for (uint32_t i = 0; i < 2; i++) {
+          const uint32_t b_idx = tid + (i * 128);
+          if (b_idx < 2048) {  // 32*64 = 2048 elements
+            const uint32_t b_row = b_idx / 64;
+            const uint32_t b_col = b_idx % 64;
+            
+            if (k_base + b_row < K && b_col < N) {
+              const float b_val = args->B[(k_base + b_row) * N + b_col];
+              store_shared(smem_b + (b_idx * 4), 0, __builtin_bit_cast(uint32_t, b_val));
+            }
+          }
+        }
+      }
+      
+      // Synchronize to ensure SMEM loads are complete
+      mu_barrier(0, 8);
+      
+      // Compute partial products
+      {
+        const uint32_t a_addr = smem_a + (thread_row * 32 * 4);  // Base address for our row of A
+        uint32_t b_addr = smem_b + (thread_col_group * 4);       // Base address for our columns of B
+        
+        #pragma GCC unroll 1
+        for (uint32_t k = 0; k < 32; k++) {
+          const float a_val = __builtin_bit_cast(float, load32_shared(a_addr + (k * 4)));
+          
+          acc[0] += a_val * __builtin_bit_cast(float, load32_shared(b_addr + 0));
+          acc[1] += a_val * __builtin_bit_cast(float, load32_shared(b_addr + 4));
+          acc[2] += a_val * __builtin_bit_cast(float, load32_shared(b_addr + 8));
+          acc[3] += a_val * __builtin_bit_cast(float, load32_shared(b_addr + 12));
+          
+          b_addr += 64 * 4;  // Move to next row (64 columns)
+        }
+      }
+      
+      // Synchronize before next iteration overwrites SMEM
+      mu_barrier(0, 8);
+    }
+    
+    // Write results to C
+    const uint32_t c_row = m_base + thread_row;
+    if (c_row < M) {
+      const uint32_t c_base_addr = c_row * N + thread_col_group;
+      
+      args->C[c_base_addr + 0] = acc[0];
+      args->C[c_base_addr + 1] = acc[1];
+      args->C[c_base_addr + 2] = acc[2];
+      args->C[c_base_addr + 3] = acc[3];
+    }
+  }
+}

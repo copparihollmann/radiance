@@ -1,0 +1,115 @@
+### Method Explanation and Plan
+
+To address the latency of the baseline floating-point matrix multiplication, we will apply **Strategy 5: stage global loads into `__shared` memory before compute to enable warp reuse**. 
+
+#### Inefficiencies in the Baseline:
+1. **Inefficient Global Memory Accesses**: Every thread performs non-coalesced, redundant global memory loads of $A$ and $B$ within the innermost loop. Since DRAM access latency is extremely high (~400 cycles), this causes massive stalling.
+2. **No Data Reuse**: Values of $A$ and $B$ loaded from global memory are discarded immediately after one multiply-accumulate operation, wasting memory bandwidth.
+
+#### Optimization Plan:
+1. **2D Output Tiling ($16 \times 16$)**: We partition the $64 \times 64$ output matrix $C$ into blocks of size $16 \times 16$.
+2. **Thread Mapping**: The 128 threads of the threadblock cooperatively compute each $16 \times 16$ tile of $C$. Each thread is responsible for exactly 2 elements of $C$ within the tile, requiring only 2 accumulator registers (`acc0` and `acc1`). This easily satisfies the strict limit of $\le 31$ registers.
+3. **Shared Memory Staging**:
+   - For each $16 \times 16$ tile of $C$, we stream the $K$ dimension in steps of $K_{\text{tile}} = 16$.
+   - In each step, the 128 threads cooperatively load a $16 \times 16$ block of $A$ and a $16 \times 16$ block of $B$ into Shared Memory (SMEM). This requires only 2 loads of $A$ and 2 loads of $B$ per thread, which are perfectly coalesced across the lanes of each warp.
+   - We use a cross-core barrier `mu_barrier(0, 8)` to synchronize the cooperative write phase to SMEM.
+4. **Local Accumulation**: Once synchronized, each thread computes its 2 assigned elements by accumulating values from SMEM. This reduces the latency of inner-loop loads from ~400 cycles to only ~2 cycles.
+5. **No Deep Unrolling**: We keep the inner loop rolled to prevent compiler-induced register bloating, ensuring we stay well under the hard hardware register ceiling.
+
+---
+
+### Optimized Code
+
+```cpp
+#include <stdint.h>
+#include <type_traits>
+
+// Forward declarations of hardware intrinsics and helpers
+inline void store_shared(uint32_t base, uint32_t offset, uint32_t data) {
+    asm volatile("sw.shared %2, %1(%0)" :: "r"(base), "I"(offset), "r"(data) : "memory");
+}
+
+inline uint32_t load32_shared(uint32_t address) {
+    uint32_t data;
+    asm volatile("lw.shared %0, %1(%2)" : "=r"(data) : "I"(0), "r"(address) : "memory");
+    return data;
+}
+
+__attribute__((convergent))
+static void mu_barrier(unsigned barrier_id, unsigned num_warps) {
+    asm volatile ("vx_bar %0, %1" :: "r"(barrier_id), "r"(num_warps) : "memory");
+}
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  (void)threads_per_threadblock;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  const uint32_t K = args->K;
+  const uint32_t N = args->N;
+
+  // Thread indexing within the 16x16 block of C
+  const uint32_t r1 = tid_in_threadblock >> 4;   // Row offset 1: 0..7
+  const uint32_t r2 = r1 + 8;                    // Row offset 2: 8..15
+  const uint32_t c1 = tid_in_threadblock & 15;   // Column offset: 0..15
+
+  // Local SMEM addresses
+  // A_shared is at SMEM offset 0 (size 16 * 16 * 4 = 1024 bytes)
+  // B_shared is at SMEM offset 1024 (size 16 * 16 * 4 = 1024 bytes)
+  const uint32_t smem_A = 0;
+  const uint32_t smem_B = 1024;
+
+  // Loop over 16x16 tiles of C
+  for (uint32_t R = 0; R < 64; R += 16) {
+    const uint32_t row1_offset_A = (R + r1) * K;
+    const uint32_t row2_offset_A = (R + r2) * K;
+
+    for (uint32_t C_start = 0; C_start < 64; C_start += 16) {
+      // Offset for cooperative loading of B
+      const uint32_t col_offset_B = r1 * N + C_start + c1;
+
+      float acc0 = 0.0f;
+      float acc1 = 0.0f;
+
+      // Stream K in steps of 16
+      for (uint32_t k = 0; k < K; k += 16) {
+        // Coalesced cooperative load from Global Memory to SMEM
+        float a1 = args->A[row1_offset_A + k + c1];
+        float a2 = args->A[row2_offset_A + k + c1];
+        store_shared(smem_A, tid_in_threadblock * 4, __builtin_bit_cast(uint32_t, a1));
+        store_shared(smem_A, (tid_in_threadblock + 128) * 4, __builtin_bit_cast(uint32_t, a2));
+
+        float b1 = args->B[k * N + col_offset_B];
+        float b2 = args->B[(k + 8) * N + col_offset_B];
+        store_shared(smem_B, tid_in_threadblock * 4, __builtin_bit_cast(uint32_t, b1));
+        store_shared(smem_B, (tid_in_threadblock + 128) * 4, __builtin_bit_cast(uint32_t, b2));
+
+        // Cross-core barrier to ensure all SMEM writes are visible
+        mu_barrier(0, 8);
+
+        // Accumulate from SMEM (keep loop rolled to save registers)
+        #pragma GCC unroll 1
+        for (uint32_t kk = 0; kk < 16; kk++) {
+          float a_val0 = __builtin_bit_cast(float, load32_shared(smem_A + (r1 * 16 + kk) * 4));
+          float a_val1 = __builtin_bit_cast(float, load32_shared(smem_A + (r2 * 16 + kk) * 4));
+          float b_val  = __builtin_bit_cast(float, load32_shared(smem_B + (kk * 16 + c1) * 4));
+          acc0 += a_val0 * b_val;
+          acc1 += a_val1 * b_val;
+        }
+
+        // Cross-core barrier before writing the next tile
+        mu_barrier(0, 8);
+      }
+
+      // Write results to Global Memory
+      args->C[(R + r1) * N + (C_start + c1)] = acc0;
+      args->C[(R + r2) * N + (C_start + c1)] = acc1;
+    }
+  }
+}
+```

@@ -1,0 +1,119 @@
+### Conceptual Plan
+
+We will implement a high-performance optimization strategy that targets the two major bottlenecks of the baseline kernel: **shared memory bank conflicts** and **slow integer division/modulo instructions**.
+
+#### 1. Shared Memory Transposition to Eliminate Bank Conflicts
+In the original implementation, the patch matrix was staged in SMEM with a layout of `[P, CKK]` (where $P = 16$ and $CKK = 768$). During the matrix multiplication phase, each warp of 16 threads executes with consecutive `idx` values. This maps to the same output channel `oc` but different patch indices $p \in [0, 15]$ mapped directly to each lane. 
+As a result, consecutive lanes accessed patch data at addresses separated by `CKK * 4 = 3072` bytes. Because 3072 is a multiple of the SMEM bank stride, all 16 lanes mapped to the exact same SMEM bank, causing a **16-way bank conflict** that completely serialized the memory reads.
+
+**Optimization:** We transpose the patch matrix storage in SMEM to `[CKK, P]`.
+- The staging destination index is modified to `ckk * P + p` (where $P = 16$).
+- During the matmul phase, lane $i$ accesses `pa` starting at `i * 4` and increments it by `P * 4 = 64` bytes at each step.
+- At any step $k$, lane $i$ accesses offset `k * 64 + i * 4`. Consecutive lanes now access consecutive 4-byte words (stride-1), resulting in **zero bank conflicts** and a massive boost in SMEM read throughput.
+
+#### 2. Bitwise Strength Reduction of Coordinate Calculations
+In the baseline, every iteration of the gather loop performed several heavy integer divisions and modulos (`/` and `%` operators) to map the flat index `i` to multidimensional input coordinates. Because the RISC-V integer unit takes dozens of cycles for division, this severely throttled the staging throughput.
+
+**Optimization:** 
+- Since the dimensions are powers of two ($KH=16, KW=16, OW=4$), we replace all division and modulo operators with fast bitwise shifts and bitwise ANDs (e.g., `x / 16` becomes `x >> 4`, and `x % 16` becomes `x & 15`).
+- Instead of calculating `p` and `ckk` via division on `i` at each iteration, we initialize them once outside the loop and incrementally update them. Since `threads_per_threadblock` is 128, we add 128 to `ckk` each iteration and perform a fast conditional check `if (ckk >= 768) { ckk -= 768; p += 1; }` to update `p`.
+
+---
+
+### Optimized Kernel Code
+
+```cpp
+#include <stdint.h>
+
+// Problem-specific KernelArgs definition
+struct KernelArgs {
+  __global float* in;
+  __global float* w;
+  __global float* out;
+  uint32_t C;
+  uint32_t H;
+  uint32_t W;
+  uint32_t OC;
+  uint32_t OH;
+  uint32_t OW;
+  uint32_t KH;
+  uint32_t KW;
+  uint32_t stride;
+};
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t CKK = 768; // C * KH * KW = 3 * 16 * 16 = 768
+  const uint32_t smem_w = 49152; // 16 * 768 * 4 (Patches stage area size)
+
+  // (1) Stage W flat into SMEM[smem_w..].
+  for (uint32_t i = tid_in_threadblock; i < 12288; i += threads_per_threadblock) {
+    store_shared(smem_w + (i << 2), 0, __builtin_bit_cast(uint32_t, a->w[i]));
+  }
+
+  // (2) Gather im2col patches into SMEM[0..] with transposed layout [CKK, P].
+  // P = 16, CKK = 768. Target SMEM offset = (ckk * 16 + p) * 4.
+  {
+    const uint32_t Wd = a->W;
+    const uint32_t HWd = a->H * Wd;
+    const uint32_t stride = a->stride;
+    
+    // Initialize coordinate indices outside the loop
+    uint32_t p = tid_in_threadblock >> 9; // tid / 768 (always 0 since tid < 128)
+    uint32_t ckk = tid_in_threadblock & 1023; // tid % 768 = tid
+    
+    for (uint32_t i = tid_in_threadblock; i < 12288; i += threads_per_threadblock) {
+      // Fast power-of-two index calculations:
+      // ckk / 256 -> ckk >> 8
+      // p / 4     -> p >> 2
+      // (ckk / 16) % 16 -> (ckk >> 4) & 15
+      // p % 4     -> p & 3
+      // ckk % 16  -> ckk & 15
+      const uint32_t in_idx = (ckk >> 8) * HWd
+                            + (((p >> 2) * stride + ((ckk >> 4) & 15)) * Wd)
+                            + (p & 3) * stride + (ckk & 15);
+      
+      const uint32_t smem_addr = ((ckk << 4) + p) << 2;
+      store_shared(smem_addr, 0, __builtin_bit_cast(uint32_t, a->in[in_idx]));
+      
+      // Advance coordinates without division
+      ckk += threads_per_threadblock;
+      if (ckk >= 768) {
+        ckk -= 768;
+        p += 1;
+      }
+    }
+  }
+
+  // Synchronize across both cores
+  mu_fence_smem();
+  mu_barrier(0, threads_per_threadblock / MU_NUM_THREADS); 
+
+  // (3) Frugal conflict-free matmul with loop unrolling.
+  {
+    const uint32_t OC_P = 256; // a->OC * P = 16 * 16 = 256
+    for (uint32_t idx = tid_in_threadblock; idx < OC_P; idx += threads_per_threadblock) {
+      uint32_t wa = smem_w + ((idx >> 4) * 3072); // W base: (oc * 768 * 4)
+      uint32_t pa = (idx & 15) << 2;              // Transposed patch base: (p * 4)
+      float acc = 0.0f;
+      
+      // Unroll by 2 to reduce loop control overhead while staying safe of register pressure
+      for (uint32_t k = 0; k < 768; k += 2) {
+        acc += __builtin_bit_cast(float, load32_shared(wa)) *
+               __builtin_bit_cast(float, load32_shared(pa));
+        acc += __builtin_bit_cast(float, load32_shared(wa + 4)) *
+               __builtin_bit_cast(float, load32_shared(pa + 64));
+        wa += 8; 
+        pa += 128;
+      }
+      a->out[idx] = acc;
+    }
+  }
+}
+```

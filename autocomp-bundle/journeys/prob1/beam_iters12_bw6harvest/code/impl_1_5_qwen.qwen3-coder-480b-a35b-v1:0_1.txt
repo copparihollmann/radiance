@@ -1,0 +1,89 @@
+#include <mu_intrinsics.h>
+#include <mu_schedule.h>
+#include <stdint.h>
+
+// Assuming KernelArgs struct layout is defined in the harness
+struct KernelArgs {
+  __global float* in;
+  __global float* w;
+  __global float* out;
+  uint32_t C;
+  uint32_t H;
+  uint32_t W;
+  uint32_t KH;
+  uint32_t KW;
+  uint32_t OC;
+  uint32_t OH;
+  uint32_t OW;
+  uint32_t stride;
+};
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  // Vision Transformer Patch-Embedding Tile Dimensions
+  constexpr uint32_t OC = 16;
+  constexpr uint32_t CKK = 768;
+  constexpr uint32_t P = 16;
+  constexpr uint32_t OW = 4;
+  constexpr uint32_t KH = 16;
+  constexpr uint32_t KW = 16;
+  constexpr uint32_t HWd = 64 * 64;
+  constexpr uint32_t Wd = 64;
+  constexpr uint32_t stride = 16;
+
+  // Pad CKK for bank-conflict-free access across warps
+  constexpr uint32_t CKK_PADDED = 769;
+  constexpr uint32_t smem_w_offset = P * CKK_PADDED; // Start of W data in SMEM
+
+  // Zero-overhead __local shared memory pointer
+  __local float* const smem_base = (__local float*)0x0;
+
+  // (1) Stage W flat into SMEM[smem_w_offset..]
+  for (uint32_t i = tid_in_threadblock; i < OC * CKK; i += threads_per_threadblock) {
+    smem_base[smem_w_offset + i] = a->w[i];
+  }
+
+  // (2) Gather im2col patches into SMEM[0..p * CKK_PADDED] 
+  for (uint32_t p = 0; p < P; ++p) {
+    const uint32_t p_div_OW = p >> 2; // p / OW
+    const uint32_t p_mod_OW = p & 3;  // p % OW
+    const uint32_t h_base = p_div_OW * stride;
+    const uint32_t w_base = p_mod_OW * stride;
+
+    for (uint32_t ckk = tid_in_threadblock; ckk < CKK; ckk += threads_per_threadblock) {
+      const uint32_t c = ckk >> 8;       // ckk / (KH * KW)
+      const uint32_t rem = ckk & 255;    // ckk % (KH * KW)
+      const uint32_t kh = rem >> 4;      // rem / KW
+      const uint32_t kw = rem & 15;      // rem % KW
+
+      const uint32_t in_idx = c * HWd + (h_base + kh) * Wd + (w_base + kw);
+      smem_base[p * CKK_PADDED + ckk] = a->in[in_idx];
+    }
+  }
+
+  // Cross-core synchronization after SMEM staging (ID=0, num_warps=8)
+  mu_barrier(0, threads_per_threadblock / MU_NUM_THREADS);
+
+  // (3) Frugal matmul using bank-conflict-free pointer increments
+  for (uint32_t idx = tid_in_threadblock; idx < OC * P; idx += threads_per_threadblock) {
+    const uint32_t oc = idx >> 4; // idx / P
+    const uint32_t p  = idx & 15; // idx % P
+
+    __local float* wa = smem_base + smem_w_offset + oc * CKK;
+    __local float* pa = smem_base + p * CKK_PADDED;
+    float acc = 0.0f;
+
+    #pragma GCC unroll 1
+    for (uint32_t k = 0; k < CKK; ++k) {
+      acc += (*wa++) * (*pa++);
+    }
+    a->out[idx] = acc;
+  }
+}

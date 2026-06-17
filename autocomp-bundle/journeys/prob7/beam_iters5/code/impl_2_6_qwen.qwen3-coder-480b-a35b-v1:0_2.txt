@@ -1,0 +1,95 @@
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t seq = a->seq;
+  const uint32_t d = a->d;
+  const uint32_t nw = threads_per_threadblock / MU_NUM_THREADS;
+
+  // SMEM layout:
+  // 0x00000: smem_q (32 KiB)
+  // 0x08000: smem_k (32 KiB)
+  // 0x10000: smem_s (64 KiB)
+  // Later phases reuse smem_q and smem_k for V and O respectively.
+  float* smem_q = reinterpret_cast<float*>(0x00000000);
+  float* smem_k = reinterpret_cast<float*>(0x00008000);
+  float* smem_s = reinterpret_cast<float*>(0x00010000);
+  float* smem_v = smem_q;  // Reuse smem_q for V in phase 3
+  float* smem_o = smem_k;  // Reuse smem_k for O in phase 3
+
+  // Phase 1a: Cooperatively load Q into SMEM (stride-1 accesses)
+  for (uint32_t i = tid_in_threadblock; i < seq * d; i += threads_per_threadblock) {
+    smem_q[i] = a->Q[i];
+  }
+  mu_barrier(0, nw); // Cross-core sync for Q
+
+  // Phase 1b: Cooperatively load K into SMEM (stride-1 accesses)
+  for (uint32_t i = tid_in_threadblock; i < seq * d; i += threads_per_threadblock) {
+    smem_k[i] = a->K[i];
+  }
+  mu_barrier(0, nw); // Cross-core sync for K
+
+  // Phase 1c: Compute S[i][j] = 0.125 * Q[i]·K[j] in SMEM
+  for (uint32_t i = tid_in_threadblock; i < seq; i += threads_per_threadblock) {
+    const float* qi = smem_q + i * d;
+    float* si = smem_s + i * seq;
+    for (uint32_t j = 0; j < seq; j++) {
+      const float* kj = smem_k + j * d;
+      float acc = 0.0f;
+      for (uint32_t k = 0; k < d; k++) {
+        acc += qi[k] * kj[k];
+      }
+      si[j] = acc * 0.125f;
+    }
+  }
+  mu_barrier(0, nw); // Cross-core sync for S
+
+  // Phase 2: In-place softmax on smem_s
+  for (uint32_t i = tid_in_threadblock; i < seq; i += threads_per_threadblock) {
+    float* sp = smem_s + i * seq;
+    float m = sp[0];
+    for (uint32_t j = 1; j < seq; j++) {
+      if (sp[j] > m) m = sp[j];
+    }
+    float sum = 0.0f;
+    for (uint32_t j = 0; j < seq; j++) {
+      const float e = mu_exp(sp[j] - m);
+      sp[j] = e;
+      sum += e;
+    }
+    const float inv = 1.0f / sum;
+    for (uint32_t j = 0; j < seq; j++) {
+      sp[j] *= inv;
+    }
+  }
+  mu_barrier(0, nw); // Cross-core sync after softmax
+
+  // Phase 3a: Cooperatively load V into SMEM (reuse smem_q)
+  for (uint32_t i = tid_in_threadblock; i < seq * d; i += threads_per_threadblock) {
+    smem_v[i] = a->V[i];
+  }
+  mu_barrier(0, nw); // Cross-core sync for V
+
+  // Phase 3b: Compute O[i][k] = sum_j P[i][j] * V[j][k] in SMEM
+  for (uint32_t i = tid_in_threadblock; i < seq; i += threads_per_threadblock) {
+    const float* sp = smem_s + i * seq;
+    float* op = smem_o + i * d;
+    for (uint32_t k = 0; k < d; k++) {
+      float acc = 0.0f;
+      for (uint32_t j = 0; j < seq; j++) {
+        acc += sp[j] * smem_v[j * d + k];
+      }
+      op[k] = acc;
+    }
+  }
+  mu_barrier(0, nw); // Cross-core sync for O
+
+  // Phase 3c: Cooperatively write O from SMEM to global
+  for (uint32_t i = tid_in_threadblock; i < seq * d; i += threads_per_threadblock) {
+    a->O[i] = smem_o[i];
+  }
+}

@@ -1,0 +1,32 @@
+### Optimization Plan: Incremental Row/Column Tracking to Eliminate Division (Strategy 7)
+
+#### 1. Inefficiency Analysis
+In the original kernel, the loop index `idx` is mapped to 2D matrix coordinates `row` and `col` in every single iteration using:
+```cpp
+const uint32_t row = idx / args->N;
+const uint32_t col = idx % args->N;
+```
+On the RV32IM architecture of the Radiance Muon core, integer division (`/`) and modulo (`%`) operations are extremely expensive, taking dozens of cycles per call. Furthermore, they require several temporary architectural registers for intermediate calculations, which directly threatens our strict budget of $\le 31$ distinct registers. Because this division occurs in the outer loop for every thread-step, it introduces a massive execution latency bottleneck.
+
+#### 2. Optimization Plan
+We will apply **Strategy 7 (Incremental Row/Column Tracking to Eliminate Division)** to replace the dynamic division/modulo inside the loop with cheap, incremental additions and a conditional reset.
+
+1. **Pre-Compute Initial Offsets & Strides**:
+   Before entering the loop, we calculate the starting coordinates and step strides *once* using the thread's initial index `tid_in_threadblock`:
+   * `row = tid_in_threadblock / args->N`
+   * `col = tid_in_threadblock % args->N`
+   * `row_stride = threads_per_threadblock / args->N`
+   * `col_stride = threads_per_threadblock % args->N`
+
+2. **Replace Division inside the Loop**:
+   Remove the `/` and `%` operations from the loop body. In each iteration of the loop, update `row` and `col` incrementally using the pre-computed strides:
+   * `row += row_stride`
+   * `col += col_stride`
+
+3. **Handle Modulo Wrap-Around with Conditional Logic**:
+   To ensure correctness when `col` wraps around the boundary of the matrix width `args->N`, check if `col >= args->N`. If it does:
+   * Subtract `args->N` from `col` (`col -= args->N`)
+   * Carry over to the next row (`row += 1`)
+
+#### 3. Expected Impact
+This approach completely eliminates division/modulo instructions from the hot loop path, replacing them with single-cycle integer additions and a branch. It reduces register pressure by eliminating the compiler's temporary registers used during complex division routines, helping the kernel easily fit within the $\le 31$ RTL physical register constraint.

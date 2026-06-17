@@ -1,0 +1,69 @@
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t total = args->M * args->N;
+
+  // Precompute initial row/col using division once
+  uint32_t row = tid_in_threadblock / args->N;
+  uint32_t col = tid_in_threadblock % args->N;
+
+  // Precompute row/col strides to avoid repeated division in loop
+  const uint32_t row_stride = threads_per_threadblock / args->N;
+  const uint32_t col_stride = threads_per_threadblock % args->N;
+
+  // Input/output pointers (no register tiling – one accumulator per thread)
+  const __global float* a = args->A;
+  const __global float* b = args->B;
+  __global float* c = args->C;
+
+  // Shared memory tile base address
+  const uint32_t smem_a_base = 0;
+  const uint32_t smem_b_base = 0x10000; // 64 KiB in; safe separation
+
+  for (; row < args->M; row += row_stride) {
+    // Handle column wrap-around manually
+    if (col >= args->N) {
+      col -= args->N;
+      row += 1;
+      if (row >= args->M) break;
+    }
+
+    float acc = 0.0f;
+
+    // Stage A[row, :] and B[:, col] into SMEM
+    const uint32_t k_tiles = (args->K + 15) / 16; // process 16-wide chunks
+    for (uint32_t tile_start = 0; tile_start < args->K; tile_start += 16) {
+      const uint32_t chunk_size = (tile_start + 16 > args->K) ? (args->K - tile_start) : 16;
+
+      // Each lane loads one element from A and one from B
+      const uint32_t lane_id = tid_in_threadblock & 15;
+      if (lane_id < chunk_size) {
+        uint32_t a_idx = row * args->K + tile_start + lane_id;
+        uint32_t b_idx = (tile_start + lane_id) * args->N + col;
+        store_shared(smem_a_base + ((tile_start + lane_id) << 2), 0, *(a + a_idx));
+        store_shared(smem_b_base + ((tile_start + lane_id) << 2), 0, *(b + b_idx));
+      }
+
+      // Cross-core barrier: ensures visibility of SMEM writes from both cores
+      mu_barrier(0, threads_per_threadblock / MU_NUM_THREADS);
+
+      // Accumulate using SMEM data
+      for (uint32_t k = 0; k < chunk_size; ++k) {
+        float a_val = load32_shared(smem_a_base + ((tile_start + k) << 2));
+        float b_val = load32_shared(smem_b_base + ((tile_start + k) << 2));
+        acc += a_val * b_val;
+      }
+    }
+
+    // Write final output to global memory
+    *(c + row * args->N + col) = acc;
+
+    // Update column with modular arithmetic
+    col += col_stride;
+  }
+}

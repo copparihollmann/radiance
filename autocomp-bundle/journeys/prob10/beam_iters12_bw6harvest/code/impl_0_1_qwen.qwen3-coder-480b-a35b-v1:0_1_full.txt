@@ -1,0 +1,110 @@
+```cpp
+#include <stdint.h>
+
+// Hardware intrinsics and helpers (minimal required subset)
+inline void store_shared(uint32_t base, uint32_t offset, uint32_t data) {
+    asm volatile("sw.shared %2, %1(%0)" :: "r"(base), "I"(offset), "r"(data) : "memory");
+}
+
+inline uint32_t load32_shared(uint32_t address) {
+    uint32_t data;
+    asm volatile("lw.shared %0, %1(%2)" : "=r"(data) : "I"(0), "r"(address) : "memory");
+    return data;
+}
+
+__attribute__((convergent))
+static void mu_barrier(unsigned barrier_id, unsigned num_warps) {
+    asm volatile ("vx_bar %0, %1" :: "r"(barrier_id), "r"(num_warps) : "memory");
+}
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  const uint32_t M = args->M;
+  const uint32_t N = args->N;
+  const uint32_t K = args->K;
+
+  // Assign threadblock-local tile coordinates
+  const uint32_t warp_id = tid_in_threadblock >> 4; // tid / 16
+  const uint32_t lane_id = tid_in_threadblock & 15; // tid % 16
+
+  // Shared memory layout:
+  // A_tile: [0, 1024) -> 16x16 floats (padded rows to avoid bank conflicts)
+  // B_tile: [1024, 2048) -> 16x16 floats (padded rows to avoid bank conflicts)
+  const uint32_t smem_A_base = 0;
+  const uint32_t smem_B_base = 1024;
+
+  // Loop over output tiles of C: 16x16
+  for (uint32_t row_block = 0; row_block < M; row_block += 16) {
+    const uint32_t row = row_block + warp_id;
+
+    for (uint32_t col_block = 0; col_block < N; col_block += 16) {
+      float acc0 = 0.0f;
+      float acc1 = 0.0f;
+
+      // Stream K dimension in chunks of 16
+      for (uint32_t k_outer = 0; k_outer < K; k_outer += 16) {
+        // Cooperative load A tile into shared memory (16x16)
+        // Each thread loads two elements: one for row warp_id, one for row warp_id+8
+        const uint32_t a_row1_addr = (row_block + warp_id) * K + k_outer + lane_id;
+        const uint32_t a_row2_addr = (row_block + warp_id + 8) * K + k_outer + lane_id;
+        
+        if (a_row1_addr < M * K)
+          store_shared(smem_A_base, (warp_id * 16 + lane_id) * 4, __builtin_bit_cast(uint32_t, args->A[a_row1_addr]));
+        if (a_row2_addr < M * K)
+          store_shared(smem_A_base, ((warp_id + 8) * 16 + lane_id) * 4, __builtin_bit_cast(uint32_t, args->A[a_row2_addr]));
+
+        // Cooperative load B tile into shared memory (16x16)
+        const uint32_t b_col1_idx = col_block + lane_id;
+        const uint32_t b_row1_addr = (k_outer + warp_id) * N + b_col1_idx;
+        const uint32_t b_row2_addr = (k_outer + warp_id + 8) * N + b_col1_idx;
+
+        if (b_col1_idx < N) {
+          if (b_row1_addr < K * N)
+            store_shared(smem_B_base, (warp_id * 16 + lane_id) * 4, __builtin_bit_cast(uint32_t, args->B[b_row1_addr]));
+          if (b_row2_addr < K * N)
+            store_shared(smem_B_base, ((warp_id + 8) * 16 + lane_id) * 4, __builtin_bit_cast(uint32_t, args->B[b_row2_addr]));
+        }
+
+        // Cross-core barrier to ensure all shared memory writes are complete
+        mu_barrier(0, threads_per_threadblock >> 4); // Total warps = 128 / 16 = 8
+
+        // Compute partial products using shared memory
+        for (uint32_t k_inner = 0; k_inner < 16; ++k_inner) {
+          const uint32_t a_off0 = (warp_id * 16 + k_inner) * 4;
+          const uint32_t a_off1 = ((warp_id + 8) * 16 + k_inner) * 4;
+          const uint32_t b_off = (k_inner * 16 + lane_id) * 4;
+
+          float a_val0 = __builtin_bit_cast(float, load32_shared(smem_A_base + a_off0));
+          float a_val1 = __builtin_bit_cast(float, load32_shared(smem_A_base + a_off1));
+          float b_val  = __builtin_bit_cast(float, load32_shared(smem_B_base + b_off));
+
+          acc0 += a_val0 * b_val;
+          acc1 += a_val1 * b_val;
+        }
+
+        // Barrier between iterations to prevent race on next SMEM tile load
+        mu_barrier(0, threads_per_threadblock >> 4);
+      }
+
+      // Write accumulated results back to global memory
+      const uint32_t c_row1_idx = row_block + warp_id;
+      const uint32_t c_row2_idx = row_block + warp_id + 8;
+      const uint32_t c_col_idx = col_block + lane_id;
+
+      if (c_row1_idx < M && c_col_idx < N) {
+        args->C[c_row1_idx * N + c_col_idx] = acc0;
+      }
+      if (c_row2_idx < M && c_col_idx < N) {
+        args->C[c_row2_idx * N + c_col_idx] = acc1;
+      }
+    }
+  }
+}
+```

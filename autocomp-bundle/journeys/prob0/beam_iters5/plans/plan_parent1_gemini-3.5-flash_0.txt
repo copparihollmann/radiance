@@ -1,0 +1,31 @@
+An elegant and highly optimized plan to improve the performance of the FP32 matrix multiplication kernel while strictly adhering to the Radiance Muon hardware constraints (especially the **31-register hard limit** and **cross-core SMEM barrier requirements**).
+
+### Analysis of Inefficiencies in the Baseline
+
+1. **Global Memory Latency**: The baseline loop loads elements of $A$ and $B$ from global memory inside the innermost $K$ loop. Since global memory loads have $\sim$400-cycle latency, this stalls the execution pipeline continuously.
+2. **Lack of Address/Compute Interleaving**: There is no overlapping between the integer pipeline (pointer math) and the floating-point pipeline, leading to underutilization of the dual-issue capability.
+3. **No Operand Reuse**: $A$ and $B$ elements are loaded repeatedly from global memory instead of being cached on-chip.
+
+---
+
+### Optimization Plan
+
+We will optimize the kernel by staging the input matrices $A$ and $B$ into Shared Memory (SMEM) and using a carefully balanced loop that minimizes register footprint.
+
+#### 1. Shared Memory Staging and Conflict Avoidance
+* **SMEM Allocation**: Since $M=64$, $N=64$, and $K=64$, we will stage the entire $A$ ($64 \times 64 \times 4$ bytes = 16 KiB) and $B$ ($64 \times 64 \times 4$ bytes = 16 KiB) matrices into SMEM.
+* **Bank Padding**: To avoid 16-way bank conflicts during column-major or strided accesses to $B$, we will add a padding of 16 floats to the $K$ dimension of $B$ in SMEM:
+  $$\text{smem\_b\_stride} = K + 16 = 80$$
+  This ensures that successive columns are offset by an odd/non-conflicting number of bank strides.
+
+#### 2. Cross-Core Barrier Synchronization
+Since threads across both cores cooperate to load the matrices into SMEM, and then read from any location, we **must** use the cross-core barrier:
+`mu_barrier(0, 8)` (where `8` is the total number of warps across both cores). Using `mu_barrier(1, ...)` would cause silent data corruption on RTL.
+
+#### 3. Low-Register Co-Scheduled Compute Loop
+To stay well below the 31-register limit (to prevent RTL over-subscription), we will:
+* Avoid multi-output register tiling (which requires many accumulators).
+* Use exactly **one** accumulator (`acc`) per thread.
+* Use a single pointer for tracking the current read position in $A$ (`a_ptr`) and $B$ (`b_ptr`).
+* Interleave address increments (`a_ptr += 16`, `b_ptr += 16`) with independent FP32 multiply-accumulates. This exploits the asymmetric execution of the 16 INT PEs and 8 FP32 PEs in parallel to hide the 2-cycle FP32 latency.
+* Unroll the $K$ loop by a factor of 4 or 8 to expose instruction-level parallelism (ILP) while keeping register pressure minimal.

@@ -1,0 +1,69 @@
+#include <vx_intrinsics.h>
+#include <mu_intrinsics.h>
+#include <mu_schedule.h>
+#include <shared_mem.h>
+#include <stdint.h>
+
+struct KernelArgs {
+  __global float* A;
+  __global float* B;
+  __global float* C;
+  uint32_t M;
+  uint32_t K;
+  uint32_t N;
+};
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  // Shared memory allocation
+  __shared float* const smem = reinterpret_cast<__shared float*>(0x0);
+  __shared float* As = smem;
+  __shared float* Bs = smem + 128 + 16; // +16 for padding to avoid bank conflicts
+
+  const uint32_t tid = tid_in_threadblock;
+  const uint32_t i = tid >> 4;
+  const uint32_t j = tid & 15;
+
+  // Iterate over output tiles
+  for (uint32_t block_r = 0; block_r < 8; block_r++) {
+    for (uint32_t block_c = 0; block_c < 4; block_c++) {
+      float acc = 0.0f;
+
+      // Loop over K dimension in tiles
+      for (uint32_t ks = 0; ks < 4; ks++) {
+        // Load A tile (8x16) - coalesced access
+        const uint32_t a_idx = (((block_r << 3) + i) << 6) + (ks << 4) + j;
+        As[tid] = args->A[a_idx];
+
+        // Load B tile (16x16) - split into two coalesced accesses
+        const uint32_t b_row1 = (ks << 4) + i;
+        const uint32_t b_row2 = b_row1 + 8;
+        const uint32_t b_col = (block_c << 4) + j;
+        Bs[tid] = args->B[(b_row1 << 6) + b_col];
+        Bs[tid + 128] = args->B[(b_row2 << 6) + b_col];
+
+        // Cross-core synchronization after loading data
+        mu_barrier(0, 8);
+
+        // Compute partial product
+        for (uint32_t k = 0; k < 16; k++) {
+          acc += As[(i << 4) + k] * Bs[(k << 4) + j + (k >= 8 ? 128 : 0)];
+        }
+
+        // Synchronize for next iteration
+        mu_barrier(0, 8);
+      }
+
+      // Write result back to global memory
+      const uint32_t c_idx = (((block_r << 3) + i) << 6) + (block_c << 4) + j;
+      args->C[c_idx] = acc;
+    }
+  }
+}

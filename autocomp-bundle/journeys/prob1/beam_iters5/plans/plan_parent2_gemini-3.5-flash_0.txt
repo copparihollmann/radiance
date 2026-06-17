@@ -1,0 +1,137 @@
+An elegant and highly effective optimization plan to address the inefficiencies in the provided conv2d patch-embedding kernel.
+
+### Optimization Plan: Strategy 10 (Unroll inner K-loop over BK to expose instruction-level parallelism across lanes)
+
+The baseline implementation suffers from significant instruction and compute overheads. Specifically:
+1. **Expensive Division and Modulo Operations:** In the gather phase (Phase 2), the flat loop uses multiple variables (`C`, `KH`, `KW`, `OW`, `W`, etc.) and performs several integer divisions and modulos (`i / CKK`, `i % CKK`, `ckk / (KH * KW)`, etc.) on every iteration. Since these dimensions are not known as compile-time constants by the compiler, it generates highly expensive software division/modulo routines or hardware serialization stalls.
+2. **Loop and Address Arithmetic Overhead:** Index calculations like `smem_w + (idx / P) * CKK * 4` and pointer advancements happen continuously.
+3. **No Instruction-Level Parallelism (ILP):** The inner matmul loop (Phase 3) sequentially loads a single word from `wa` and `pa` on every iteration, leading to raw pipeline dependency stalls on the 2-cycle FP32 SIMD latency.
+
+#### Steps to Implement the Optimization:
+1. **Unroll the Inner Matmul Loop (Strategy 10):** Unroll the inner $K$-loop by a factor of 8. Since the total inner loop trip count ($CKK = 768$) is a multiple of 8, we can fully unroll it.
+2. **Implement Offset-Based Shared Memory Loads:** Define a macro/intrinsic helper `load32_shared_offset(addr, offset)` utilizing the custom I2-type `lw.shared` instruction which supports immediate offsets. This avoids the register pressure and instructions of adding offsets to base registers (`wa` and `pa`) inside the unrolled loop, allowing the compiler to reuse a minimal set of registers.
+3. **Eliminate All Divisions and Modulos in Gather Phase:**
+   - Observe that the thread step size is always $128$, and $CKK = 768$ is a multiple of $128$.
+   - We can track the indices `p` and `ckk` incrementally! Initialize `p = 0`, `ckk = tid_in_threadblock`. In each iteration, we add $128$ to `ckk`. If `ckk >= 768`, we decrement it by $768$ and increment `p`.
+   - Replace remaining divisions/modulos with bitwise shifts and mask operations, as $KH=16$, $KW=16$, and $OW=4$ are powers of 2.
+4. **Eliminate Matmul Index Div/Mod:** Replace `/ P` and `% P` with `>> 4` and `& 15` respectively, since $P = 16$.
+5. **Incremental Address Generation:** Track `dest_addr` in Phase 1 and Phase 2 incrementally (e.g., `dest_addr += 512` per step) to bypass any multiplier and index addition arithmetic.
+
+---
+
+### Optimized Code
+
+```cpp
+#include <stdint.h>
+
+// Macro to load from shared memory using a compile-time immediate offset.
+// This leverages the I2-type format of the lw.shared instruction.
+#define load32_shared_offset(addr, offset) ({ \
+    uint32_t __data; \
+    asm volatile("lw.shared %0, %1(%2)" : "=r"(__data) : "i"(offset), "r"(addr) : "memory"); \
+    __data; \
+})
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  (void)threads_per_threadblock;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  
+  // Total elements in patch/W dimensions are fixed for this patch-embedding tile:
+  // OUT[16, 4, 4] = IN[3, 64, 64] * W[16, 3, 16, 16]
+  // CKK = 3 * 16 * 16 = 768
+  // P = 4 * 4 = 16
+  // OC = 16
+  const uint32_t smem_w = 49152; // 16 * 768 * 4 (W is staged after the patches)
+
+  // (1) Stage W flat into SMEM[smem_w..]
+  {
+    uint32_t dest_addr = smem_w + tid_in_threadblock * 4;
+    for (uint32_t i = tid_in_threadblock; i < 12288; i += 128) {
+      store_shared(dest_addr, 0, __builtin_bit_cast(uint32_t, a->w[i]));
+      dest_addr += 512; // 128 threads * 4 bytes
+    }
+  }
+
+  // (2) Gather im2col patches into SMEM[0..] with incremental indexing (zero divisions/modulos)
+  {
+    const uint32_t Wd = a->W;      // 64
+    const uint32_t HWd = a->H * Wd; // 4096
+    const uint32_t stride = a->stride; // 16
+    const uint32_t total = 12288;  // P * CKK = 16 * 768
+
+    uint32_t p = 0;
+    uint32_t ckk = tid_in_threadblock;
+    uint32_t dest_addr = tid_in_threadblock * 4;
+
+    for (uint32_t i = tid_in_threadblock; i < total; i += 128) {
+      // Deconstruct ckk and p using bitwise shifts/ands since KH=16, KW=16, OW=4
+      const uint32_t c = ckk >> 8;           // ckk / 256
+      const uint32_t kh = (ckk >> 4) & 15;   // (ckk / 16) % 16
+      const uint32_t kw = ckk & 15;          // ckk % 16
+      const uint32_t ph = p >> 2;            // p / 4
+      const uint32_t pw = p & 3;             // p % 4
+
+      const uint32_t in_idx = c * HWd
+                            + (ph * stride + kh) * Wd
+                            + pw * stride + kw;
+
+      store_shared(dest_addr, 0, __builtin_bit_cast(uint32_t, a->in[in_idx]));
+
+      dest_addr += 512; // 128 threads * 4 bytes
+
+      // Incrementally advance ckk and p
+      ckk += 128;
+      if (ckk >= 768) {
+        ckk -= 768;
+        p += 1;
+      }
+    }
+  }
+
+  // Synchronize across cores. Since we stage cooperatively, we use cross-core barrier ID 0.
+  mu_fence_smem();
+  mu_barrier(0, 8); // 8 warps total (2 cores x 4 warps)
+
+  // (3) Frugal matmul with unrolled inner loop and immediate-offset shared memory loads
+  {
+    for (uint32_t idx = tid_in_threadblock; idx < 256; idx += 128) {
+      const uint32_t oc = idx >> 4;   // idx / 16
+      const uint32_t p = idx & 15;    // idx % 16
+      
+      uint32_t wa = smem_w + oc * 3072; // oc * 768 * 4
+      uint32_t pa = p * 3072;          // p * 768 * 4
+      
+      float acc = 0.0f;
+      
+      // Unrolled by 8 to maximize instruction-level parallelism and hide FP32 execution latency.
+      for (uint32_t k = 0; k < 768; k += 8) {
+        acc += __builtin_bit_cast(float, load32_shared_offset(wa, 0)) *
+               __builtin_bit_cast(float, load32_shared_offset(pa, 0));
+        acc += __builtin_bit_cast(float, load32_shared_offset(wa, 4)) *
+               __builtin_bit_cast(float, load32_shared_offset(pa, 4));
+        acc += __builtin_bit_cast(float, load32_shared_offset(wa, 8)) *
+               __builtin_bit_cast(float, load32_shared_offset(pa, 8));
+        acc += __builtin_bit_cast(float, load32_shared_offset(wa, 12)) *
+               __builtin_bit_cast(float, load32_shared_offset(pa, 12));
+        acc += __builtin_bit_cast(float, load32_shared_offset(wa, 16)) *
+               __builtin_bit_cast(float, load32_shared_offset(pa, 16));
+        acc += __builtin_bit_cast(float, load32_shared_offset(wa, 20)) *
+               __builtin_bit_cast(float, load32_shared_offset(pa, 20));
+        acc += __builtin_bit_cast(float, load32_shared_offset(wa, 24)) *
+               __builtin_bit_cast(float, load32_shared_offset(pa, 24));
+        acc += __builtin_bit_cast(float, load32_shared_offset(wa, 28)) *
+               __builtin_bit_cast(float, load32_shared_offset(pa, 28));
+        wa += 32;
+        pa += 32;
+      }
+      a->out[idx] = acc;
+    }
+  }
+}
+```

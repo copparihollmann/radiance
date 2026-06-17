@@ -1,0 +1,109 @@
+#define SMEM_Q_OFFSET 0
+#define SMEM_K_OFFSET 24576
+#define SMEM_V_OFFSET 49152
+#define SMEM_S_OFFSET 73728
+
+inline void store_shared_float(uint32_t addr, float val) {
+    union { float f; uint32_t i; } u;
+    u.f = val;
+    asm volatile("sw.shared %2, 0(%0)" :: "r"(addr), "r"(u.i) : "memory");
+}
+
+inline float load_shared_float(uint32_t addr) {
+    union { float f; uint32_t i; } u;
+    asm volatile("lw.shared %0, 0(%1)" : "=r"(u.i) : "r"(addr) : "memory");
+    return u.f;
+}
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t num_warps = threads_per_threadblock / MU_NUM_THREADS;
+  const float scale = 0.125f;
+
+  const uint32_t SEQ = 96;
+  const uint32_t HEAD_DIM = 64;
+  const uint32_t total_elements = SEQ * HEAD_DIM;
+  const uint32_t score_elements = SEQ * SEQ;
+
+  // 1. Cooperative Global-to-SMEM Load of Q, K, and V
+  for (uint32_t idx = tid_in_threadblock; idx < total_elements; idx += threads_per_threadblock) {
+    store_shared_float(SMEM_Q_OFFSET + idx * 4, a->Q[idx]);
+  }
+
+  for (uint32_t idx = tid_in_threadblock; idx < total_elements; idx += threads_per_threadblock) {
+    store_shared_float(SMEM_K_OFFSET + idx * 4, a->K[idx]);
+  }
+
+  for (uint32_t idx = tid_in_threadblock; idx < total_elements; idx += threads_per_threadblock) {
+    store_shared_float(SMEM_V_OFFSET + idx * 4, a->V[idx]);
+  }
+
+  // Cross-Core Barrier to ensure all loaded values are visible to both cores
+  mu_barrier(0, num_warps);
+
+  // 2. Phase 1: Scores computation (completely inside SMEM)
+  for (uint32_t idx = tid_in_threadblock; idx < score_elements; idx += threads_per_threadblock) {
+    const uint32_t i = idx / SEQ;
+    const uint32_t j = idx % SEQ;
+    float acc = 0.0f;
+    uint32_t q_addr = SMEM_Q_OFFSET + (i * HEAD_DIM) * 4;
+    uint32_t k_addr = SMEM_K_OFFSET + (j * HEAD_DIM) * 4;
+
+    for (uint32_t k = 0; k < HEAD_DIM; k++) {
+      float q_val = load_shared_float(q_addr + k * 4);
+      float k_val = load_shared_float(k_addr + k * 4);
+      acc += q_val * k_val;
+    }
+    store_shared_float(SMEM_S_OFFSET + idx * 4, acc * scale);
+  }
+
+  mu_barrier(0, num_warps);
+
+  // 3. Phase 2: Softmax per row (completely inside SMEM)
+  for (uint32_t row = tid_in_threadblock; row < SEQ; row += threads_per_threadblock) {
+    uint32_t row_addr = SMEM_S_OFFSET + (row * SEQ) * 4;
+    float m = load_shared_float(row_addr);
+
+    for (uint32_t j = 1; j < SEQ; j++) {
+      const float v = load_shared_float(row_addr + j * 4);
+      if (v > m) m = v;
+    }
+
+    float sum = 0.0f;
+    for (uint32_t j = 0; j < SEQ; j++) {
+      const float e = mu_exp(load_shared_float(row_addr + j * 4) - m);
+      store_shared_float(row_addr + j * 4, e);
+      sum += e;
+    }
+
+    const float inv = 1.0f / sum;
+    for (uint32_t j = 0; j < SEQ; j++) {
+      float val = load_shared_float(row_addr + j * 4);
+      store_shared_float(row_addr + j * 4, val * inv);
+    }
+  }
+
+  mu_barrier(0, num_warps);
+
+  // 4. Phase 3: O = P V (reads S & V from SMEM, writes O to Global)
+  for (uint32_t idx = tid_in_threadblock; idx < total_elements; idx += threads_per_threadblock) {
+    const uint32_t i = idx / HEAD_DIM;
+    const uint32_t k = idx % HEAD_DIM;
+    float acc = 0.0f;
+    uint32_t s_addr = SMEM_S_OFFSET + (i * SEQ) * 4;
+    uint32_t v_addr = SMEM_V_OFFSET + k * 4;
+
+    for (uint32_t j = 0; j < SEQ; j++) {
+      float s_val = load_shared_float(s_addr + j * 4);
+      float v_val = load_shared_float(v_addr + (j * HEAD_DIM) * 4);
+      acc += s_val * v_val;
+    }
+    a->O[idx] = acc;
+  }
+}

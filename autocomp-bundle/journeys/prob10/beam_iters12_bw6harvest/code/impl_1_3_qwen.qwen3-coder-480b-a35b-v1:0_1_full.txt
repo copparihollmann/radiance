@@ -1,0 +1,86 @@
+```cpp
+#include <stdint.h>
+
+// Struct definition matching the harness
+struct KernelArgs {
+  const float* A;
+  const float* B;
+  float* C;
+  uint32_t M;
+  uint32_t N;
+  uint32_t K;
+};
+
+static inline float bits_to_float(uint32_t b) { union { uint32_t u; float f; } c; c.u = b; return c.f; }
+static inline uint32_t float_to_bits(float f) { union { uint32_t u; float f; } c; c.f = f; return c.u; }
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  const uint32_t M = args->M;
+  const uint32_t N = args->N;
+  const uint32_t K = args->K;
+
+  const uint32_t total_outputs = M * N;
+
+  // Shared memory layout
+  const uint32_t smem_a_base = 0;
+  const uint32_t smem_b_base = 16 * K * sizeof(float); // 16 rows of K elements
+  const uint32_t PAD = 16; // Padding to avoid bank conflicts
+  const uint32_t b_stride = K + PAD;
+
+  // Iterate over output elements assigned to this thread
+  for (uint32_t idx = tid_in_threadblock; idx < total_outputs; idx += threads_per_threadblock) {
+    const uint32_t row = idx / N;
+    const uint32_t col = idx % N;
+
+    // Determine which 16x16 block this element belongs to
+    const uint32_t block_row = row / 16;
+    const uint32_t block_col = col / 16;
+    
+    // Determine local coordinates within the block
+    const uint32_t local_row = row % 16;
+    const uint32_t local_col = col % 16;
+
+    // Load A tile (16 x K) cooperatively into shared memory
+    for (uint32_t k = 0; k < K; k++) {
+        const uint32_t global_a_idx = (block_row * 16 + local_row) * K + k;
+        store_shared(smem_a_base + (local_row * K + k) * sizeof(float), 0, float_to_bits(args->A[global_a_idx]));
+    }
+
+    // Load B tile (K x 16) transposed and padded into shared memory
+    for (uint32_t k = 0; k < K; k++) {
+        const uint32_t global_b_idx = k * N + (block_col * 16 + local_col);
+        store_shared(smem_b_base + (local_col * b_stride + k) * sizeof(float), 0, float_to_bits(args->B[global_b_idx]));
+    }
+
+    // Synchronize to ensure all SMEM writes are complete
+    mu_barrier(0, threads_per_threadblock / 16); // Cross-core barrier
+
+    // Compute dot product using shared memory
+    float acc = 0.0f;
+    uint32_t a_ptr = smem_a_base + local_row * K * sizeof(float);
+    uint32_t b_ptr = smem_b_base + local_col * b_stride * sizeof(float);
+
+    for (uint32_t k = 0; k < K; k++) {
+        float a_val = bits_to_float(load32_shared(a_ptr));
+        float b_val = bits_to_float(load32_shared(b_ptr));
+        acc += a_val * b_val;
+        a_ptr += sizeof(float);
+        b_ptr += sizeof(float);
+    }
+
+    // Store result to global memory
+    args->C[idx] = acc;
+
+    // Synchronize before next iteration to prevent overwriting SMEM
+    mu_barrier(0, threads_per_threadblock / 16); // Cross-core barrier
+  }
+}
+```

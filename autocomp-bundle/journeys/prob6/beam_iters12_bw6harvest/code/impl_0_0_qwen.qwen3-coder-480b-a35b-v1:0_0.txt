@@ -1,0 +1,110 @@
+#include <mu_intrinsics.h>
+#include <mu_schedule.h>
+#include <stdint.h>
+
+struct KernelArgs {
+  __global float* A;
+  __global float* B;
+  __global float* C;
+  uint32_t M;
+  uint32_t N;
+  uint32_t K;
+};
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t M = args->M;
+  const uint32_t N = args->N;
+  const uint32_t K = args->K;
+  const uint32_t num_warps = threads_per_threadblock / MU_NUM_THREADS;
+
+  // Tiling parameters
+  constexpr uint32_t TILE_M = 16;
+  constexpr uint32_t TILE_N = 32;
+  constexpr uint32_t TILE_K = 64;
+  constexpr uint32_t PAD = 16;
+
+  // Shared memory layout
+  const uint32_t smem_a_offset = 0;
+  const uint32_t smem_b_offset = TILE_M * TILE_K * sizeof(float); // 16*64*4 = 4096
+
+  // Grid of 16 rows x 8 columns mapped to 128 threads
+  const uint32_t row_thread = tid_in_threadblock / 8; // 0-15
+  const uint32_t col_thread = tid_in_threadblock % 8; // 0-7
+
+  // Outer loop over output tiles
+  for (uint32_t tile_row = 0; tile_row < (M + TILE_M - 1) / TILE_M; ++tile_row) {
+    for (uint32_t tile_col = 0; tile_col < (N + TILE_N - 1) / TILE_N; ++tile_col) {
+
+      // Initialize single accumulator
+      float accumulator = 0.0f;
+
+      // Iterate through K dimension in chunks
+      for (uint32_t k_outer = 0; k_outer < K; k_outer += TILE_K) {
+        // Cooperatively load A tile (16x64)
+        for (uint32_t i = tid_in_threadblock; i < TILE_M * TILE_K; i += threads_per_threadblock) {
+          uint32_t local_row = i / TILE_K;
+          uint32_t local_k = i % TILE_K;
+          uint32_t global_row = tile_row * TILE_M + local_row;
+          uint32_t global_k = k_outer + local_k;
+          
+          if (global_row < M && global_k < K) {
+            float val = args->A[global_row * K + global_k];
+            store_shared(smem_a_offset + i * sizeof(float), 0, __builtin_bit_cast(uint32_t, val));
+          } else {
+            store_shared(smem_a_offset + i * sizeof(float), 0, 0);
+          }
+        }
+
+        // Cooperatively load B tile (64x32) transposed with padding
+        for (uint32_t i = tid_in_threadblock; i < TILE_K * TILE_N; i += threads_per_threadblock) {
+          uint32_t local_k = i / TILE_N;
+          uint32_t local_col = i % TILE_N;
+          uint32_t global_k = k_outer + local_k;
+          uint32_t global_col = tile_col * TILE_N + local_col;
+          
+          if (global_k < K && global_col < N) {
+            float val = args->B[global_k * N + global_col];
+            uint32_t smem_addr = smem_b_offset + (local_col * (TILE_K + PAD) + local_k) * sizeof(float);
+            store_shared(smem_addr, 0, __builtin_bit_cast(uint32_t, val));
+          } else {
+            uint32_t smem_addr = smem_b_offset + (local_col * (TILE_K + PAD) + local_k) * sizeof(float);
+            store_shared(smem_addr, 0, 0);
+          }
+        }
+
+        // Cross-core synchronization barrier
+        mu_barrier(0, num_warps);
+
+        // Compute partial product using single accumulator
+        uint32_t a_addr = smem_a_offset + row_thread * TILE_K * sizeof(float);
+        uint32_t b_base = smem_b_offset + col_thread * sizeof(float); // Each thread handles 1 column
+        
+        #pragma GCC unroll 1
+        for (uint32_t k_inner = 0; k_inner < TILE_K; ++k_inner) {
+          float a_val = __builtin_bit_cast(float, load32_shared(a_addr));
+          float b_val = __builtin_bit_cast(float, load32_shared(b_base));
+          accumulator += a_val * b_val;
+          a_addr += sizeof(float);
+          b_base += (TILE_K + PAD) * sizeof(float); // Move to next row in transposed B
+        }
+
+        // Synchronize before next iteration
+        mu_barrier(0, num_warps);
+      }
+
+      // Write result back to global memory
+      uint32_t global_row = tile_row * TILE_M + row_thread;
+      uint32_t global_col = tile_col * TILE_N + col_thread;
+      if (global_row < M && global_col < N) {
+        args->C[global_row * N + global_col] = accumulator;
+      }
+    }
+  }
+}

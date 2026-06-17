@@ -1,0 +1,138 @@
+### Optimization Plan
+
+To optimize the matrix multiplication kernel ($C[64,64] = A[64,768] \times B[768,64]$) and reduce execution cycles while strictly obeying the physical register limit ($\le 31$ registers) and shared memory boundaries, we will implement **2D Shared-Memory Tiling combined with Register Tiling**:
+
+1. **Avoid Shared Memory Overflow**: 
+   The original code attempted to stage the entire $M \times K$ and $K \times N$ matrices into SMEM, which requires $192\text{ KiB} + 192\text{ KiB} = 384\text{ KiB}$. This far exceeds the physical $128\text{ KiB}$ SMEM capacity and corrupts memory. We will partition the $C$ matrix into 8 tiles of size $M_{\text{tile}} = 16$ and $N_{\text{tile}} = 32$. We then stage the contraction dimension $K=768$ in chunks of $K_{\text{tile}} = 64$. This limits the SMEM footprint to $14\text{ KiB}$, well within limits.
+
+2. **Register-Lean Register Tiling (1x4 thread tile)**:
+   We partition the 128 threads in the threadblock into a $16 \times 8$ logical grid. Each thread computes 4 horizontal outputs of $C$. Each thread holds exactly 4 accumulators in registers. In the inner loop, we load 1 element of $A$ from SMEM and reuse it across 4 loads of $B$, reducing SMEM loads by $4\times$. This uses only ~11 distinct registers, well below the hard limit of 31 registers.
+
+3. **Incremental Pointer Arithmetic**:
+   Rather than performing complex index calculations (`col * stride + k`) inside the unrolled inner loop, we initialize pointer registers to the base addresses in SMEM and increment them by 4 bytes. This reduces register pressure and instruction issue overhead.
+
+4. **Correct Cross-Core Synchronization**:
+   Since the threadblock spans two cores and threads cooperatively stage data to SMEM, we must use `mu_barrier(0, num_warps)` (Barrier ID 0) for cross-core memory visibility, replacing the incorrect single-core `mu_barrier(1, ...)`.
+
+### Optimized C++ Code
+
+```cpp
+#include <mu_intrinsics.h>
+#include <mu_schedule.h>
+#include <stdint.h>
+
+struct KernelArgs {
+  __global float* A;
+  __global float* B;
+  __global float* C;
+  uint32_t M;
+  uint32_t N;
+  uint32_t K;
+};
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t K = args->K;
+  const uint32_t N = args->N;
+  const uint32_t num_warps = threads_per_threadblock / MU_NUM_THREADS;
+
+  // Tiling Configuration
+  constexpr uint32_t M_TILE = 16;
+  constexpr uint32_t N_TILE = 32;
+  constexpr uint32_t K_TILE = 64;
+  constexpr uint32_t PAD = 16;
+
+  // Shared Memory Offsets
+  const uint32_t smem_a = 0;
+  const uint32_t smem_b = M_TILE * K_TILE * 4; // 16 * 64 * 4 = 4096 bytes
+
+  // Logical Thread Mapping: 16 rows x 8 cols
+  const uint32_t tr = tid_in_threadblock / 8; // 0..15
+  const uint32_t tc = tid_in_threadblock % 8; // 0..7
+
+  // Loop over the 8 tiles of C (64x64 matrix divided into 16x32 tiles -> 4x2 grid of tiles)
+  #pragma unroll 1
+  for (uint32_t tile_idx = 0; tile_idx < 8; ++tile_idx) {
+    const uint32_t tile_r = tile_idx / 2;
+    const uint32_t tile_c = tile_idx % 2;
+
+    // Initialize accumulators for 4 outputs per thread
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+
+    // Loop over the contraction dimension K
+    for (uint32_t kk = 0; kk < K; kk += K_TILE) {
+      
+      // 1. Cooperative Stage A Tile (16 rows x 64 cols = 1024 elements)
+      #pragma unroll
+      for (uint32_t i = tid_in_threadblock; i < 1024; i += 128) {
+        const uint32_t local_r = i >> 6; // i / 64
+        const uint32_t local_k = i & 63; // i % 64
+        const uint32_t global_r = tile_r * M_TILE + local_r;
+        const uint32_t global_k = kk + local_k;
+        const float val = args->A[global_r * K + global_k];
+        store_shared(smem_a + i * 4, 0, __builtin_bit_cast(uint32_t, val));
+      }
+
+      // 2. Cooperative Stage B Tile (64 rows x 32 cols = 2048 elements)
+      // Transposed layout in SMEM with PAD to eliminate bank conflicts
+      #pragma unroll
+      for (uint32_t i = tid_in_threadblock; i < 2048; i += 128) {
+        const uint32_t local_k = i >> 5;   // i / 32
+        const uint32_t local_col = i & 31; // i % 32
+        const uint32_t global_k = kk + local_k;
+        const uint32_t global_col = tile_c * N_TILE + local_col;
+        const float val = args->B[global_k * N + global_col];
+        const uint32_t smem_addr = smem_b + (local_col * (K_TILE + PAD) + local_k) * 4;
+        store_shared(smem_addr, 0, __builtin_bit_cast(uint32_t, val));
+      }
+
+      // Synchronize to ensure all threads have finished loading SMEM
+      mu_barrier(0, num_warps);
+
+      // Compute partial products
+      uint32_t a_ptr = smem_a + tr * K_TILE * 4;
+      const uint32_t b_stride = (K_TILE + PAD) * 4;
+      uint32_t b0_ptr = smem_b + (tc * 4 + 0) * b_stride;
+      uint32_t b1_ptr = b0_ptr + b_stride;
+      uint32_t b2_ptr = b1_ptr + b_stride;
+      uint32_t b3_ptr = b2_ptr + b_stride;
+
+      #pragma unroll 4
+      for (uint32_t k = 0; k < K_TILE; ++k) {
+        const float a = __builtin_bit_cast(float, load32_shared(a_ptr));
+        acc0 += a * __builtin_bit_cast(float, load32_shared(b0_ptr));
+        acc1 += a * __builtin_bit_cast(float, load32_shared(b1_ptr));
+        acc2 += a * __builtin_bit_cast(float, load32_shared(b2_ptr));
+        acc3 += a * __builtin_bit_cast(float, load32_shared(b3_ptr));
+        a_ptr += 4;
+        b0_ptr += 4;
+        b1_ptr += 4;
+        b2_ptr += 4;
+        b3_ptr += 4;
+      }
+
+      // Synchronize to prevent overwriting SMEM before all threads finish reading
+      mu_barrier(0, num_warps);
+    }
+
+    // Write-back the accumulated results to global memory C
+    const uint32_t global_row = tile_r * M_TILE + tr;
+    const uint32_t global_col_base = tile_c * N_TILE + tc * 4;
+    const uint32_t c_idx = global_row * N + global_col_base;
+
+    args->C[c_idx + 0] = acc0;
+    args->C[c_idx + 1] = acc1;
+    args->C[c_idx + 2] = acc2;
+    args->C[c_idx + 3] = acc3;
+  }
+}
+```

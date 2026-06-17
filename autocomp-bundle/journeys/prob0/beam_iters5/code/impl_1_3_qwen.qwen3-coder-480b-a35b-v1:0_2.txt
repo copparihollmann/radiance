@@ -1,0 +1,68 @@
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  const uint32_t M = args->M;
+  const uint32_t N = args->N;
+  const uint32_t K = args->K;
+
+  // Shared memory pointers (base address 0x00000000)
+  constexpr uint32_t smem_base = 0;
+  constexpr uint32_t smem_a_offset = 0;
+  constexpr uint32_t smem_b_offset = 64 * (64 + 16) * sizeof(float);  // padded B matrix
+  float* smem_a = reinterpret_cast<float*>(smem_base + smem_a_offset);
+  float* smem_b = reinterpret_cast<float*>(smem_base + smem_b_offset);
+
+  const uint32_t warp_id = tid_in_threadblock / 16;
+  const uint32_t lane_id = tid_in_threadblock % 16;
+
+  // Tile dimensions: Each thread computes one output element
+  const uint32_t tile_m = M / 8;  // 8 warps
+  const uint32_t tile_n = N / 16; // 16 lanes
+  const uint32_t row = (warp_id * tile_m) + (lane_id / tile_n);
+  const uint32_t col = (lane_id % tile_n);
+
+  // Stage A matrix into SMEM
+  for (uint32_t idx = tid_in_threadblock; idx < M * K; idx += threads_per_threadblock) {
+    uint32_t r = idx / K;
+    uint32_t c = idx % K;
+    uint32_t smem_addr = (r * K + c) * sizeof(float);
+    float val = args->A[r * K + c];
+    store_shared(smem_base + smem_a_offset, smem_addr, *reinterpret_cast<uint32_t*>(&val));
+  }
+
+  // Stage B matrix into SMEM with padding to avoid bank conflicts
+  for (uint32_t idx = tid_in_threadblock; idx < K * N; idx += threads_per_threadblock) {
+    uint32_t r = idx / N;
+    uint32_t c = idx % N;
+    uint32_t smem_addr = (r * (N + 16) + c) * sizeof(float);
+    float val = args->B[r * N + c];
+    store_shared(smem_base + smem_b_offset, smem_addr, *reinterpret_cast<uint32_t*>(&val));
+  }
+
+  // Cross-core barrier to ensure all threads have written to SMEM
+  mu_barrier(0, threads_per_threadblock / 16); // total warps = 8
+
+  // Compute loop using staged data
+  float acc = 0.0f;
+  float* a_ptr = smem_a + row * K;
+  float* b_ptr = smem_b + col;
+
+#pragma GCC unroll 1
+  for (uint32_t k = 0; k < K; ++k) {
+    float a_val = *a_ptr++;
+    float b_val = *b_ptr;
+    b_ptr += (N + 16);
+    acc += a_val * b_val;
+  }
+
+  // Write result
+  if (row < M && col < N) {
+    args->C[row * N + col] = acc;
+  }
+}

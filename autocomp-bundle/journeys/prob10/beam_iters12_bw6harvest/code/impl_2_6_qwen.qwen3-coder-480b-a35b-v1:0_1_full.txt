@@ -1,0 +1,119 @@
+```cpp
+#include <stdint.h>
+
+#define K_PAD 65
+#define MU_NUM_THREADS 16
+
+static inline float bits_to_float(uint32_t b) {
+    union { uint32_t u; float f; } c;
+    c.u = b;
+    return c.f;
+}
+
+static inline uint32_t float_to_bits(float f) {
+    union { uint32_t u; float f; } c;
+    c.f = f;
+    return c.u;
+}
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t K = args->K;
+  const uint32_t N = args->N;
+  const uint32_t M = args->M;
+
+  const uint32_t tid = tid_in_threadblock;
+  const uint32_t num_warps = threads_per_threadblock / MU_NUM_THREADS; // 8 warps total
+
+  // Thread mapping for computing C in a 32x16 block
+  const uint32_t th_r = tid / 16; // 0..7
+  const uint32_t th_c = tid % 16; // 0..15
+
+  const uint32_t smem_a = 0;
+  const uint32_t smem_b = 32 * K_PAD * 4; // A tile has 32 rows
+
+  // Iterate over 32x16 output blocks
+  for (uint32_t block_row = 0; block_row < (M + 31) / 32; block_row++) {
+    for (uint32_t block_col = 0; block_col < (N + 15) / 16; block_col++) {
+      const uint32_t row_start = block_row * 32;
+      const uint32_t col_start = block_col * 16;
+
+      if (row_start >= M || col_start >= N) continue;
+
+      float acc0 = 0.0f;
+      float acc1 = 0.0f;
+      float acc2 = 0.0f;
+      float acc3 = 0.0f;
+
+      for (uint32_t kk = 0; kk < K; kk += 64) {
+        // 1. Cooperative load A to SMEM (32x64 floats)
+        #pragma GCC unroll 4
+        for (uint32_t i = 0; i < 16; i++) {
+          uint32_t idx = i * 128 + tid;
+          uint32_t r = idx / 64;
+          uint32_t c = idx % 64;
+          if (row_start + r < M && kk + c < K) {
+            float val = args->A[(row_start + r) * K + (kk + c)];
+            store_shared(smem_a + (r * K_PAD + c) * 4, 0, float_to_bits(val));
+          } else {
+            store_shared(smem_a + (r * K_PAD + c) * 4, 0, float_to_bits(0.0f));
+          }
+        }
+
+        // 2. Cooperative load B to SMEM (transposed, 64x16 floats)
+        #pragma GCC unroll 4
+        for (uint32_t i = 0; i < 8; i++) {
+          uint32_t idx = i * 128 + tid;
+          uint32_t r = idx / 16;
+          uint32_t c = idx % 16;
+          if (kk + r < K && col_start + c < N) {
+            float val = args->B[(kk + r) * N + (col_start + c)];
+            store_shared(smem_b + (c * K_PAD + r) * 4, 0, float_to_bits(val));
+          } else {
+            store_shared(smem_b + (c * K_PAD + r) * 4, 0, float_to_bits(0.0f));
+          }
+        }
+
+        // Cross-core SMEM visibility barrier
+        mu_barrier(0, num_warps);
+
+        // 3. Compute accumulation
+        uint32_t b_base = smem_b + th_c * K_PAD * 4;
+        uint32_t a_base = smem_a + (th_r * 4) * K_PAD * 4;
+
+        #pragma GCC unroll 4
+        for (uint32_t k = 0; k < 64; k++) {
+          uint32_t k4 = k * 4;
+          float b = bits_to_float(load32_shared(b_base + k4));
+          acc0 += bits_to_float(load32_shared(a_base + k4)) * b;
+          acc1 += bits_to_float(load32_shared(a_base + k4 + 1 * K_PAD * 4)) * b;
+          acc2 += bits_to_float(load32_shared(a_base + k4 + 2 * K_PAD * 4)) * b;
+          acc3 += bits_to_float(load32_shared(a_base + k4 + 3 * K_PAD * 4)) * b;
+        }
+
+        // Barrier to prevent staging write-over before reads complete
+        mu_barrier(0, num_warps);
+      }
+
+      // Write-back values to C (Contiguous write-backs per warp to match memory system)
+      const uint32_t r_base = row_start + th_r * 4;
+      const uint32_t c = col_start + th_c;
+      
+      if (r_base + 0 < M && c < N)
+        args->C[(r_base + 0) * N + c] = acc0;
+      if (r_base + 1 < M && c < N)
+        args->C[(r_base + 1) * N + c] = acc1;
+      if (r_base + 2 < M && c < N)
+        args->C[(r_base + 2) * N + c] = acc2;
+      if (r_base + 3 < M && c < N)
+        args->C[(r_base + 3) * N + c] = acc3;
+    }
+  }
+}
+```

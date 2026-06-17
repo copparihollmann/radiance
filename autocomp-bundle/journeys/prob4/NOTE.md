@@ -1,0 +1,1 @@
+Final kernel only — the search journey (per-iteration candidates/plans/eval) was not preserved for this problem. baseline.cpp = starting kernel; best.cpp = best discovered kernel. Cycles in ../../index/summary anchors / results/metrics/results.csv.

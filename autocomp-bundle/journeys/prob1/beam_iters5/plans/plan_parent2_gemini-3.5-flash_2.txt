@@ -1,0 +1,152 @@
+An elegant and highly effective way to optimize this kernel is to apply **Strategy 12: Avoid integer division and modulo in the im2col index calculation by using iterative induction variables to eliminate high-latency integer division instructions.**
+
+### Inefficiency Analysis
+In the original gather phase (Phase 2), there is a flat loop of `total = 12288` iterations. For each iteration, every thread performs multiple high-latency integer division (`/`) and modulo (`%`) operations to compute the multi-dimensional indices (`c`, `kh`, `kw`, `ph`, `pw`) for the `im2col` mapping. On RISC-V SIMT architectures, integer division/modulo instructions take many cycles to execute and completely stall the execution pipeline. Because this loop executes 96 times per thread, these division instructions represent the primary execution bottleneck.
+
+### Optimization Plan
+1. **Iterative Induction Variables (Strategy 12):** 
+   - Instead of computing `c`, `kh`, and `kw` from scratch using `/` and `%` in every iteration of the loop, we can initialize them once per thread before entering any of the loops (using the thread's starting index `tid_in_threadblock`).
+   - Inside the loop, since `ckk` advances by `threads_per_threadblock` (128) in each step, we can compute the pre-step increments `d_kw = 128 % KW` and `d_kh = 128 / KW` outside the loops.
+   - For each step inside the loop, we iteratively add these increments to `kw` and `kh`, and perform simple conditional carry-overs (using `if` and `while` subtraction loops) to keep them in bounds. This completely eliminates division and modulo instructions from the inner loop.
+2. **Loop Structure Simplification:**
+   - Restructure the flat `total` loop into nested loops: an outer loop over patches `p` (16 iterations) and an inner loop over `ckk`. This allows us to compute the `p`-dependent offset (`p_offset`) once per patch, rather than re-computing it inside the inner loop.
+3. **Instruction-Level Parallelism (ILP) via Unrolling:**
+   - In Phase 1, load and store weights in chunks of 4 elements to pipeline global memory accesses and hide the 400-cycle DRAM latency.
+   - In Phase 3, unroll the innermost matrix multiplication loop by a factor of 4. This loads multiple elements from shared memory simultaneously to hide the 2-cycle SMEM bank/access latency and keeps the register usage well below the hard limit of 31.
+
+---
+
+### Optimized Kernel Code
+
+```cpp
+#include <stdint.h>
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t CKK = a->C * a->KH * a->KW;
+  const uint32_t P = a->OH * a->OW;
+  const uint32_t smem_w = P * CKK * 4; // Weight staging area in SMEM (after patches)
+
+  // (1) Stage W flat into SMEM[smem_w..] using 4x pipelined global loads
+  {
+    const uint32_t total_w = a->OC * CKK;
+    const uint32_t step = threads_per_threadblock;
+    for (uint32_t i = tid_in_threadblock; i < total_w; i += step * 4) {
+      if (i + step * 3 < total_w) {
+        float r0 = a->w[i];
+        float r1 = a->w[i + step];
+        float r2 = a->w[i + step * 2];
+        float r3 = a->w[i + step * 3];
+        store_shared(smem_w + i * 4, 0, __builtin_bit_cast(uint32_t, r0));
+        store_shared(smem_w + (i + step) * 4, 0, __builtin_bit_cast(uint32_t, r1));
+        store_shared(smem_w + (i + step * 2) * 4, 0, __builtin_bit_cast(uint32_t, r2));
+        store_shared(smem_w + (i + step * 3) * 4, 0, __builtin_bit_cast(uint32_t, r3));
+      } else {
+        for (uint32_t j = 0; j < 4; j++) {
+          uint32_t idx = i + j * step;
+          if (idx < total_w) {
+            store_shared(smem_w + idx * 4, 0, __builtin_bit_cast(uint32_t, a->w[idx]));
+          }
+        }
+      }
+    }
+  }
+
+  // (2) Gather im2col patches into SMEM[0..] using iterative induction variables
+  {
+    const uint32_t OW = a->OW;
+    const uint32_t KH = a->KH;
+    const uint32_t KW = a->KW;
+    const uint32_t HWd = a->H * a->W;
+    const uint32_t Wd = a->W;
+    const uint32_t stride = a->stride;
+    const uint32_t d_kw = threads_per_threadblock % KW;
+    const uint32_t d_kh = threads_per_threadblock / KW;
+
+    // Precalculate initial induction values for ckk starting at tid_in_threadblock
+    uint32_t c_init = tid_in_threadblock / (KH * KW);
+    uint32_t rem = tid_in_threadblock % (KH * KW);
+    uint32_t kh_init = rem / KW;
+    uint32_t kw_init = rem % KW;
+
+    for (uint32_t p = 0; p < P; p++) {
+      const uint32_t ph = p / OW;
+      const uint32_t pw = p % OW;
+      const uint32_t p_offset = (ph * stride) * Wd + pw * stride;
+
+      uint32_t c = c_init;
+      uint32_t kh = kh_init;
+      uint32_t kw = kw_init;
+
+      for (uint32_t ckk = tid_in_threadblock; ckk < CKK; ckk += threads_per_threadblock) {
+        const uint32_t in_idx = c * HWd + kh * Wd + kw + p_offset;
+        const uint32_t i = p * CKK + ckk;
+        store_shared(i * 4, 0, __builtin_bit_cast(uint32_t, a->in[in_idx]));
+
+        // Advance induction variables iteratively (No division or modulo)
+        kw += d_kw;
+        kh += d_kh;
+        if (kw >= KW) {
+          kw -= KW;
+          kh++;
+        }
+        while (kh >= KH) {
+          kh -= KH;
+          c++;
+        }
+      }
+    }
+  }
+
+  // Make SMEM writes visible globally before any core proceeds past the barrier
+  mu_fence_smem();
+  mu_barrier(0, threads_per_threadblock / MU_NUM_THREADS); // Cross-core barrier
+
+  // (3) Frugal GEMM with 4x unrolling to hide SMEM and floating-point latencies
+  {
+    const uint32_t total_out = a->OC * P;
+    for (uint32_t idx = tid_in_threadblock; idx < total_out; idx += threads_per_threadblock) {
+      uint32_t wa = smem_w + (idx / P) * CKK * 4;
+      uint32_t pa = (idx % P) * CKK * 4;
+      float acc = 0.0f;
+      uint32_t k = 0;
+
+      // Unrolled loop body for ILP
+      for (; k + 3 < CKK; k += 4) {
+        float w0 = __builtin_bit_cast(float, load32_shared(wa));
+        float p0 = __builtin_bit_cast(float, load32_shared(pa));
+        float w1 = __builtin_bit_cast(float, load32_shared(wa + 4));
+        float p1 = __builtin_bit_cast(float, load32_shared(pa + 4));
+        float w2 = __builtin_bit_cast(float, load32_shared(wa + 8));
+        float p2 = __builtin_bit_cast(float, load32_shared(pa + 8));
+        float w3 = __builtin_bit_cast(float, load32_shared(wa + 12));
+        float p3 = __builtin_bit_cast(float, load32_shared(pa + 12));
+        
+        acc += w0 * p0;
+        acc += w1 * p1;
+        acc += w2 * p2;
+        acc += w3 * p3;
+        
+        wa += 16;
+        pa += 16;
+      }
+
+      // Cleanup loop for non-multiple remainder
+      for (; k < CKK; k++) {
+        acc += __builtin_bit_cast(float, load32_shared(wa)) *
+               __builtin_bit_cast(float, load32_shared(pa));
+        wa += 4;
+        pa += 4;
+      }
+
+      a->out[idx] = acc;
+    }
+  }
+}
+```

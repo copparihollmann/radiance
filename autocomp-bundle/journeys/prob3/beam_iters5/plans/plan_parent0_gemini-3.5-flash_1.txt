@@ -1,0 +1,34 @@
+To address the primary performance bottleneck in the softmax phase (Phase 2), we will apply **Strategy 10: Implement hierarchical warp-and-block reductions in shared memory for softmax row statistics (max and sum) to replace inefficient serial scans and global memory round-trips.**
+
+### Inefficiency Analysis
+In the original implementation of Phase 2:
+1. **Thread Divergence and Serial Execution:** Each thread processes an entire row of the `scratch` matrix sequentially. With 96 rows and 128 threads, some threads do 1 row while others do 0, leading to significant load imbalance and serialization.
+2. **Slow Global Memory Round-trips:** Every read and write during the max search, exponential sum, and normalization steps goes to global memory (`a->scratch`), which incurs high latency (~400 cycles).
+3. **Lack of Parallel Reduction:** No hardware-level or block-level parallel reductions are used to find row-wide statistics (`max` and `sum`).
+
+---
+
+### Optimization Plan
+
+We will redesign Phase 2 to use cooperative, hierarchical block reductions inside Shared Memory:
+
+1. **Cooperative Row Processing:**
+   Instead of mapping one row per thread, the entire threadblock of 128 threads will cooperatively process one row of `scratch` at a time. The loop will iterate through the rows, and all 128 threads will work together on each row.
+
+2. **Cooperative Load & Padding:**
+   For each row, threads `tid_in_threadblock < 96` will load their corresponding element `v` from global memory. Threads `tid_in_threadblock >= 96` will participate by loading a neutral value (e.g., `-1e30f` for maximum reduction and `0.0f` for sum reduction) to pad the reduction size to a power-of-two (128). This avoids complex boundary checks during the reduction.
+
+3. **Hierarchical Reduction in SMEM (Max-Finding):**
+   - Write the values into SMEM (base address `0x0`).
+   - Use a tree-based reduction loop (`offset` from 64 down to 1) with `mu_barrier(0, num_warps)` (using cross-core barrier ID `0` to ensure visibility across both cores).
+   - After the loop, thread 0 reads the maximum value `m` and broadcasts it back to all threads.
+
+4. **Hierarchical Reduction in SMEM (Sum-Finding):**
+   - Each thread computes `e = mu_exp(v - m)` and stores it in SMEM.
+   - Perform another tree-based reduction to sum the values.
+   - Thread 0 computes `inv_sum = 1.0f / sum` and broadcasts it.
+
+5. **Cooperative Global Store:**
+   - Active threads (`tid_in_threadblock < 96`) write the normalized softmax value `e * inv_sum` back to global memory.
+
+By using this approach, we keep register pressure extremely low (well within the 31-register RTL limit) because we do not unroll the reduction loops, while completely eliminating the sequential global memory bottleneck.

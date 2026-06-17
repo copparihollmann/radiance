@@ -1,0 +1,117 @@
+Here is the optimization plan and the high-performance implementation.
+
+### Optimization Plan
+
+The original kernel executes matrix multiplication directly from global memory, resulting in high latency due to global memory load instructions (~400 cycles each). Our plan is to employ **cooperative shared memory staging** combined with **leading-dimension padding (Strategy 7)** to eliminate memory bottleneck and bank conflicts.
+
+1. **Grid & Block Staging**: 
+   Since $M=64, N=64, K=768$, the total output size of $C$ is $64 \times 64 = 4096$ elements. We partition the computation into 16 blocks of size $16 \times 16$.
+   For each block, we cooperatively load an $A$ tile of size $16 \times 768$ and a $B$ tile of size $768 \times 16$ into shared memory (SMEM).
+   
+2. **Eliminating Bank Conflicts (Strategy 7)**:
+   By default, storing the $B$ tile as $768 \times 16$ causes 4-way dual-port bank conflicts when lanes read from their respective columns. To completely eliminate these bank conflicts, we pad the leading dimension of the $B$ tile in SMEM by choosing `PAD = 17`. A stride of $768 + 17 = 785$ is coprime with $64$ (the number of banks), ensuring that all 16 lanes in a warp access 16 completely unique banks.
+
+3. **Low-Register 2-Output Tiling**:
+   To stay strictly within the **hard constraint of <= 31 distinct registers**, we use only 2 accumulators per thread (each thread computes 2 outputs of $C$ inside the active block). This keeps the register footprint extremely lean while still cutting the global-memory pressure and redundant SMEM loads of the $B$ matrix in half.
+
+4. **Cross-Core Synchronization**:
+   We use `mu_barrier(0, 8)` to synchronize the 8 warps across both cores, ensuring correct memory visibility during cooperative SMEM loads.
+
+---
+
+### Optimized Code
+
+```cpp
+#include <stdint.h>
+
+// Struct definition matching the harness
+struct KernelArgs {
+  const float* A;
+  const float* B;
+  float* C;
+  uint32_t M;
+  uint32_t N;
+  uint32_t K;
+};
+
+static inline float bits_to_float(uint32_t b) { union { uint32_t u; float f; } c; c.u = b; return c.f; }
+static inline uint32_t float_to_bits(float f) { union { uint32_t u; float f; } c; c.f = f; return c.u; }
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  (void)threads_per_threadblock;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  // Constants optimized for M=64, N=64, K=768
+  const uint32_t K = 768;
+  const uint32_t smem_a = 0;
+  const uint32_t smem_b = 16 * 768 * 4; // 49,152 bytes
+  const uint32_t PAD = 17;              // Pad to eliminate dual-port bank conflicts (Strategy 7)
+  const uint32_t b_stride = 768 + PAD;  // 785 elements
+
+  // Loop over 16 blocks of size 16x16
+  for (uint32_t block_idx = 0; block_idx < 16; block_idx++) {
+    const uint32_t by = block_idx / 4;
+    const uint32_t bx = block_idx % 4;
+
+    // 1. Cooperative load A tile (16 x 768) into SMEM
+    const uint32_t global_row_base = by * 16;
+    for (uint32_t i = tid_in_threadblock; i < 16 * 768; i += 128) {
+      const uint32_t r = i / 768;
+      const uint32_t k = i % 768;
+      const uint32_t global_idx = (global_row_base + r) * 768 + k;
+      store_shared(smem_a + i * 4, 0, float_to_bits(args->A[global_idx]));
+    }
+
+    // 2. Cooperative load B tile (768 x 16) into SMEM (transposed and padded)
+    const uint32_t global_col_base = bx * 16;
+    for (uint32_t i = tid_in_threadblock; i < 768 * 16; i += 128) {
+      const uint32_t k = i / 16;
+      const uint32_t col = i % 16;
+      const uint32_t global_idx = k * 64 + global_col_base + col;
+      store_shared(smem_b + (col * b_stride + k) * 4, 0, float_to_bits(args->B[global_idx]));
+    }
+
+    // Barrier 1: Sync all 8 warps across both cores to ensure SMEM writes are finished
+    mu_barrier(0, 8);
+
+    // 3. Thread-level computation (Each thread computes 2 elements)
+    const uint32_t row1 = tid_in_threadblock / 16;
+    const uint32_t col1 = tid_in_threadblock % 16;
+    const uint32_t row2 = row1 + 8;
+
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+
+    uint32_t ptr_a1 = smem_a + row1 * 768 * 4;
+    uint32_t ptr_a2 = smem_a + row2 * 768 * 4;
+    uint32_t ptr_b  = smem_b + col1 * b_stride * 4;
+
+    #pragma unroll 2
+    for (uint32_t k = 0; k < 768; k++) {
+      const float b_val = bits_to_float(load32_shared(ptr_b));
+      acc1 += bits_to_float(load32_shared(ptr_a1)) * b_val;
+      acc2 += bits_to_float(load32_shared(ptr_a2)) * b_val;
+      ptr_a1 += 4;
+      ptr_a2 += 4;
+      ptr_b  += 4;
+    }
+
+    // 4. Coalesced store to global memory C
+    const uint32_t out_row1 = global_row_base + row1;
+    const uint32_t out_row2 = global_row_base + row2;
+    const uint32_t out_col  = global_col_base + col1;
+
+    args->C[out_row1 * 64 + out_col] = acc1;
+    args->C[out_row2 * 64 + out_col] = acc2;
+
+    // Barrier 2: Sync before starting next block to prevent overwriting SMEM
+    mu_barrier(0, 8);
+  }
+}
+```

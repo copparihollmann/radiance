@@ -1,0 +1,26 @@
+An elegant and highly effective way to optimize this kernel is to target the memory-staging bottleneck. Currently, staging the weight matrix $W$ and gathering the input patches into shared memory (SMEM) takes a significant portion of execution time due to the instruction overhead of issuing individual 32-bit `store_shared` writes for every element. 
+
+We can address this by applying **Strategy 6: Use 64-bit shared memory operations (`store64_shared`) to write two 32-bit values simultaneously, reducing instruction count and instruction-fetch pressure.**
+
+### Optimization Plan
+
+1. **Verify Dimensions**: 
+   - The total number of weight elements is $OC \times CKK = 16 \times 768 = 12,288$, which is a multiple of 2.
+   - The total number of gathered input patch elements is $OH \times OW \times CKK = 4 \times 4 \times 768 = 12,288$, which is also a multiple of 2.
+   - Since both totals are even, we can process elements in pairs unconditionally, avoiding branch divergence.
+
+2. **Optimize Weight Staging**:
+   - Change the stride of the weight-staging loop from `threads_per_threadblock` to `threads_per_threadblock * 2`.
+   - In each iteration, load two consecutive elements $w[i]$ and $w[i+1]$ from global memory.
+   - Cast both to `uint32_t`, combine them into a single 64-bit `uint64_t` value, and store them to SMEM using `store64_shared(smem_w + i * 4, 0, packed_w)`.
+
+3. **Optimize Input Gathering**:
+   - Change the stride of the im2col patch gather loop to `threads_per_threadblock * 2`.
+   - Calculate indices for two consecutive output locations ($i$ and $i+1$).
+   - Perform the index mapping for both indices, load the two input elements, pack them into a `uint64_t`, and write them using `store64_shared(i * 4, 0, packed_in)`.
+
+4. **Preserve Registers and Barriers**:
+   - Keep the frugal matmul logic unchanged to stay well within the hard 31-register limit.
+   - Retain the cross-core `mu_barrier(0, 8)` sync to ensure correct SMEM coherence across both cores.
+
+This optimization halves the loop iterations and instruction count for the memory staging phases, leading to a substantial performance improvement while maintaining register-frugality.

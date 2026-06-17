@@ -1,0 +1,110 @@
+#include <stdint.h>
+
+struct KernelArgs {
+  __global float* A;
+  __global float* B;
+  __global float* C;
+  uint32_t M;
+  uint32_t N;
+  uint32_t K;
+};
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t M = args->M;
+  const uint32_t N = args->N;
+  const uint32_t K = args->K;
+  const uint32_t num_warps = threads_per_threadblock / 16;
+
+  // Tiling parameters
+  const uint32_t M_TILE = 16;
+  const uint32_t N_TILE = 32;
+  const uint32_t K_TILE = 64;
+  const uint32_t PAD = 16;
+
+  // Shared memory layout
+  const uint32_t smem_a_offset = 0;
+  const uint32_t smem_b_offset = M_TILE * K_TILE * 4;  // 16 * 64 * 4 = 4096 bytes
+
+  // Thread mapping: 16 rows x 8 cols logical grid
+  const uint32_t thread_row = tid_in_threadblock / 8;  // 0..15
+  const uint32_t thread_col = tid_in_threadblock % 8;  // 0..7
+
+  // Loop over C matrix tiles (4 rows x 2 columns of tiles)
+  for (uint32_t tile_row = 0; tile_row < 4; ++tile_row) {
+    for (uint32_t tile_col = 0; tile_col < 2; ++tile_col) {
+      float acc = 0.0f;
+
+      // Iterate over K dimension in chunks
+      for (uint32_t k_outer = 0; k_outer < K; k_outer += K_TILE) {
+        // Stage A tile (16 rows x 64 cols) cooperatively
+        for (uint32_t i = tid_in_threadblock; i < M_TILE * K_TILE; i += threads_per_threadblock) {
+          const uint32_t local_row = i / K_TILE;
+          const uint32_t local_k = i % K_TILE;
+          const uint32_t global_row = tile_row * M_TILE + local_row;
+          const uint32_t global_k = k_outer + local_k;
+          
+          if (global_row < M) {
+            const float val = args->A[global_row * K + global_k];
+            const uint32_t smem_addr = smem_a_offset + (local_row * K_TILE + local_k) * 4;
+            asm volatile("sw.shared %1, 0(%0)" :: "r"(smem_addr), "r"(__builtin_bit_cast(uint32_t, val)) : "memory");
+          }
+        }
+
+        // Stage B tile (64 rows x 32 cols, transposed) cooperatively
+        for (uint32_t i = tid_in_threadblock; i < K_TILE * N_TILE; i += threads_per_threadblock) {
+          const uint32_t local_k = i / N_TILE;
+          const uint32_t local_col = i % N_TILE;
+          const uint32_t global_k = k_outer + local_k;
+          const uint32_t global_col = tile_col * N_TILE + local_col;
+          
+          if (global_col < N) {
+            const float val = args->B[global_k * N + global_col];
+            const uint32_t smem_addr = smem_b_offset + (local_col * (K_TILE + PAD) + local_k) * 4;
+            asm volatile("sw.shared %1, 0(%0)" :: "r"(smem_addr), "r"(__builtin_bit_cast(uint32_t, val)) : "memory");
+          }
+        }
+
+        // Cross-core synchronization after staging
+        asm volatile ("vx_bar %0, %1" :: "r"(0), "r"(num_warps) : "memory");
+
+        // Compute partial products
+        const uint32_t a_base = smem_a_offset + thread_row * K_TILE * 4;
+        const uint32_t b_base = smem_b_offset + (thread_col * 4) * (K_TILE + PAD) * 4;
+        
+        uint32_t a_ptr = a_base;
+        uint32_t b_ptr = b_base;
+        
+        for (uint32_t k_inner = 0; k_inner < K_TILE; ++k_inner) {
+          const float a_val = __builtin_bit_cast(float, 
+              ({ uint32_t tmp; asm volatile("lw.shared %0, 0(%1)" : "=r"(tmp) : "r"(a_ptr) : "memory"); tmp; })
+          );
+          const float b_val = __builtin_bit_cast(float, 
+              ({ uint32_t tmp; asm volatile("lw.shared %0, 0(%1)" : "=r"(tmp) : "r"(b_ptr) : "memory"); tmp; })
+          );
+          acc += a_val * b_val;
+          a_ptr += 4;
+          b_ptr += 4;
+        }
+
+        // Cross-core synchronization before next iteration
+        asm volatile ("vx_bar %0, %1" :: "r"(0), "r"(num_warps) : "memory");
+      }
+
+      // Write result to global memory
+      const uint32_t global_row = tile_row * M_TILE + thread_row;
+      const uint32_t global_col = tile_col * N_TILE + thread_col * 4;
+      const uint32_t c_index = global_row * N + global_col;
+      
+      if (global_row < M && global_col < N) {
+        args->C[c_index] = acc;
+      }
+    }
+  }
+}

@@ -1,0 +1,1 @@
+No kernel — problem 12 (flash attention seq192 d64, pi05) is register-infeasible on Muon: a working baseline exceeds the 256 physical-register budget (RTL globalOverSubscription). Dropped. Documented as the register wall for long-sequence attention.

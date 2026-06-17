@@ -1,0 +1,56 @@
+```cpp
+#include <stdint.h>
+
+// Forward-declare the harness-provided struct
+struct KernelArgs;
+
+template <uint32_t M, uint32_t N, uint32_t K>
+__attribute__((always_inline))
+static inline void kernel_body_tiled(
+    KernelArgs* args,
+    uint32_t tid_in_threadblock,
+    uint32_t threads_per_threadblock
+) {
+    const uint32_t total = M * N;
+
+    for (uint32_t idx = tid_in_threadblock; idx < total; idx += threads_per_threadblock) {
+        const uint32_t row = idx / N;
+        const uint32_t col = idx % N;
+
+        float acc = 0.0f;
+        for (uint32_t k = 0; k < K; k++) {
+            acc += args->A[row * K + k] * args->B[k * N + col];
+        }
+        args->C[idx] = acc;
+    }
+}
+
+static inline void kernel_body(
+    void* raw_arg,
+    uint32_t tid_in_threadblock,
+    uint32_t threads_per_threadblock,
+    uint32_t threadblock_id
+) {
+    (void)threadblock_id;
+    auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+    if (__builtin_constant_p(args->M) && __builtin_constant_p(args->N) && __builtin_constant_p(args->K)) {
+        if (args->M == 64 && args->N == 64 && args->K == 64) {
+            kernel_body_tiled<64, 64, 64>(args, tid_in_threadblock, threads_per_threadblock);
+            return;
+        }
+    }
+
+    // Fallback path for dynamic shapes
+    const uint32_t total = args->M * args->N;
+    for (uint32_t idx = tid_in_threadblock; idx < total; idx += threads_per_threadblock) {
+        const uint32_t row = idx / args->N;
+        const uint32_t col = idx % args->N;
+        float acc = 0.0f;
+        for (uint32_t k = 0; k < args->K; k++) {
+            acc += args->A[row * args->K + k] * args->B[k * args->N + col];
+        }
+        args->C[idx] = acc;
+    }
+}
+```

@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:70:39: error: use of undeclared identifier 'stride'\n   70 |                               + (pr * stride + kh) * Wd\n      |                                       ^\nkernel.cpp:71:38: error: use of undeclared identifier 'stride'\n   71 |                               + pc * stride + kw;\n      |                                      ^\nkernel.cpp:114:5: error: use of undeclared identifier 'kernel_body_specialized'\n  114 |     kernel_body_specialized<16, 3, 16, 16, 4, 4, 16>(\n      |     ^\n3 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

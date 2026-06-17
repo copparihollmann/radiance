@@ -1,0 +1,85 @@
+#include <cstdint>
+
+// Vector type for 128-bit loads/stores (4 floats)
+struct alignas(16) float4 {
+    float x, y, z, w;
+};
+
+static inline void kernel_body(
+    void* raw_arg,
+    uint32_t tid_in_threadblock,
+    uint32_t threads_per_threadblock,
+    uint32_t threadblock_id
+) {
+    (void)threadblock_id;
+    auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+    const uint32_t seq = a->seq;
+    const uint32_t d = a->d;
+    const uint32_t nw = threads_per_threadblock / MU_NUM_THREADS;
+
+    // Cast global pointers to float4 for vectorized loads
+    const __global float4* Q4 = reinterpret_cast<const __global float4*>(a->Q);
+    const __global float4* K4 = reinterpret_cast<const __global float4*>(a->K);
+    const __global float4* V4 = reinterpret_cast<const __global float4*>(a->V);
+    __global float4* O4 = reinterpret_cast<__global float4*>(a->O);
+    const uint32_t d4 = d / 4;
+
+    // Phase 1: S[i][j] = scale * Q[i] · K[j]
+    for (uint32_t i = tid_in_threadblock; i < seq; i += threads_per_threadblock) {
+        const __global float4* qi = Q4 + i * d4;
+        __global float* sp = a->scratch + i * seq;
+        for (uint32_t j = 0; j < seq; j++) {
+            const __global float4* kj = K4 + j * d4;
+            float acc = 0.0f;
+            for (uint32_t k = 0; k < d4; k++) {
+                float4 q = qi[k];
+                float4 kval = kj[k];
+                acc += q.x * kval.x;
+                acc += q.y * kval.y;
+                acc += q.z * kval.z;
+                acc += q.w * kval.w;
+            }
+            sp[j] = acc * 0.125f;
+        }
+    }
+    mu_barrier(0, nw); // Cross-core barrier for scratch visibility
+
+    // Phase 2: In-place row softmax
+    for (uint32_t i = tid_in_threadblock; i < seq; i += threads_per_threadblock) {
+        __global float* sp = a->scratch + i * seq;
+        float m = sp[0];
+        for (uint32_t j = 1; j < seq; j++) {
+            if (sp[j] > m) m = sp[j];
+        }
+        float sum = 0.0f;
+        for (uint32_t j = 0; j < seq; j++) {
+            const float e = mu_exp(sp[j] - m);
+            sp[j] = e;
+            sum += e;
+        }
+        const float inv = 1.0f / sum;
+        for (uint32_t j = 0; j < seq; j++) {
+            sp[j] *= inv;
+        }
+    }
+    mu_barrier(0, nw); // Cross-core barrier post-softmax
+
+    // Phase 3: O[i][k] = sum_j P[i][j] * V[j][k]
+    for (uint32_t i = tid_in_threadblock; i < seq; i += threads_per_threadblock) {
+        const __global float* sp = a->scratch + i * seq;
+        __global float4* oi = O4 + i * d4;
+        for (uint32_t k = 0; k < d4; k++) {
+            float4 acc = {0.0f, 0.0f, 0.0f, 0.0f};
+            for (uint32_t j = 0; j < seq; j++) {
+                const float p_ij = sp[j];
+                const __global float4* vj = V4 + j * d4;
+                float4 v = vj[k];
+                acc.x += p_ij * v.x;
+                acc.y += p_ij * v.y;
+                acc.z += p_ij * v.z;
+                acc.w += p_ij * v.w;
+            }
+            oi[k] = acc;
+        }
+    }
+}

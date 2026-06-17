@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n40 |       store_shared(addr, 0, *(reinterpret_cast<uint32_t*>(&e)));\n      |                               ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:148:50: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  148 |       const float e = *(reinterpret_cast<float*>(&load32_shared(addr))) * inv_sum;\n      |                                                  ^~~~~~~~~~~~~~~~~~~~\nkernel.cpp:149:31: error: reinterpret_cast from 'const float *' to 'uint32_t *' (aka 'unsigned int *') casts away qualifiers\n  149 |       store_shared(addr, 0, *(reinterpret_cast<uint32_t*>(&e)));\n      |                               ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:157:10: error: cannot initialize a variable of type 'float *' with an lvalue of type '__global float *'\n  157 |   float* O_global = a->O;\n      |          ^          ~~~~\nkernel.cpp:171:54: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  171 |       const float p_val = *(reinterpret_cast<float*>(&load32_shared(p_elem_addr)));\n      |                                                      ^~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:172:54: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  172 |       const float v_val = *(reinterpret_cast<float*>(&load32_shared(v_elem_addr)));\n      |                                                      ^~~~~~~~~~~~~~~~~~~~~~~~~~~\n14 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

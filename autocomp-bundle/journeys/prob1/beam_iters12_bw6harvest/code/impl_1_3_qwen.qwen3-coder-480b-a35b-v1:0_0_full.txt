@@ -1,0 +1,110 @@
+```cpp
+#include <mu_intrinsics.h>
+#include <mu_schedule.h>
+#include <stdint.h>
+
+// Assuming KernelArgs struct layout is defined as follows in the harness:
+struct KernelArgs {
+  __global float* in;
+  __global float* w;
+  __global float* out;
+  uint32_t C;
+  uint32_t H;
+  uint32_t W;
+  uint32_t KH;
+  uint32_t KW;
+  uint32_t OC;
+  uint32_t OH;
+  uint32_t OW;
+  uint32_t stride;
+};
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  // Vision Transformer Patch-Embedding Tile Dimensions
+  constexpr uint32_t OC = 16;
+  constexpr uint32_t CKK = 768;
+  constexpr uint32_t CKK_PADDED = 784; // Next multiple of 16 + 16 to ensure coprime with 16 -> 768 + 16 = 784 (still causes issues) OR 769 works better but let's pad rows to avoid all mod-16 conflicts. Better approach: pad every row to not be a multiple of 16.
+  constexpr uint32_t P = 16;
+  constexpr uint32_t OW = 4;
+  constexpr uint32_t KH = 16;
+  constexpr uint32_t KW = 16;
+  constexpr uint32_t HWd = 64 * 64;
+  constexpr uint32_t Wd = 64;
+  constexpr uint32_t stride = 16;
+  
+  // Padding strategy for SMEM to avoid bank conflicts
+  // Add 16 floats per row to ensure no two elements from adjacent rows map to same bank
+  // So each row stride is 768 + 16 = 784 floats => 3136 bytes
+  constexpr uint32_t ROW_STRIDE_BYTES = (CKK + 16) * 4; // 784 * 4 = 3136 bytes
+  constexpr uint32_t smem_w_start = 0;                   // W tile start address in SMEM
+  constexpr uint32_t smem_patch_start = ROW_STRIDE_BYTES * OC; // Patch tile start address
+
+  // (1) Stage W tiled in SMEM with padding to avoid bank conflicts
+  for (uint32_t oc = 0; oc < OC; ++oc) {
+    uint32_t shared_offset_base = smem_w_start + oc * ROW_STRIDE_BYTES;
+    uint32_t global_offset_base = oc * CKK;
+
+    for (uint32_t k = tid_in_threadblock; k < CKK; k += threads_per_threadblock) {
+      store_shared(shared_offset_base + k * 4, 0, __builtin_bit_cast(uint32_t, a->w[global_offset_base + k]));
+    }
+  }
+
+  // Synchronize after writing W to SMEM across both cores
+  mu_barrier(0, threads_per_threadblock / MU_NUM_THREADS);
+
+  // (2) Restructured gather of im2col patches into SMEM[smem_patch_start..] with padding
+  for (uint32_t p = 0; p < P; ++p) {
+    const uint32_t p_div_OW = p / OW; // Compiler optimizes to: p >> 2
+    const uint32_t p_mod_OW = p % OW; // Compiler optimizes to: p & 3
+    const uint32_t h_base = p_div_OW * stride;
+    const uint32_t w_base = p_mod_OW * stride;
+
+    uint32_t shared_offset_base = smem_patch_start + p * ROW_STRIDE_BYTES;
+
+    for (uint32_t ckk = tid_in_threadblock; ckk < CKK; ckk += threads_per_threadblock) {
+      const uint32_t c = ckk / (KH * KW);       // Compiler optimizes to: ckk >> 8
+      const uint32_t rem = ckk % (KH * KW);     // Compiler optimizes to: ckk & 255
+      const uint32_t kh = rem / KW;             // Compiler optimizes to: rem >> 4
+      const uint32_t kw = rem % KW;             // Compiler optimizes to: rem & 15
+
+      const uint32_t in_idx = c * HWd + (h_base + kh) * Wd + (w_base + kw);
+      store_shared(shared_offset_base + ckk * 4, 0, __builtin_bit_cast(uint32_t, a->in[in_idx]));
+    }
+  }
+
+  // Final synchronization before compute
+  mu_barrier(0, threads_per_threadblock / MU_NUM_THREADS);
+
+  // (3) Matrix multiply using padded layout to eliminate shared memory bank conflicts
+  // Each row in SMEM is padded by 16 floats so consecutive accesses do not conflict
+  for (uint32_t idx = tid_in_threadblock; idx < OC * P; idx += threads_per_threadblock) {
+    const uint32_t oc = idx / P; // Compiler optimizes to: idx >> 4
+    const uint32_t p = idx % P;  // Compiler optimizes to: idx & 15
+
+    const uint32_t w_base = smem_w_start + oc * ROW_STRIDE_BYTES;
+    const uint32_t patch_base = smem_patch_start + p * ROW_STRIDE_BYTES;
+
+    float acc = 0.0f;
+    uint32_t w_ptr = w_base;
+    uint32_t patch_ptr = patch_base;
+
+    #pragma GCC unroll 4
+    for (uint32_t k = 0; k < CKK; ++k) {
+      acc += __builtin_bit_cast(float, load32_shared(w_ptr)) *
+             __builtin_bit_cast(float, load32_shared(patch_ptr));
+      w_ptr += 4;
+      patch_ptr += 4;
+    }
+
+    a->out[idx] = acc;
+  }
+}
+```

@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:146:35: error: use of undeclared identifier 'INFINITY'\n  146 |     if (lane_id >= seq) my_val = -INFINITY;\n      |                                   ^\n1 error generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

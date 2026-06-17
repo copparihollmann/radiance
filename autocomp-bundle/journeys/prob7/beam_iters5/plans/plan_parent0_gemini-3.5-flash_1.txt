@@ -1,0 +1,42 @@
+An elegant and highly optimal plan to address the inefficiencies in the current single-head attention kernel.
+
+### Analysis of Inefficiencies in Baseline Code
+1. **Redundant and Uncoalesced Global Memory Accesses:** 
+   - Every thread `i` reads its own row of `Q` and the entire `K` matrix from global memory. Since `K` is read by all 128 threads, it results in massive redundant DRAM traffic.
+   - Global reads of `Q` are uncoalesced because thread `i` accesses `Q[i * 64 + k]`, resulting in a stride of 64 floats between lanes.
+   - In Phase 3, the `V` matrix is similarly read redundantly and with a stride of 64 floats (uncoalesced).
+2. **Global Memory Round-Trip for Scratch Space:**
+   - The intermediate attention score matrix `scratch` (64 KiB) is written to global memory in Phase 1, read back and rewritten in Phase 2, and read again in Phase 3. This DRAM round-trip is extremely slow.
+3. **Register Pressure Constraint:**
+   - To respect the hard target limit of **$\le$ 31 registers**, we must avoid aggressive loop unrolling or per-thread register tiling, and instead utilize shared memory staging.
+
+---
+
+### Optimization Plan
+We will exploit the **128 KiB of Shared Memory (SMEM)** to stage all matrices, completely eliminating global memory round-trips for `scratch` and making all DRAM transactions 100% coalesced.
+
+#### 1. Shared Memory Mapping (128 KiB total)
+We partition the SMEM address space dynamically to reuse buffers across phases:
+* `s_K` or `s_V` (32 KiB): Address `0x0000` to `0x7FFF` (8192 floats).
+* `s_scratch` (64 KiB): Address `0x8000` to `0x17FFF` (16384 floats).
+* `s_Q` or `s_O` (32 KiB): Address `0x18000` to `0x1FFFF` (8192 floats).
+
+#### 2. Detailed Execution Phases
+- **Phase 1 (Coalesced Load & SMEM Compute):**
+  - Cooperatively load the entire `Q` and `K` matrices from global memory into `s_Q` and `s_K` in SMEM. Since thread `tid` loads element `tid + step * 128`, these global loads are perfectly coalesced (stride-1).
+  - Synchronize using the cross-core barrier `mu_barrier(0, nw)`.
+  - Perform the GEMM `scratch = scale * Q * K^T` entirely in SMEM, writing the results directly to `s_scratch` at `0x8000`.
+
+- **Phase 2 (In-SMEM Softmax):**
+  - Synchronize with a cross-core barrier.
+  - Perform row-wise softmax in-place on `s_scratch` entirely in SMEM (zero global memory traffic).
+
+- **Phase 3 (Coalesced Load, SMEM Compute & Coalesced Write):**
+  - Synchronize with a cross-core barrier.
+  - Cooperatively load the `V` matrix from global memory into `s_V` (overwriting `s_K` at `0x0000`) using 100% coalesced global loads.
+  - Synchronize with a cross-core barrier.
+  - Compute `O = scratch * V` entirely in SMEM, storing the output in `s_O` (overwriting `s_Q` at `0x18000`).
+  - Synchronize with a cross-core barrier.
+  - Cooperatively write `O` from `s_O` to global memory using 100% coalesced stride-1 global stores.
+
+This completely eliminates uncoalesced global transactions and eliminates the expensive DRAM round-trip of the 64 KiB `scratch` buffer. Register usage is kept well under the 31-register hard limit.

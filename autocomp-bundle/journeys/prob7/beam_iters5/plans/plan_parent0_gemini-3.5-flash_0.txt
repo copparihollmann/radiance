@@ -1,0 +1,41 @@
+An elegant and highly effective strategy to optimize the single-head attention kernel on the Radiance Muon GPU is **Warp-Cooperative Row Processing**.
+
+### The Problem with the Baseline
+In the baseline implementation, each thread processes an entire row of $SEQ=128$ independently. This approach has three severe performance drawbacks:
+1. **Uncoalesced Memory Accesses**: When a single thread loops through $K[j]$ and $V[j]$, the 16 threads of a warp access disjoint memory locations (separated by stride $D=64$), causing highly uncoalesced global memory reads that thrash the L0/L1 caches.
+2. **High Register Pressure**: Since one thread is responsible for computing the entire row's outputs and intermediates, it must maintain multiple accumulators, offsets, and loop counters. This easily exceeds the 31-register physical limit, triggering register oversubscription.
+3. **No Local Reuse**: Each thread has to load the entire $Q[i]$ row and repeatedly load $K$ and $V$ columns without sharing data with neighboring threads.
+
+---
+
+### Proposed Strategy: Warp-Cooperative Row Processing
+
+Instead of assigning **one thread per row**, we assign **one warp (16 threads) per row**. Since the threadblock has 128 threads, we have exactly 8 warps. These 8 warps will cooperatively process the 128 rows (each warp handles $128 / 8 = 16$ rows sequentially).
+
+#### 1. Cooperative $Q \cdot K^T$ Dot Product
+For a warp processing row $i$:
+* The 64-element query vector $Q[i]$ is cooperatively loaded by the 16 threads of the warp (each thread loads 4 elements spaced by stride 16: `lane_id`, `lane_id + 16`, `lane_id + 32`, and `lane_id + 48`). This guarantees perfectly coalesced 64-byte global memory loads.
+* To compute $S[i][j] = Q[i] \cdot K[j]$ for each column $j \in [0, 128)$:
+  * The warp cooperatively loads $K[j]$ in the same coalesced 4-element-per-thread fashion.
+  * Each thread computes a local sum of 4 products.
+  * The warp performs a fast parallel reduction using a 16-word shared memory scratchpad to sum the 16 threads' results, yielding the final scalar dot product $S[i][j]$.
+
+#### 2. Cooperative Row Softmax
+Instead of a single thread doing sequential reduction over 128 elements:
+* The 16 threads divide the 128 intermediate scores (8 elements per thread).
+* They cooperatively find the maximum value using a 16-element warp reduction in SMEM.
+* Each thread computes the exponentials of its 8 elements using `mu_exp()`.
+* They cooperatively sum these exponentials via another SMEM warp reduction to obtain the denominator, which is then division-broadcasted to all threads in the warp.
+
+#### 3. Cooperative $P \cdot V$ Projection
+* To compute the 64 output elements of $O[i]$:
+  * Each of the 16 threads in the warp is assigned exactly $64 / 16 = 4$ output elements of $O[i]$.
+  * The thread accumulates its 4 output values by looping over the 128 cooperative softmax probabilities (which are kept in SMEM) and the corresponding columns of $V$.
+  * Once finished, the thread performs a coalesced write of its 4 output elements back to the global buffer $O[i]$.
+
+---
+
+### Why This Improves Performance
+* **Coalesced Global Memory Transactions**: Global memory requests for $Q$, $K$, and $V$ are perfectly aligned and contiguous across the 16 lanes of the warp, maximizing L0 data cache hit rates and minimizing DRAM latency.
+* **Avoids Register Oversubscription**: Distributing the calculation of a single row across 16 threads reduces the local accumulator state per thread to just a few registers, ensuring the kernel stays safely below the hard limit of 31 distinct registers.
+* **Zero DRAM Roundtrips for Scores**: The $128$-element attention score vector for row $i$ is kept entirely in SMEM during the softmax and projection phases, completely eliminating the slow DRAM read/write overhead of the `scratch` array.

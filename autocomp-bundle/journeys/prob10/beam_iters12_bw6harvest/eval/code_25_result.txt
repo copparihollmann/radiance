@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:82:26: error: use of undeclared identifier 'float_to_bits'\n   82 |                          float_to_bits(args->A[a_row * K + a_col_base]));\n      |                          ^\nkernel.cpp:88:26: error: use of undeclared identifier 'float_to_bits'\n   88 |                          float_to_bits(args->A[a_row * K + a_col2]));\n      |                          ^\nkernel.cpp:99:26: error: use of undeclared identifier 'float_to_bits'\n   99 |                          float_to_bits(args->B[b_row_base * N + b_col]));\n      |                          ^\nkernel.cpp:105:26: error: use of undeclared identifier 'float_to_bits'\n  105 |                          float_to_bits(args->B[b_row2 * N + b_col]));\n      |                          ^\nkernel.cpp:114:25: error: use of undeclared identifier 'bits_to_float'\n  114 |           float a_val = bits_to_float(load32_shared(smem_a + (r_thread * 16 + kk) * 4));\n      |                         ^\nkernel.cpp:115:25: error: use of undeclared identifier 'bits_to_float'\n  115 |           float b_val = bits_to_float(load32_shared(smem_b + (kk * 16 + c_thread) * 4));\n      |                         ^\n6 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

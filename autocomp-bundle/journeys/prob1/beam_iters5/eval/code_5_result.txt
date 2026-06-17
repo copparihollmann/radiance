@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nK'\n   62 |       for (uint32_t k = tid_in_threadblock; k < SPEC_CKK; k += threads_per_threadblock) {\n      |                                                 ^\nkernel.cpp:83:51: error: use of undeclared identifier 'SPEC_OC'\n   83 |     for (uint32_t idx = tid_in_threadblock; idx < SPEC_OC * SPEC_P; idx += threads_per_threadblock) {\n      |                                                   ^\nkernel.cpp:83:61: error: use of undeclared identifier 'SPEC_P'\n   83 |     for (uint32_t idx = tid_in_threadblock; idx < SPEC_OC * SPEC_P; idx += threads_per_threadblock) {\n      |                                                             ^\nkernel.cpp:84:50: error: use of undeclared identifier 'SPEC_CKK'\n   84 |       uint32_t wa = SPEC_SMEM_W + ((idx >> 4) * (SPEC_CKK * 4)); // W base (after patches)\n      |                                                  ^\nkernel.cpp:84:21: error: use of undeclared identifier 'SPEC_SMEM_W'\n   84 |       uint32_t wa = SPEC_SMEM_W + ((idx >> 4) * (SPEC_CKK * 4)); // W base (after patches)\n      |                     ^\nkernel.cpp:85:35: error: use of undeclared identifier 'SPEC_CKK'\n   85 |       uint32_t pa = (idx & 15) * (SPEC_CKK * 4);                 // patch base (SMEM offset 0)\n      |                                   ^\nkernel.cpp:89:32: error: use of undeclared identifier 'SPEC_CKK'\n   89 |       for (uint32_t k = 0; k < SPEC_CKK; k++) {\n      |                                ^\n12 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

@@ -1,0 +1,108 @@
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t seq = a->seq;
+  const uint32_t d = a->d;
+  const uint32_t nw = threads_per_threadblock / MU_NUM_THREADS;
+
+  // Shared memory layout:
+  // Phases 1 & 2:
+  //   smem_q: 0x00000 - 0x08000 (32 KiB)
+  //   smem_k: 0x08000 - 0x10000 (32 KiB)
+  //   smem_s: 0x10000 - 0x20000 (64 KiB)
+  // Phase 3:
+  //   smem_v: 0x00000 - 0x08000 (32 KiB)
+  //   smem_o: 0x08000 - 0x10000 (32 KiB)
+  constexpr uint32_t SMEM_Q_BASE = 0x00000;
+  constexpr uint32_t SMEM_K_BASE = 0x08000;
+  constexpr uint32_t SMEM_S_BASE = 0x10000;
+  constexpr uint32_t SMEM_V_BASE = 0x00000;
+  constexpr uint32_t SMEM_O_BASE = 0x08000;
+
+  // Phase 1: Coalesced load of Q and K into SMEM
+  // Each thread loads one element per row, striding by threads_per_threadblock
+  for (uint32_t i = tid_in_threadblock; i < seq * d; i += threads_per_threadblock) {
+    const uint32_t row = i / d;
+    const uint32_t col = i % d;
+    const __global float* q_ptr = a->Q + row * d + col;
+    const __global float* k_ptr = a->K + row * d + col;
+    float q_val, k_val;
+    asm volatile("flw %0, 0(%1)" : "=f"(q_val) : "r"(q_ptr));
+    asm volatile("flw %0, 0(%1)" : "=f"(k_val) : "r"(k_ptr));
+    store_shared(SMEM_Q_BASE, i * sizeof(float), *(uint32_t*)&q_val);
+    store_shared(SMEM_K_BASE, i * sizeof(float), *(uint32_t*)&k_val);
+  }
+  mu_barrier(0, nw); // Cross-core sync after SMEM write
+
+  // Phase 2: Compute scores S[i][j] = 0.125 * Q[i] dot K[j], then softmax in-place
+  for (uint32_t i = tid_in_threadblock; i < seq; i += threads_per_threadblock) {
+    for (uint32_t j = 0; j < seq; j++) {
+      float acc = 0.0f;
+      for (uint32_t k = 0; k < d; k++) {
+        float qi_k = *(float*)&load32_shared(SMEM_Q_BASE + (i * d + k) * sizeof(float));
+        float kj_k = *(float*)&load32_shared(SMEM_K_BASE + (j * d + k) * sizeof(float));
+        acc += qi_k * kj_k;
+      }
+      float scaled_score = acc * 0.125f;
+      store_shared(SMEM_S_BASE, (i * seq + j) * sizeof(float), *(uint32_t*)&scaled_score);
+    }
+    
+    // Softmax on row i
+    float* s_row = (float*)(SMEM_S_BASE + i * seq * sizeof(float));
+    float m = s_row[0];
+    for (uint32_t j = 1; j < seq; j++) {
+      if (s_row[j] > m) m = s_row[j];
+    }
+    float sum = 0.0f;
+    for (uint32_t j = 0; j < seq; j++) {
+      float diff = s_row[j] - m;
+      float e = mu_exp(diff);
+      s_row[j] = e;
+      sum += e;
+    }
+    float inv_sum = 1.0f / sum;
+    for (uint32_t j = 0; j < seq; j++) {
+      s_row[j] *= inv_sum;
+    }
+  }
+  mu_barrier(0, nw); // Cross-core sync after S computation and softmax
+
+  // Phase 3: Load V into SMEM (reuse Q's space)
+  for (uint32_t i = tid_in_threadblock; i < seq * d; i += threads_per_threadblock) {
+    const uint32_t row = i / d;
+    const uint32_t col = i % d;
+    const __global float* v_ptr = a->V + row * d + col;
+    float v_val;
+    asm volatile("flw %0, 0(%1)" : "=f"(v_val) : "r"(v_ptr));
+    store_shared(SMEM_V_BASE, i * sizeof(float), *(uint32_t*)&v_val);
+  }
+  mu_barrier(0, nw); // Cross-core sync after V load
+
+  // Compute output O[i][k] = sum_j P[i][j] * V[j][k]
+  for (uint32_t i = tid_in_threadblock; i < seq; i += threads_per_threadblock) {
+    for (uint32_t k = 0; k < d; k++) {
+      float acc = 0.0f;
+      for (uint32_t j = 0; j < seq; j++) {
+        float p_ij = *(float*)&load32_shared(SMEM_S_BASE + (i * seq + j) * sizeof(float));
+        float v_jk = *(float*)&load32_shared(SMEM_V_BASE + (j * d + k) * sizeof(float));
+        acc += p_ij * v_jk;
+      }
+      store_shared(SMEM_O_BASE, (i * d + k) * sizeof(float), *(uint32_t*)&acc);
+    }
+  }
+  mu_barrier(0, nw); // Cross-core sync after O computation
+
+  // Coalesced writeback of O from SMEM to global memory
+  for (uint32_t i = tid_in_threadblock; i < seq * d; i += threads_per_threadblock) {
+    const uint32_t row = i / d;
+    const uint32_t col = i % d;
+    __global float* o_ptr = a->O + row * d + col;
+    float o_val = *(float*)&load32_shared(SMEM_O_BASE + i * sizeof(float));
+    asm volatile("fsw %0, 0(%1)" :: "f"(o_val), "r"(o_ptr));
+  }
+}

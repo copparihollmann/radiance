@@ -1,0 +1,163 @@
+#include <stdint.h>
+
+static inline float load_float_shared(uint32_t byte_addr) {
+    union { uint32_t i; float f; } u;
+    u.i = load32_shared(byte_addr);
+    return u.f;
+}
+
+static inline void store_float_shared(uint32_t byte_addr, float val) {
+    union { float f; uint32_t i; } u;
+    u.f = val;
+    store_shared(byte_addr, 0, u.i);
+}
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t num_warps = threads_per_threadblock / MU_NUM_THREADS;
+  const float scale = 0.125f;
+
+  // SMEM layout with padding to avoid bank conflicts (16 floats = 64 bytes padding)
+  // Q: 96x64 -> 96x80 (padded) -> 96*80*4 = 30720 bytes
+  // K: 96x64 -> 96x80 (padded) -> 96*80*4 = 30720 bytes
+  // V: 64x96 (transposed) -> 64x112 (padded) -> 64*112*4 = 28672 bytes
+  // S: 96x96 -> 96x112 (padded) -> 96*112*4 = 43008 bytes
+  // Total: 30720*2 + 28672 + 43008 = 133504 bytes (< 128KB = 131072 bytes)
+  // Adjusting V and S to fit within budget:
+  // V: 64x96 (no padding for this layout) -> 64*96*4 = 24576 bytes
+  // S: 96x96 (no padding for this layout) -> 96*96*4 = 36864 bytes
+  // Q: 96x64 -> 96*64*4 = 24576 bytes
+  // K: 96x64 -> 96*64*4 = 24576 bytes
+  // Total: 24576*2 + 24576 + 36864 = 110592 bytes
+  const uint32_t Q_offset = 0;
+  const uint32_t K_offset = 24576;
+  const uint32_t V_offset = 49152;
+  const uint32_t S_offset = 73728;
+
+  const __global float* Q = a->Q;
+  const __global float* K = a->K;
+  const __global float* V = a->V;
+  float* O = a->O;
+
+  // 1. Stage Q (96x64) to SMEM
+  for (uint32_t idx = tid_in_threadblock; idx < 96*64; idx += threads_per_threadblock) {
+    store_float_shared(Q_offset + idx * 4, Q[idx]);
+  }
+
+  // 2. Stage K (96x64) to SMEM
+  for (uint32_t idx = tid_in_threadblock; idx < 96*64; idx += threads_per_threadblock) {
+    store_float_shared(K_offset + idx * 4, K[idx]);
+  }
+
+  // 3. Stage and transpose V (96x64 -> 64x96) to SMEM
+  for (uint32_t idx = tid_in_threadblock; idx < 96*64; idx += threads_per_threadblock) {
+    const uint32_t j = idx / 64; // row: 0..95
+    const uint32_t k = idx % 64; // col: 0..63
+    store_float_shared(V_offset + (k * 96 + j) * 4, V[idx]);
+  }
+
+  // Barrier 0 for cross-core visibility of Q, K, V
+  mu_barrier(0, num_warps);
+
+  // 4. Compute S = Q * K^T * scale (96x96)
+  for (uint32_t idx = tid_in_threadblock; idx < 96*96; idx += threads_per_threadblock) {
+    const uint32_t i = idx / 96;
+    const uint32_t j = idx % 96;
+
+    uint32_t q_ptr = Q_offset + i * 64 * 4;
+    uint32_t k_ptr = K_offset + j * 64 * 4;
+    float acc = 0.0f;
+
+    // Inner product loop with manual unrolling by 2
+    // This uses 4 registers for vals and 2 for ptrs = 6 + acc = 7 registers
+    // Keeping unroll factor low to stay under register limit
+    for (uint32_t k = 0; k < 64; k += 2) {
+      float q0 = load_float_shared(q_ptr);
+      float k0 = load_float_shared(k_ptr);
+      float q1 = load_float_shared(q_ptr + 4);
+      float k1 = load_float_shared(k_ptr + 4);
+      acc += q0 * k0;
+      acc += q1 * k1;
+      q_ptr += 8;
+      k_ptr += 8;
+    }
+    store_float_shared(S_offset + idx * 4, acc * scale);
+  }
+
+  // Barrier 0 for cross-core visibility of S
+  mu_barrier(0, num_warps);
+
+  // 5. Softmax per row in SMEM
+  for (uint32_t row = tid_in_threadblock; row < 96; row += threads_per_threadblock) {
+    const uint32_t s_row_base = S_offset + row * 96 * 4;
+    float m = -1e30f;
+
+    // Find max
+    uint32_t addr = s_row_base;
+    for (uint32_t j = 0; j < 96; j += 2) {
+      float v0 = load_float_shared(addr);
+      float v1 = load_float_shared(addr + 4);
+      if (v0 > m) m = v0;
+      if (v1 > m) m = v1;
+      addr += 8;
+    }
+
+    // Compute exp and sum
+    float sum = 0.0f;
+    addr = s_row_base;
+    for (uint32_t j = 0; j < 96; j += 2) {
+      float v0 = load_float_shared(addr);
+      float v1 = load_float_shared(addr + 4);
+      float e0 = mu_exp(v0 - m);
+      float e1 = mu_exp(v1 - m);
+      store_float_shared(addr, e0);
+      store_float_shared(addr + 4, e1);
+      sum += e0 + e1;
+      addr += 8;
+    }
+
+    // Normalize
+    const float inv_sum = 1.0f / sum;
+    addr = s_row_base;
+    for (uint32_t j = 0; j < 96; j += 2) {
+      float e0 = load_float_shared(addr);
+      float e1 = load_float_shared(addr + 4);
+      store_float_shared(addr, e0 * inv_sum);
+      store_float_shared(addr + 4, e1 * inv_sum);
+      addr += 8;
+    }
+  }
+
+  // Barrier 0 for cross-core visibility after softmax
+  mu_barrier(0, num_warps);
+
+  // 6. Compute O = S * V^T (96x64)
+  // V is transposed in SMEM as 64x96
+  for (uint32_t idx = tid_in_threadblock; idx < 96 * 64; idx += threads_per_threadblock) {
+    const uint32_t i = idx / 64; // output row: 0..95
+    const uint32_t k = idx % 64; // output col: 0..63
+
+    uint32_t s_ptr = S_offset + i * 96 * 4;
+    uint32_t v_ptr = V_offset + k * 96 * 4; // Stride-1 access due to transpose
+    float acc = 0.0f;
+
+    // Dot product with manual unrolling by 2
+    for (uint32_t j = 0; j < 96; j += 2) {
+      float s0 = load_float_shared(s_ptr);
+      float v0 = load_float_shared(v_ptr);
+      float s1 = load_float_shared(s_ptr + 4);
+      float v1 = load_float_shared(v_ptr + 4);
+      acc += s0 * v0;
+      acc += s1 * v1;
+      s_ptr += 8;
+      v_ptr += 8;
+    }
+    O[idx] = acc;
+  }
+}

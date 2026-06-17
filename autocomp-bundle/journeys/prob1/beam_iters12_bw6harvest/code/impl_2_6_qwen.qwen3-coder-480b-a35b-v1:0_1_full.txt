@@ -1,0 +1,147 @@
+```cpp
+#include <stdint.h>
+
+#define MU_NUM_THREADS 16
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t CKK = a->C * a->KH * a->KW;
+
+  // Pad CKK to avoid SMEM bank conflicts: 768 -> 784 (next multiple of 16)
+  const uint32_t CKK_PADDED = (CKK + 15) & ~15;
+  const uint32_t smem_w = a->OH * a->OW * CKK_PADDED * 4; // W staged AFTER patches
+
+  // (1) Stage weights flat into SMEM with padded rows
+  const uint32_t OC = a->OC;
+  if (__builtin_constant_p(CKK) && CKK == 768) {
+    for (uint32_t r = 0; r < OC; ++r) {
+      uint32_t smem_row_base = smem_w + r * CKK_PADDED * 4;
+      uint32_t global_row_base = r * CKK;
+      for (uint32_t k = tid_in_threadblock; k < CKK; k += 128) {
+        store_shared(smem_row_base + k * 4, 0, __builtin_bit_cast(uint32_t, a->w[global_row_base + k]));
+      }
+    }
+  } else {
+    // Generic fallback weight staging
+    const uint32_t total_w = OC * CKK;
+    for (uint32_t i = tid_in_threadblock; i < total_w; i += threads_per_threadblock) {
+      const uint32_t r = i / CKK;
+      const uint32_t ckk = i % CKK;
+      store_shared(smem_w + r * CKK_PADDED * 4 + ckk * 4, 0, __builtin_bit_cast(uint32_t, a->w[i]));
+    }
+  }
+
+  // (2) Gather im2col patches into SMEM
+  const uint32_t KH = a->KH, KW = a->KW, OW = a->OW;
+  const uint32_t Wd = a->W, HWd = a->H * Wd, stride = a->stride;
+  const uint32_t OH = a->OH;
+
+  if (__builtin_constant_p(KW) && __builtin_constant_p(KH) && __builtin_constant_p(OW) &&
+      KW == 16 && KH == 16 && OW == 4) {
+    for (uint32_t ph = 0; ph < OH; ++ph) {
+      const uint32_t ph_stride_Wd = ph * stride * Wd;
+      for (uint32_t pw = 0; pw < 4; ++pw) {
+        const uint32_t p = ph * 4 + pw;
+        const uint32_t pw_stride = pw * stride;
+        const uint32_t smem_p_base = p * CKK_PADDED * 4;
+        
+        for (uint32_t s = 0; s < 6; ++s) {
+          const uint32_t ckk = tid_in_threadblock + s * 128;
+          if (ckk >= CKK) continue;
+          const uint32_t c = ckk >> 8;
+          const uint32_t kh = (ckk >> 4) & 15;
+          const uint32_t kw = ckk & 15;
+          const uint32_t in_idx = c * HWd + ph_stride_Wd + kh * Wd + pw_stride + kw;
+          store_shared(smem_p_base + ckk * 4, 0, __builtin_bit_cast(uint32_t, a->in[in_idx]));
+        }
+      }
+    }
+  } else {
+    // Generic fallback input staging
+    const uint32_t total = OH * OW * CKK;
+    for (uint32_t i = tid_in_threadblock; i < total; i += threads_per_threadblock) {
+      const uint32_t p = i / CKK;
+      const uint32_t ckk = i % CKK;
+      const uint32_t in_idx = (ckk / (KH * KW)) * HWd
+                            + ((p / OW) * stride + (ckk / KW) % KH) * Wd
+                            + (p % OW) * stride + ckk % KW;
+      store_shared(p * CKK_PADDED * 4 + ckk * 4, 0, __builtin_bit_cast(uint32_t, a->in[in_idx]));
+    }
+  }
+
+  // Cross-core SMEM staging barrier
+  mu_barrier(0, threads_per_threadblock / MU_NUM_THREADS);
+
+  // (3) Matmul phase
+  const uint32_t P = OH * OW;
+  if (__builtin_constant_p(P) && P == 16 && __builtin_constant_p(CKK) && CKK == 768) {
+    // Cooperative matmul: each thread computes two outputs
+    const uint32_t col = tid_in_threadblock & 15;
+    const uint32_t row0 = tid_in_threadblock >> 4;
+    const uint32_t row1 = row0 + 8;
+
+    uint32_t wa0 = smem_w + row0 * CKK_PADDED * 4;
+    uint32_t wa1 = smem_w + row1 * CKK_PADDED * 4;
+    uint32_t pa  = col * CKK_PADDED * 4;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    // Unroll by 4 to balance ILP and register usage
+    for (uint32_t k = 0; k < CKK; k += 4) {
+      float p, w0, w1;
+
+      p  = __builtin_bit_cast(float, load32_shared(pa));
+      w0 = __builtin_bit_cast(float, load32_shared(wa0));
+      w1 = __builtin_bit_cast(float, load32_shared(wa1));
+      acc0 += w0 * p;
+      acc1 += w1 * p;
+
+      p  = __builtin_bit_cast(float, load32_shared(pa + 4));
+      w0 = __builtin_bit_cast(float, load32_shared(wa0 + 4));
+      w1 = __builtin_bit_cast(float, load32_shared(wa1 + 4));
+      acc0 += w0 * p;
+      acc1 += w1 * p;
+
+      p  = __builtin_bit_cast(float, load32_shared(pa + 8));
+      w0 = __builtin_bit_cast(float, load32_shared(wa0 + 8));
+      w1 = __builtin_bit_cast(float, load32_shared(wa1 + 8));
+      acc0 += w0 * p;
+      acc1 += w1 * p;
+
+      p  = __builtin_bit_cast(float, load32_shared(pa + 12));
+      w0 = __builtin_bit_cast(float, load32_shared(wa0 + 12));
+      w1 = __builtin_bit_cast(float, load32_shared(wa1 + 12));
+      acc0 += w0 * p;
+      acc1 += w1 * p;
+
+      wa0 += 16;
+      wa1 += 16;
+      pa  += 16;
+    }
+
+    a->out[row0 * 16 + col] = acc0;
+    a->out[row1 * 16 + col] = acc1;
+  } else {
+    // Generic fallback matmul path
+    const uint32_t total_out = OC * P;
+    for (uint32_t idx = tid_in_threadblock; idx < total_out; idx += threads_per_threadblock) {
+      uint32_t wa = smem_w + (idx / P) * CKK_PADDED * 4;
+      uint32_t pa = (idx % P) * CKK_PADDED * 4;
+      float acc = 0.0f;
+      for (uint32_t k = 0; k < CKK; k++) {
+        acc += __builtin_bit_cast(float, load32_shared(wa)) *
+               __builtin_bit_cast(float, load32_shared(pa));
+        wa += 4; pa += 4;
+      }
+      a->out[idx] = acc;
+    }
+  }
+}
+```

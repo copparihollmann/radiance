@@ -1,0 +1,115 @@
+```cpp
+#include <vx_intrinsics.h>
+#include <mu_intrinsics.h>
+#include <mu_schedule.h>
+#include <shared_mem.h>
+#include <math.h>
+#include <stdint.h>
+
+static inline float bits_to_float(uint32_t b) { 
+  union { uint32_t u; float f; } c; 
+  c.u = b; 
+  return c.f; 
+}
+
+static inline uint32_t float_to_bits(float f) { 
+  union { uint32_t u; float f; } c; 
+  c.f = f; 
+  return c.u; 
+}
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t seq = 96;
+  const uint32_t d = 64;
+  const uint32_t num_warps = threads_per_threadblock / MU_NUM_THREADS;
+  const float scale = 0.125f;
+
+  // SMEM Layout (Total size = 111,360 bytes < 128 KiB)
+  const uint32_t smem_Q = 0;              
+  const uint32_t smem_K = 24576;          
+  const uint32_t smem_V = 49536;         
+  const uint32_t smem_scratch = 74112;    
+
+  // Phase 0: Stage Q, K, and V into SMEM
+  for (uint32_t idx = tid_in_threadblock; idx < seq * d; idx += threads_per_threadblock) {
+    const uint32_t r = idx / d;
+    const uint32_t c = idx % d;
+    store_shared(smem_Q + (idx * 4), 0, float_to_bits(a->Q[idx]));
+    store_shared(smem_K + (r * 65 + c) * 4, 0, float_to_bits(a->K[idx]));
+    store_shared(smem_V + (idx * 4), 0, float_to_bits(a->V[idx]));
+  }
+
+  // Cross-core barrier for SMEM writes to be visible
+  mu_barrier(0, num_warps);
+
+  // Phase 1: Compute scores QK^T into scratch
+  for (uint32_t idx = tid_in_threadblock; idx < seq * seq; idx += threads_per_threadblock) {
+    const uint32_t i = idx / seq;
+    const uint32_t j = idx % seq;
+    float acc = 0.0f;
+    
+    uint32_t q_ptr = smem_Q + i * d * 4;
+    uint32_t k_ptr = smem_K + j * 65 * 4;
+
+    for (uint32_t k = 0; k < d; k++) {
+      float q_val = bits_to_float(load32_shared(q_ptr + k * 4));
+      float k_val = bits_to_float(load32_shared(k_ptr + k * 4));
+      acc += q_val * k_val;
+    }
+    store_shared(smem_scratch + (i * 97 + j) * 4, 0, float_to_bits(acc * scale));
+  }
+  
+  mu_barrier(0, num_warps);
+
+  // Phase 2: Softmax per row
+  for (uint32_t row = tid_in_threadblock; row < seq; row += threads_per_threadblock) {
+    const uint32_t row_offset = smem_scratch + row * 97 * 4;
+    float m = bits_to_float(load32_shared(row_offset));
+
+    for (uint32_t j = 1; j < seq; j++) {
+      float v = bits_to_float(load32_shared(row_offset + j * 4));
+      if (v > m) m = v;
+    }
+
+    float sum = 0.0f;
+    for (uint32_t j = 0; j < seq; j++) {
+      float diff = bits_to_float(load32_shared(row_offset + j * 4)) - m;
+      float e = mu_exp(diff);
+      store_shared(row_offset + j * 4, 0, float_to_bits(e));
+      sum += e;
+    }
+
+    const float inv_sum = 1.0f / sum;
+    for (uint32_t j = 0; j < seq; j++) {
+      float e = bits_to_float(load32_shared(row_offset + j * 4));
+      store_shared(row_offset + j * 4, 0, float_to_bits(e * inv_sum));
+    }
+  }
+
+  mu_barrier(0, num_warps);
+
+  // Phase 3: O = P V
+  for (uint32_t idx = tid_in_threadblock; idx < seq * d; idx += threads_per_threadblock) {
+    const uint32_t i = idx / d;
+    const uint32_t k = idx % d;
+    float acc = 0.0f;
+    
+    uint32_t p_row_base = smem_scratch + i * 97 * 4;
+    uint32_t v_col_base = smem_V + k * 4;
+
+    for (uint32_t j = 0; j < seq; j++) {
+      float p_val = bits_to_float(load32_shared(p_row_base + j * 4));
+      float v_val = bits_to_float(load32_shared(v_col_base + j * d * 4));
+      acc += p_val * v_val;
+    }
+    a->O[idx] = acc;
+  }
+}
+```

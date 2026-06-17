@@ -1,0 +1,105 @@
+```cpp
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t seq = a->seq;
+  const uint32_t d = a->d;
+  const uint32_t num_warps = threads_per_threadblock / MU_NUM_THREADS;
+  const float scale = 0.125f;
+
+  // Phase 1: scores
+  for (uint32_t idx = tid_in_threadblock; idx < seq * seq; idx += threads_per_threadblock) {
+    const uint32_t i = idx / seq;
+    const uint32_t j = idx % seq;
+    float acc = 0.0f;
+    for (uint32_t k = 0; k < d; k++) {
+      acc += a->Q[i * d + k] * a->K[j * d + k];
+    }
+    a->scratch[idx] = acc * scale;
+  }
+  mu_barrier(1, num_warps);
+
+  // Phase 2: softmax per row (optimized with shared memory reductions)
+  const uint32_t smem_row_offset = 0;  // Shared memory layout starts at 0
+  float* smem_max = (float*)smem_row_offset;
+  float* smem_exp = (float*)(smem_row_offset + 128 * sizeof(float));
+
+  for (uint32_t row = 0; row < seq; ++row) {
+    const uint32_t global_idx = row * seq + tid_in_threadblock;
+    
+    // Cooperative load into shared memory
+    float val = -1e30f;  // Initialize with neutral value for max
+    if (tid_in_threadblock < seq) {
+      val = a->scratch[global_idx];
+    }
+    
+    // Store value in shared memory for max reduction
+    store_shared((uint32_t)smem_max, tid_in_threadblock * 4, *(uint32_t*)&val);
+    mu_barrier(0, num_warps); // Cross-core barrier to ensure visibility
+    
+    // Hierarchical reduction in shared memory for finding maximum
+    for (uint32_t stride = 64; stride > 0; stride >>= 1) {
+      if (tid_in_threadblock < stride) {
+        float lhs = *(float*)&load32_shared((uint32_t)&smem_max[tid_in_threadblock]);
+        float rhs = *(float*)&load32_shared((uint32_t)&smem_max[tid_in_threadblock + stride]);
+        float max_val = (lhs > rhs) ? lhs : rhs;
+        store_shared((uint32_t)smem_max, tid_in_threadblock * 4, *(uint32_t*)&max_val);
+      }
+      mu_barrier(0, num_warps);
+    }
+    
+    // Broadcast maximum value to all threads
+    float max_val = *(float*)&load32_shared((uint32_t)smem_max);
+    
+    // Reset shared memory for exponential values
+    val = 0.0f;  // Neutral value for sum
+    if (tid_in_threadblock < seq) {
+      float diff = a->scratch[global_idx] - max_val;
+      val = mu_exp(diff);
+    }
+    
+    // Store exponential value in shared memory for sum reduction
+    store_shared((uint32_t)smem_exp, tid_in_threadblock * 4, *(uint32_t*)&val);
+    mu_barrier(0, num_warps); // Cross-core barrier to ensure visibility
+    
+    // Hierarchical reduction in shared memory for computing sum
+    for (uint32_t stride = 64; stride > 0; stride >>= 1) {
+      if (tid_in_threadblock < stride) {
+        float lhs = *(float*)&load32_shared((uint32_t)&smem_exp[tid_in_threadblock]);
+        float rhs = *(float*)&load32_shared((uint32_t)&smem_exp[tid_in_threadblock + stride]);
+        float sum_val = lhs + rhs;
+        store_shared((uint32_t)smem_exp, tid_in_threadblock * 4, *(uint32_t*)&sum_val);
+      }
+      mu_barrier(0, num_warps);
+    }
+    
+    // Compute inverse of sum and broadcast
+    float inv_sum = 1.0f / (*(float*)&load32_shared((uint32_t)smem_exp));
+    
+    // Normalize and write back to global memory
+    if (tid_in_threadblock < seq) {
+      a->scratch[global_idx] = val * inv_sum;
+    }
+    
+    mu_barrier(1, num_warps); // Per-core barrier between rows
+  }
+  
+  mu_barrier(1, num_warps);
+
+  // Phase 3: O = P V
+  for (uint32_t idx = tid_in_threadblock; idx < seq * d; idx += threads_per_threadblock) {
+    const uint32_t i = idx / d;
+    const uint32_t k = idx % d;
+    float acc = 0.0f;
+    for (uint32_t j = 0; j < seq; j++) {
+      acc += a->scratch[i * seq + j] * a->V[j * d + k];
+    }
+    a->O[idx] = acc;
+  }
+}
+```

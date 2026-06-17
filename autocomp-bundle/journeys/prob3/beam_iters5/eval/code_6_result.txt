@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:76:5: error: use of undeclared identifier 's_scratch'\n   76 |     s_scratch[idx] = acc * scale;\n      |     ^\nkernel.cpp:84:21: error: use of undeclared identifier 's_scratch'\n   84 |     float max_val = s_scratch[row * seq + 0];\n      |                     ^\nkernel.cpp:86:19: error: use of undeclared identifier 's_scratch'\n   86 |       float val = s_scratch[row * seq + j];\n      |                   ^\nkernel.cpp:94:20: error: use of undeclared identifier 's_scratch'\n   94 |       float diff = s_scratch[row * seq + j] - max_val;\n      |                    ^\nkernel.cpp:96:7: error: use of undeclared identifier 's_scratch'\n   96 |       s_scratch[row * seq + j] = exp_val;\n      |       ^\nkernel.cpp:102:7: error: use of undeclared identifier 's_scratch'\n  102 |       s_scratch[row * seq + j] *= inv_sum;\n      |       ^\nkernel.cpp:115:14: error: use of undeclared identifier 's_scratch'\n  115 |       acc += s_scratch[i * seq + j] * a->V[j * d + k];\n      |              ^\n7 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

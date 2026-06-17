@@ -1,0 +1,35 @@
+An elegant and highly effective optimization plan to improve the single-head attention kernel.
+
+### Optimization Plan: Vectorized 128-bit Loads/Stores for High-Dimension Matrices (Strategy 9)
+
+#### Inefficiencies in the Baseline Kernel
+1. **Instruction Overhead**: In Phase 1 and Phase 3, the inner loops perform single element 32-bit (`float`) loads. For $d = 64$ and $\text{SEQ} = 128$, this generates a massive number of individual scalar load instructions, causing instruction-cache pressure and serialization in the load-store unit (LSU).
+2. **Suboptimal Memory Fetching**: Since global memory reads have a latency of ~400 cycles, fetching contiguous elements sequentially in scalar fashion fails to exploit the L0 data cache's wide bandwidth (64 B/cycle). Grouping these accesses into wider 128-bit loads significantly increases spatial locality and LSU throughput.
+3. **Register Constraints**: We must strictly adhere to the RTL limit of $\le 31$ distinct registers per thread. Staging the entirety of a row in registers is impossible. However, by processing data in chunks of 4 elements (`float4`) and only keeping 4 accumulators active at any given time, we can maximize bandwidth without exceeding the register budget.
+
+#### Optimization Steps
+
+1. **Define a Vector Type**:
+   Define a 16-byte aligned `struct float4` to represent 128-bit packed floating-point data:
+   ```cpp
+   struct alignas(16) float4 {
+     float x, y, z, w;
+   };
+   ```
+
+2. **Phase 1 (Q $\cdot$ K Dot Product)**:
+   * Cast the $Q$ and $K$ pointers to `const __global float4*`.
+   * Unroll the innermost loop by 4 (to match the `float4` boundary), loading 4 elements of $Q[i]$ and $K[j]$ in a single 128-bit load instruction.
+   * Accumulate the products of their corresponding `.x`, `.y`, `.z`, and `.w` components.
+
+3. **Phase 2 (Softmax)**:
+   * Keep Phase 2 minimal and simple to conserve registers.
+
+4. **Phase 3 (P $\cdot$ V Matrix Multiplication)**:
+   * Loop through the dimension $k$ in strides of 4.
+   * Keep 4 accumulators (`acc0`, `acc1`, `acc2`, `acc3`) in registers.
+   * In the inner $j$ loop, load 4 contiguous elements of $V$ starting at $V[j \cdot d + k]$ using a single 128-bit load `float4 v_val = *v_ptr`.
+   * Multiply each component by the scalar probability $S[i][j]$ and accumulate.
+   * Write the final 4 computed outputs to $O[i \cdot d + k]$ using a single vectorized 128-bit store.
+
+This strategy directly implements **Strategy 9**, drastically reducing instruction count and latency while safely remaining within the strict 31-register architectural limit.

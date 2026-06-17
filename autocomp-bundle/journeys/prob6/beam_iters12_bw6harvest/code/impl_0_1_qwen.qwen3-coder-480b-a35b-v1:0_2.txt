@@ -1,0 +1,137 @@
+#include <stdint.h>
+
+struct KernelArgs {
+  __global float* A;
+  __global float* B;
+  __global float* C;
+  uint32_t M;
+  uint32_t N;
+  uint32_t K;
+};
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t M = args->M, N = args->N, K = args->K;
+  const uint32_t num_warps = threads_per_threadblock / 16;
+
+  // Tile sizes
+  const uint32_t TM = 64, TN = 64, TK = 32;
+
+  // Shared memory layout
+  const uint32_t smem_a = 0;
+  const uint32_t smem_b = smem_a + TM * TK * sizeof(float);
+  const uint32_t smem_c = smem_b + TK * (TN + 16) * sizeof(float); // +16 for padding
+
+  const __global float* A_ptr = args->A;
+  const __global float* B_ptr = args->B;
+  __global float* C_ptr = args->C;
+
+  // Thread mapping: 8x16 logical grid for 128 threads
+  const uint32_t thread_row = tid_in_threadblock / 16;
+  const uint32_t thread_col = tid_in_threadblock % 16;
+
+  // Initialize C tile in shared memory
+  for (uint32_t i = tid_in_threadblock; i < TM * TN; i += threads_per_threadblock) {
+    uint32_t r = i / TN;
+    uint32_t c = i % TN;
+    uint32_t addr = smem_c + (r * (TN + 16) + c) * sizeof(float);
+    store_shared(addr, 0, __builtin_bit_cast(uint32_t, 0.0f));
+  }
+  mu_barrier(0, num_warps);
+
+  // Main K-loop
+  for (uint32_t k_outer = 0; k_outer < K; k_outer += TK) {
+    // Collaborative load of A tile (64x32)
+    for (uint32_t i = tid_in_threadblock; i < TM * TK; i += threads_per_threadblock) {
+      uint32_t local_r = i / TK;
+      uint32_t local_c = i % TK;
+      uint32_t global_idx = (local_r * K) + k_outer + local_c;
+      uint32_t smem_addr = smem_a + i * sizeof(float);
+      float val = (k_outer + local_c < K && local_r < M) ? A_ptr[global_idx] : 0.0f;
+      store_shared(smem_addr, 0, __builtin_bit_cast(uint32_t, val));
+    }
+
+    // Collaborative load of B tile (32x64) with padding
+    for (uint32_t i = tid_in_threadblock; i < TK * TN; i += threads_per_threadblock) {
+      uint32_t local_r = i / TN;
+      uint32_t local_c = i % TN;
+      uint32_t global_idx = ((k_outer + local_r) * N) + local_c;
+      uint32_t smem_addr = smem_b + (local_c * (TK + 16) + local_r) * sizeof(float);
+      float val = (k_outer + local_r < K && local_c < N) ? B_ptr[global_idx] : 0.0f;
+      store_shared(smem_addr, 0, __builtin_bit_cast(uint32_t, val));
+    }
+
+    mu_barrier(0, num_warps);
+
+    // Compute partial products for 4 C elements per thread
+    for (uint32_t r_inner = 0; r_inner < 8; r_inner++) {
+      uint32_t r = thread_row * 8 + r_inner;
+      if (r >= TM) continue;
+
+      uint32_t c_base = thread_col * 4;
+      if (c_base >= TN) continue;
+
+      float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+      
+      for (uint32_t k = 0; k < TK; k++) {
+        uint32_t a_addr = smem_a + (r * TK + k) * sizeof(float);
+        float a_val = __builtin_bit_cast(float, load32_shared(a_addr));
+
+        uint32_t b_off = (c_base + 0) * (TK + 16) + k;
+        uint32_t b_addr0 = smem_b + b_off * sizeof(float);
+        acc0 += a_val * __builtin_bit_cast(float, load32_shared(b_addr0));
+
+        b_off = (c_base + 1) * (TK + 16) + k;
+        uint32_t b_addr1 = smem_b + b_off * sizeof(float);
+        acc1 += a_val * __builtin_bit_cast(float, load32_shared(b_addr1));
+
+        b_off = (c_base + 2) * (TK + 16) + k;
+        uint32_t b_addr2 = smem_b + b_off * sizeof(float);
+        acc2 += a_val * __builtin_bit_cast(float, load32_shared(b_addr2));
+
+        b_off = (c_base + 3) * (TK + 16) + k;
+        uint32_t b_addr3 = smem_b + b_off * sizeof(float);
+        acc3 += a_val * __builtin_bit_cast(float, load32_shared(b_addr3));
+      }
+
+      // Accumulate into existing values in smem_c
+      uint32_t c_r_off = r * (TN + 16);
+      
+      uint32_t c_addr0 = smem_c + (c_r_off + c_base + 0) * sizeof(float);
+      float prev0 = __builtin_bit_cast(float, load32_shared(c_addr0));
+      store_shared(c_addr0, 0, __builtin_bit_cast(uint32_t, prev0 + acc0));
+      
+      uint32_t c_addr1 = smem_c + (c_r_off + c_base + 1) * sizeof(float);
+      float prev1 = __builtin_bit_cast(float, load32_shared(c_addr1));
+      store_shared(c_addr1, 0, __builtin_bit_cast(uint32_t, prev1 + acc1));
+      
+      uint32_t c_addr2 = smem_c + (c_r_off + c_base + 2) * sizeof(float);
+      float prev2 = __builtin_bit_cast(float, load32_shared(c_addr2));
+      store_shared(c_addr2, 0, __builtin_bit_cast(uint32_t, prev2 + acc2));
+      
+      uint32_t c_addr3 = smem_c + (c_r_off + c_base + 3) * sizeof(float);
+      float prev3 = __builtin_bit_cast(float, load32_shared(c_addr3));
+      store_shared(c_addr3, 0, __builtin_bit_cast(uint32_t, prev3 + acc3));
+    }
+
+    mu_barrier(0, num_warps);
+  }
+
+  // Write back final C tile to global memory
+  for (uint32_t i = tid_in_threadblock; i < TM * TN; i += threads_per_threadblock) {
+    uint32_t r = i / TN;
+    uint32_t c = i % TN;
+    if (r < M && c < N) {
+      uint32_t c_smem_addr = smem_c + (r * (TN + 16) + c) * sizeof(float);
+      float result = __builtin_bit_cast(float, load32_shared(c_smem_addr));
+      uint32_t global_idx = r * N + c;
+      C_ptr[global_idx] = result;
+    }
+  }
+}

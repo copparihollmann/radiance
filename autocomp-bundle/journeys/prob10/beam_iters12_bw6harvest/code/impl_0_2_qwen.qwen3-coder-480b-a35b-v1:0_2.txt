@@ -1,0 +1,112 @@
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  (void)threads_per_threadblock;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  // Shared memory offsets (aligned to avoid bank conflicts)
+  const uint32_t smem_a_base = 0;                             // 8x64 tile of A (padded): 8*64 = 512 floats -> 2048 bytes
+  const uint32_t smem_b_base = 2048;                          // 64x16 tile of B: 64*16 = 1024 floats -> 4096 bytes
+  const uint32_t smem_tile_size = 6144;                       // Total per tile: 2048 (A) + 4096 (B)
+
+  const uint32_t smem_a_stride = 64 * sizeof(float);          // Row stride including padding to avoid bank conflict
+  const uint32_t smem_b_stride = 16 * sizeof(float);          // Row stride of B
+
+  const uint32_t thread_row = tid_in_threadblock >> 4;        // tid_in_threadblock / 16 (row in threadblock grid: 0-7)
+  const uint32_t thread_col = tid_in_threadblock & 15;        // tid_in_threadblock % 16 (col in threadblock grid: 0-15)
+
+  const uint32_t a_rows = args->M;
+  const uint32_t b_cols = args->N;
+  const uint32_t k_total = args->K;
+
+  const uint32_t num_c_tiles_m = (a_rows + 7) >> 3;           // ceil(M/8)
+  const uint32_t num_c_tiles_n = (b_cols + 15) >> 4;          // ceil(N/16)
+
+  const uint32_t k_tilesize = 64;
+
+  // Iterate over all 8x16 output tiles in the grid
+  for (uint32_t tile_n = 0; tile_n < num_c_tiles_n; tile_n++) {
+    for (uint32_t tile_m = 0; tile_m < num_c_tiles_m; tile_m++) {
+
+      const uint32_t start_m = tile_m * 8;
+      const uint32_t start_n = tile_n * 16;
+
+      // Check bounds for partial tiles
+      const uint32_t max_m = (start_m + 8 > a_rows) ? a_rows : start_m + 8;
+      const uint32_t max_n = (start_n + 16 > b_cols) ? b_cols : start_n + 16;
+      const uint32_t actual_M = max_m - start_m;
+      const uint32_t actual_N = max_n - start_n;
+
+      // If partial tile, skip iteration (or handle appropriately). Here we only process full-size tiles.
+      if (actual_M != 8 || actual_N != 16) continue;
+
+      float acc = 0.0f;
+
+      const uint32_t smem_base_offset = ((tile_m * num_c_tiles_n + tile_n) % 2) * smem_tile_size;
+
+      const uint32_t local_smem_a = smem_base_offset + smem_a_base;
+      const uint32_t local_smem_b = smem_base_offset + smem_b_base;
+
+      // Outer product loop over K dimension
+      for (uint32_t k = 0; k < k_total; k += k_tilesize) {
+        const uint32_t this_k_size = (k + k_tilesize > k_total) ? (k_total - k) : k_tilesize;
+
+        // ---------------------
+        // Stage A (8 rows x 64 cols)
+        // ---------------------
+        uint32_t a_idx = (start_m + thread_row) * k_total + k + thread_col;
+        for (int rep = 0; rep < 4 && (start_m + thread_row) < a_rows; ++rep, a_idx += 16) {
+          if (thread_col < this_k_size && a_idx < a_rows * k_total) {
+            float val = args->A[a_idx];
+            store_shared(local_smem_a + (thread_row * smem_a_stride + (thread_col + rep * 16) * sizeof(float)), 0, __builtin_bit_cast(uint32_t, val));
+          } else {
+            store_shared(local_smem_a + (thread_row * smem_a_stride + (thread_col + rep * 16) * sizeof(float)), 0, 0u);
+          }
+        }
+
+        // ---------------------
+        // Stage B (64 rows x 16 cols)
+        // ---------------------
+        uint32_t b_idx = (k + thread_row) * b_cols + start_n + thread_col;
+        for (int rep = 0; rep < 4 && (k + thread_row) < k_total; ++rep, b_idx += 16 * b_cols) {
+          if (thread_col < actual_N && (k + thread_row) < k_total) {
+            float val = args->B[b_idx];
+            store_shared(local_smem_b + (thread_row * 4 + rep) * smem_b_stride + thread_col * sizeof(float), 0, __builtin_bit_cast(uint32_t, val));
+          } else {
+            store_shared(local_smem_b + (thread_row * 4 + rep) * smem_b_stride + thread_col * sizeof(float), 0, 0u);
+          }
+        }
+
+        // Synchronize across both cores to make staged data globally visible
+        mu_barrier(0, 8);
+
+        // Inner gemm computation: dot product along shared K dimension
+        uint32_t ptr_a = local_smem_a + thread_row * smem_a_stride;
+        uint32_t ptr_b = local_smem_b + thread_col * sizeof(float);
+        uint32_t k_end = ptr_a + this_k_size * sizeof(float);
+
+        while (ptr_a < k_end) {
+          float val_a0 = __builtin_bit_cast(float, load32_shared(ptr_a));
+          float val_b0 = __builtin_bit_cast(float, load32_shared(ptr_b));
+
+          acc += val_a0 * val_b0;
+
+          ptr_a += sizeof(float);
+          ptr_b += smem_b_stride;
+        }
+
+        mu_barrier(0, 8);
+      }
+
+      // Write back final accumulated result
+      uint32_t c_idx = (start_m + thread_row) * b_cols + start_n + thread_col;
+      if ((start_m + thread_row) < a_rows && (start_n + thread_col) < b_cols) {
+        args->C[c_idx] = acc;
+      }
+    }
+  }
+}

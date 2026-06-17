@@ -1,0 +1,48 @@
+An elegant and highly effective optimization plan to significantly reduce the execution latency of the attention kernel by applying **Strategy 11: Eliminating Global Scratch via Shared Memory Staging of the Attention Matrix**.
+
+### Optimization Plan
+
+#### 1. Identify the Bottleneck
+In the current implementation, the intermediate attention matrix $S$ (of size $\text{SEQ} \times \text{SEQ} = 128 \times 128$) is written to and read from the global `scratch` buffer in DRAM/L2 cache across three distinct phases. 
+* **Phase 1** writes $128 \times 128$ floats to global memory.
+* **Phase 2** reads and writes $128 \times 128$ floats to perform in-place softmax.
+* **Phase 3** reads $128 \times 128$ floats to compute the weighted sum with $V$.
+
+These high-latency memory roundtrips (~400 cycles for global loads) represent the primary bottleneck of the kernel.
+
+#### 2. Apply Strategy 11: Staging the Attention Matrix in Shared Memory (SMEM)
+Since $\text{SEQ} = 128$, the total size of the attention matrix is:
+$$\text{Size} = 128 \times 128 \times 4 \text{ bytes} = 64 \text{ KiB}$$
+This fits perfectly within the hardware's 128 KiB Shared Memory (SMEM) limit (address range `0x0` to `0x20000`). Staging the entire attention matrix in SMEM eliminates all global memory round-trips for the intermediate attention scores, utilizing the ultra-high bandwidth (256 B/cycle) and low latency (~2 cycles) of SMEM.
+
+#### 3. Detailed Implementation Steps
+
+1. **Declare the Shared Memory Pointer**:
+   Define a `__local float*` pointer starting at SMEM base address `0x0`:
+   ```cpp
+   __local float* smem_scratch = (__local float*)0x0;
+   ```
+
+2. **Update Phase 1 (Q $\cdot$ K$^T$)**:
+   Change the destination of the scaled dot products from `a->scratch` to `smem_scratch`:
+   ```cpp
+   smem_scratch[i * seq + j] = acc * 0.125f;
+   ```
+
+3. **Update Phase 2 (Row Softmax)**:
+   Change all reads and writes of the attention row to target `smem_scratch` instead of `a->scratch`:
+   ```cpp
+   __local float* sp = smem_scratch + i * seq;
+   ```
+
+4. **Update Phase 3 (P $\cdot$ V)**:
+   Update the pointer to the softmax probabilities to read from `smem_scratch`:
+   ```cpp
+   const __local float* sp = smem_scratch + i * seq;
+   ```
+
+5. **Safe Synchronization (Cross-Core Barriers)**:
+   Change the barriers between phases to use barrier ID `0` (`mu_barrier(0, nw)`) to guarantee robust cross-core memory visibility and safety across both cores of the threadblock.
+
+6. **Respect the Register Wall**:
+   Keep loops fully rolled (no `#pragma unroll`) and avoid register tiling. This keeps the register usage per thread well below the strict limit of 31 distinct registers, preventing hardware-level register oversubscription.

@@ -1,0 +1,22 @@
+An elegant and highly optimized plan to address the performance bottlenecks of the FP32 matrix multiplication kernel.
+
+### Bottleneck Analysis
+In the original kernel, each of the 128 threads sequentially computes its assigned outputs by streaming along the entire $K$ dimension of $768$ elements. This introduces two critical inefficiencies:
+1. **Severe Memory Bandwidth Waste:** The global loads of $B$ are strided (`b_ptr += N`), which destroys cache line utilization. Each 64-byte L0d cache line fetch only uses 4 bytes of data, causing extreme cache thrashing and memory latency stalls.
+2. **Lack of Operand Reuse:** $A$ and $B$ are loaded from slow global memory (~400 cycles) repeatedly for every output, rather than being shared across threads.
+
+### Optimization Strategy
+We will apply **Strategy 6 (stage global loads into `__shared` memory before compute to enable warp reuse)** combined with **Strategy 10 (separate load and compute phases)**. 
+
+To bypass the **31-register hard limit** and the **Register Wall**, we cannot use extensive register tiling or multiple accumulators per thread. Instead, we will stage the accumulators of the current $64 \times 64$ output tile in **Shared Memory (SMEM)**. This allows each thread to compute its outputs one-by-one with a single register accumulator, avoiding register spill completely while achieving a **$64\times$ reduction** in global memory traffic!
+
+### Detailed Plan
+
+1. **Output Tiling:** Divide the output matrix $C$ into $64 \times 64$ blocks. We will loop over these blocks using `m_base` and `n_base`.
+2. **Initialize SMEM Accumulators:** Allocate a $64 \times 64$ float buffer in SMEM (`smem_C`, 16 KiB) starting at address `0x0`. At the start of each tile, the 128 threads cooperatively zero out the 4,096 elements of `smem_C` (32 elements per thread).
+3. **K-Streaming with SMEM Staging:** Stream the $K$ dimension in chunks of $BK = 32$:
+   * **Cooperative Global-to-SMEM Loads:** Load a $64 \times 32$ tile of $A$ into `smem_A` (8 KiB) and a $32 \times 64$ tile of $B$ into `smem_B` (8 KiB). This is done cooperatively by all 128 threads (each thread loads 16 elements of $A$ and 16 elements of $B$). The loading index math is structured to guarantee **perfectly coalesced, stride-1 global loads** for both $A$ and $B$.
+   * **Cross-Core Sync:** Synchronize using `mu_barrier(0, 8)` to ensure the loads are completed across both cores before any compute reads them.
+   * **Compute Phase:** Each thread computes its 32 assigned outputs. For each output, the thread performs 32 multiply-accumulate (MAC) operations from `smem_A` and `smem_B` into a single local register `acc`, and then adds `acc` back to the corresponding element in `smem_C`.
+   * **Double Buffer Sync:** Synchronize again with `mu_barrier(0, 8)` before starting the next $K$ tile to ensure no thread overwrites the SMEM operands while others are still reading.
+4. **Global Writeback:** After finishing the $K$ loop, each thread reads its 32 accumulated values from `smem_C` and writes them back to the global memory $C$ matrix in a fully coalesced pattern.

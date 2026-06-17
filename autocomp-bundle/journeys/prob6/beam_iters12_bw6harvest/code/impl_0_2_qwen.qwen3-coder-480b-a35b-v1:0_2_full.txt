@@ -1,0 +1,133 @@
+Looking at the requirements and constraints, I need to create a highly optimized matmul kernel that stays under the 31 distinct register limit while maximizing performance. Let me analyze the key constraints:
+
+1. **Register wall**: ≤ 31 distinct registers (RTL hard limit)
+2. **Cross-core synchronization**: Must use `mu_barrier(0, 8)` for cooperative SMEM access
+3. **Bank conflict avoidance**: Proper padding for SMEM accesses
+4. **Coalesced memory access**: Sequential per-lane accesses
+
+Here's my optimized implementation:
+
+```cpp
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t M = args->M, N = args->N, K = args->K;
+  const uint32_t num_warps = threads_per_threadblock / MU_NUM_THREADS;
+
+  // Shared memory layout with padding to avoid bank conflicts
+  // A: 64 rows * 33 cols (padded from 32) = 2112 floats
+  // B: 32 rows * 17 cols (padded from 16) = 544 floats
+  const uint32_t smem_a = 0;
+  const uint32_t smem_b = 2112 * 4;  // 2112 * 4 bytes offset
+
+  // Thread mapping: 128 threads -> 32 rows * 4 cols processing
+  const uint32_t thread_row = tid_in_threadblock / 4;  // 0..31
+  const uint32_t thread_col = tid_in_threadblock % 4;  // 0..3
+
+  // Output tile: each thread computes 1x4 elements
+  float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+
+  // Tile over output matrix in 64x16 blocks
+  for (uint32_t tile_m = 0; tile_m < M; tile_m += 64) {
+    for (uint32_t tile_n = 0; tile_n < N; tile_n += 16) {
+      
+      // Process K in blocks of 32
+      for (uint32_t k_block = 0; k_block < K; k_block += 32) {
+        
+        // Stage A tile (64x32) into shared memory
+        // Each thread loads 16 elements (8 steps * 2 elements per step)
+        for (uint32_t step = 0; step < 8; step++) {
+          uint32_t global_idx = (step * 128 + tid_in_threadblock) * 2;
+          uint32_t a_row = global_idx / 32;
+          uint32_t a_col = global_idx % 32;
+          
+          if (a_row < 64 && a_col < 32) {
+            uint32_t global_row = tile_m + a_row;
+            uint32_t global_col = k_block + a_col;
+            if (global_row < M && global_col < K) {
+              float val0 = args->A[global_row * K + global_col];
+              store_shared(smem_a + (a_row * 33 + a_col) * 4, 0, __builtin_bit_cast(uint32_t, val0));
+            }
+          }
+          
+          global_idx += 128;
+          a_row = global_idx / 32;
+          a_col = global_idx % 32;
+          
+          if (a_row < 64 && a_col < 32) {
+            uint32_t global_row = tile_m + a_row;
+            uint32_t global_col = k_block + a_col;
+            if (global_row < M && global_col < K) {
+              float val1 = args->A[global_row * K + global_col];
+              store_shared(smem_a + (a_row * 33 + a_col) * 4, 0, __builtin_bit_cast(uint32_t, val1));
+            }
+          }
+        }
+
+        // Stage B tile (32x16) into shared memory
+        // Each thread loads 4 elements
+        for (uint32_t step = 0; step < 4; step++) {
+          uint32_t global_idx = step * 128 + tid_in_threadblock;
+          uint32_t b_row = global_idx / 16;
+          uint32_t b_col = global_idx % 16;
+          
+          if (b_row < 32 && b_col < 16) {
+            uint32_t global_row = k_block + b_row;
+            uint32_t global_col = tile_n + b_col;
+            if (global_row < K && global_col < N) {
+              float val = args->B[global_row * N + global_col];
+              store_shared(smem_b + (b_row * 17 + b_col) * 4, 0, __builtin_bit_cast(uint32_t, val));
+            }
+          }
+        }
+
+        // Cross-core synchronization barrier
+        mu_barrier(0, num_warps);
+
+        // Compute 32x16 tile using staged data
+        const uint32_t local_row = thread_row % 32;  // 0..31 within tile
+        const uint32_t a_base_addr = smem_a + local_row * 33 * 4;
+        const uint32_t b_base_addr = smem_b + thread_col * 4 * 4;
+
+        // Inner product computation over 32 K-elements
+        for (uint32_t k = 0; k < 32; k++) {
+          float a_val = __builtin_bit_cast(float, load32_shared(a_base_addr + k * 4));
+          uint32_t b_row_addr = b_base_addr + k * 17 * 4;
+          
+          float b0 = __builtin_bit_cast(float, load32_shared(b_row_addr + 0 * 4));
+          float b1 = __builtin_bit_cast(float, load32_shared(b_row_addr + 1 * 4));
+          float b2 = __builtin_bit_cast(float, load32_shared(b_row_addr + 2 * 4));
+          float b3 = __builtin_bit_cast(float, load32_shared(b_row_addr + 3 * 4));
+
+          acc0 += a_val * b0;
+          acc1 += a_val * b1;
+          acc2 += a_val * b2;
+          acc3 += a_val * b3;
+        }
+
+        // Synchronize before next K-block
+        mu_barrier(0, num_warps);
+      }
+
+      // Write back results
+      uint32_t out_row = tile_m + thread_row;
+      uint32_t out_col_base = tile_n + thread_col * 4;
+      
+      if (out_row < M) {
+        if (out_col_base + 0 < N) args->C[out_row * N + out_col_base + 0] = acc0;
+        if (out_col_base + 1 < N) args->C[out_row * N + out_col_base + 1] = acc1;
+        if (out_col_base + 2 < N) args->C[out_row * N + out_col_base + 2] = acc2;
+        if (out_col_base + 3 < N) args->C[out_row * N + out_col_base + 3] = acc3;
+      }
+
+      // Reset accumulators for next tile
+      acc0 = 0.0f; acc1 = 0.0f; acc2 = 0.0f; acc3 = 0.0f;
+    }
+  }
+}
+```

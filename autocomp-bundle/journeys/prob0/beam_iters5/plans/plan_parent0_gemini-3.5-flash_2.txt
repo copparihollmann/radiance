@@ -1,0 +1,108 @@
+An elegant and highly optimized plan to address the inefficiencies of the baseline matrix multiplication kernel.
+
+### Optimization Plan: Cache Reused Data in Shared Memory (Strategy 1)
+
+The baseline implementation suffers from severe memory bandwidth bottlenecks because every thread repeatedly reloads elements of matrices $A$ and $B$ from global memory inside the innermost loop. 
+
+To overcome this, we will implement **loop tiling with Shared Memory (SMEM) caching**. We will stage tiles of $A$ and $B$ in the high-bandwidth 128 KiB SMEM and reuse them across thread execution.
+
+#### 1. Tile Size Design
+Since the problem dimensions are $M=64, N=64, K=64$ and the threadblock has exactly 128 threads:
+* We choose **$BM = 8$**, **$BN = 16$**, and **$BK = 16$**.
+* A single tile of $C$ has size $BM \times BN = 8 \times 16 = 128$ elements.
+* With 128 threads, **each thread computes exactly one output element of $C$ per tile**. This is a critical design choice because it requires only **one register accumulator** per thread, guaranteeing we do not exceed the strict register wall limit ($\le 31$ registers).
+
+#### 2. Thread-to-Tile Mapping and Coalesced Access
+We map each thread `tid` (0 to 127) to a coordinate `(i, j)` in the $8 \times 16$ tile:
+* `i = tid >> 4` (row index, 0..7)
+* `j = tid & 15` (column index, 0..15)
+
+During the global memory load:
+* **Matrix A ($8 \times 16$):** Each thread loads 1 element. The column index is `j = tid & 15`. Since consecutive threads access consecutive columns, this load is fully coalesced.
+* **Matrix B ($16 \times 16$):** Each thread loads 2 elements.
+  * Load 1 at offset `tid`
+  * Load 2 at offset `tid + 128`
+  * In both loads, consecutive threads access consecutive columns, achieving 100% coalesced stride-1 memory access.
+
+#### 3. Eliminating Multiplications with Bitwise Shifts (Strategy 9)
+Since $M, N, K = 64$ (powers of 2), all division, modulo, and multiplication operations for index calculation will be replaced with single-cycle bitwise shifts and bitwise ANDs (e.g., `row * 64` becomes `row << 6`).
+
+#### 4. Correct Synchronization and Bank-Conflict-Free Reads
+* **Cross-Core Barrier:** Because the 128 threads span 2 cores, threads on Core 1 will read SMEM data loaded by threads on Core 0. We must use the cross-core barrier **`mu_barrier(0, 8)`** (barrier ID 0, 8 total warps) to ensure cross-core visibility.
+* **Bank-Conflict-Free SMEM Reads:** 
+  * Loading $A$ uses `As[(i << 4) + k]`. All threads in a warp share the same row `i`, resulting in a broadcast read.
+  * Loading $B$ uses `Bs[(k << 4) + j]`. Each lane `j` (0..15) maps to bank `j`, resulting in conflict-free parallel reads.
+
+---
+
+### Optimized Code
+
+```cpp
+#include <vx_intrinsics.h>
+#include <mu_intrinsics.h>
+#include <mu_schedule.h>
+#include <shared_mem.h>
+#include <stdint.h>
+
+struct KernelArgs {
+  __global float* A;
+  __global float* B;
+  __global float* C;
+  uint32_t M;
+  uint32_t K;
+  uint32_t N;
+};
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  (void)threads_per_threadblock;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  // Allocate 128 floats for A tile and 256 floats for B tile in SMEM
+  __shared float* const sdata = reinterpret_cast<__shared float*>(0x0);
+  __shared float* As = sdata;
+  __shared float* Bs = sdata + 128;
+
+  const uint32_t tid = tid_in_threadblock;
+  const uint32_t i = tid >> 4;
+  const uint32_t j = tid & 15;
+
+  // Tile dimensions: BM=8, BN=16, BK=16
+  // Grid size: 8 tiles in M, 4 tiles in N
+  for (uint32_t block_r = 0; block_r < 8; block_r++) {
+    for (uint32_t block_c = 0; block_c < 4; block_c++) {
+      float acc = 0.0f;
+
+      for (uint32_t ks = 0; ks < 4; ks++) {
+        // Coalesced load of A tile to SMEM (8x16)
+        As[tid] = args->A[(((block_r << 3) + i) << 6) + (ks << 4) + j];
+
+        // Coalesced load of B tile to SMEM (16x16)
+        Bs[tid]       = args->B[((((ks << 4) + i) << 6) + (block_c << 4) + j)];
+        Bs[tid + 128] = args->B[((((ks << 4) + i + 8) << 6) + (block_c << 4) + j)];
+
+        // Ensure SMEM writes are complete and visible across both cores
+        mu_fence_smem();
+        mu_barrier(0, 8);
+
+        // Compute thread-tile GEMM over BK slice (BK=16)
+        #pragma unroll
+        for (uint32_t k = 0; k < 16; k++) {
+          acc += As[(i << 4) + k] * Bs[(k << 4) + j];
+        }
+
+        // Synchronize before writing the next tile to SMEM
+        mu_barrier(0, 8);
+      }
+
+      // Coalesced write-back to global memory C
+      args->C[(((block_r << 3) + i) << 6) + (block_c << 4) + j] = acc;
+    }
+  }
+}
+```

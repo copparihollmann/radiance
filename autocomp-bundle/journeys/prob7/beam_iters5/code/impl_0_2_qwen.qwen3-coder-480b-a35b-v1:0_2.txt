@@ -1,0 +1,78 @@
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t seq = a->seq;
+  const uint32_t d = a->d;
+
+  // Base addresses for SMEM partitions
+  const uint32_t smem_Q_base = 0;
+  const uint32_t smem_S_base = 32768; // 32 KiB offset
+
+  const uint32_t my_row = tid_in_threadblock;
+
+  if (my_row >= seq) return;
+
+  // Phase 1: Load Q[my_row][:] into smem_Q[my_row][:]
+  const __global float* Qi = a->Q + my_row * d;
+  uint32_t smem_q_addr = smem_Q_base + my_row * d * sizeof(float);
+  for (uint32_t k = 0; k < d; k++) {
+    store_shared(smem_q_addr, 0, __builtin_bit_cast(uint32_t, Qi[k]));
+    smem_q_addr += sizeof(float);
+  }
+
+  // Phase 2: Compute S[my_row][j] = scale * Q[my_row]·K[j], store in smem_S[my_row][j]
+  uint32_t smem_s_addr = smem_S_base + my_row * seq * sizeof(float);
+  for (uint32_t j = 0; j < seq; j++) {
+    const __global float* Kj = a->K + j * d;
+    float acc = 0.0f;
+    uint32_t q_off = smem_Q_base + my_row * d * sizeof(float);
+    for (uint32_t k = 0; k < d; k++) {
+      float q_val = __builtin_bit_cast(float, load32_shared(q_off));
+      acc += q_val * Kj[k];
+      q_off += sizeof(float);
+    }
+    float score = acc * 0.125f;
+    store_shared(smem_s_addr, 0, __builtin_bit_cast(uint32_t, score));
+    smem_s_addr += sizeof(float);
+  }
+
+  // Phase 3: Softmax in-place on smem_S[my_row][:]
+  smem_s_addr = smem_S_base + my_row * seq * sizeof(float);
+  float m = __builtin_bit_cast(float, load32_shared(smem_s_addr));
+  for (uint32_t j = 1; j < seq; j++) {
+    float val = __builtin_bit_cast(float, load32_shared(smem_s_addr + j * sizeof(float)));
+    if (val > m) m = val;
+  }
+
+  float sum = 0.0f;
+  for (uint32_t j = 0; j < seq; j++) {
+    float val = __builtin_bit_cast(float, load32_shared(smem_s_addr + j * sizeof(float)));
+    float e = mu_exp(val - m);
+    store_shared(smem_s_addr + j * sizeof(float), 0, __builtin_bit_cast(uint32_t, e));
+    sum += e;
+  }
+
+  float inv_sum = 1.0f / sum;
+  for (uint32_t j = 0; j < seq; j++) {
+    float e = __builtin_bit_cast(float, load32_shared(smem_s_addr + j * sizeof(float)));
+    float p = e * inv_sum;
+    store_shared(smem_s_addr + j * sizeof(float), 0, __builtin_bit_cast(uint32_t, p));
+  }
+
+  // Phase 4: Compute O[my_row][k] = sum_j P[my_row][j] * V[j][k]
+  for (uint32_t k = 0; k < d; k++) {
+    float acc = 0.0f;
+    smem_s_addr = smem_S_base + my_row * seq * sizeof(float);
+    for (uint32_t j = 0; j < seq; j++) {
+      float p = __builtin_bit_cast(float, load32_shared(smem_s_addr));
+      acc += p * a->V[j * d + k];
+      smem_s_addr += sizeof(float);
+    }
+    a->O[my_row * d + k] = acc;
+  }
+}

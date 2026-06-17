@@ -1,0 +1,146 @@
+static inline void kernel_body(
+    void* raw_arg,
+    uint32_t tid_in_threadblock,
+    uint32_t threads_per_threadblock,
+    uint32_t threadblock_id
+) {
+    (void)threadblock_id;
+    auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+    const uint32_t M = args->M;
+    const uint32_t N = args->N;
+    const uint32_t K = args->K;
+
+    // Tile sizes
+    const uint32_t TM = 64;  // Tile size for M
+    const uint32_t TN = 64;  // Tile size for N
+    const uint32_t TK = 32;  // Tile size for K
+
+    // Shared memory layout (all start at 0x0)
+    // These are byte addresses; sizeof(float) = 4
+    const uint32_t smem_C_offset = 0;
+    const uint32_t smem_A_offset = smem_C_offset + TM * TN * 4; // 16KB
+    const uint32_t smem_B_offset = smem_A_offset + TM * TK * 4; // 8KB
+    // Total used: 16KB + 8KB + 8KB = 32KB < 128KB
+
+    // Cast to float pointers for convenience
+    float* const smem_C = (float*)(smem_C_offset);
+    float* const smem_A = (float*)(smem_A_offset);
+    float* const smem_B = (float*)(smem_B_offset);
+
+    const uint32_t warp_id = tid_in_threadblock / 16;
+    const uint32_t lane_id = tid_in_threadblock % 16;
+
+    // Number of warps across both cores for synchronization
+    const uint32_t total_warps = threads_per_threadblock / 16;
+
+    // Loop over output tiles
+    for (uint32_t m_base = 0; m_base < M; m_base += TM) {
+        for (uint32_t n_base = 0; n_base < N; n_base += TN) {
+            // Zero out smem_C cooperatively
+            // Each thread writes 32 elements (4096 elements / 128 threads)
+            for (uint32_t i = 0; i < 32; i++) {
+                const uint32_t idx = tid_in_threadblock + i * threads_per_threadblock;
+                if (idx < TM * TN) {
+                    store_shared((uint32_t)smem_C, idx * 4, 0);
+                }
+            }
+
+            // K-loop
+            for (uint32_t k_base = 0; k_base < K; k_base += TK) {
+                // --- Cooperative Load Phase ---
+
+                // Load A[m_base:m_base+TM, k_base:k_base+TK] into smem_A
+                // Each thread loads 16 elements
+                // Stride is 1 for coalesced access
+                const uint32_t a_load_elements_per_thread = 16;
+                for (uint32_t i = 0; i < a_load_elements_per_thread; i++) {
+                    const uint32_t linear_idx = tid_in_threadblock + i * threads_per_threadblock;
+                    // Unroll 2D indexing manually
+                    if (linear_idx < TM * TK) {
+                        const uint32_t tm = linear_idx / TK;
+                        const uint32_t tk = linear_idx % TK;
+                        const uint32_t global_row = m_base + tm;
+                        const uint32_t global_col = k_base + tk;
+                        uint32_t data = 0;
+                        if (global_row < M && global_col < K) {
+                            const __global float* src_ptr = args->A + global_row * K + global_col;
+                            asm volatile("lw.global %0, 0(%1)" : "=r"(data) : "r"(src_ptr) : "memory");
+                        }
+                        store_shared((uint32_t)smem_A, (tm * TK + tk) * 4, data);
+                    }
+                }
+
+                // Load B[k_base:k_base+TK, n_base:n_base+TN] into smem_B
+                // Each thread loads 16 elements
+                const uint32_t b_load_elements_per_thread = 16;
+                for (uint32_t i = 0; i < b_load_elements_per_thread; i++) {
+                    const uint32_t linear_idx = tid_in_threadblock + i * threads_per_threadblock;
+                    if (linear_idx < TK * TN) {
+                        const uint32_t tk = linear_idx / TN;
+                        const uint32_t tn = linear_idx % TN;
+                        const uint32_t global_row = k_base + tk;
+                        const uint32_t global_col = n_base + tn;
+                        uint32_t data = 0;
+                        if (global_row < K && global_col < N) {
+                            const __global float* src_ptr = args->B + global_row * N + global_col;
+                            asm volatile("lw.global %0, 0(%1)" : "=r"(data) : "r"(src_ptr) : "memory");
+                        }
+                        store_shared((uint32_t)smem_B, (tk * TN + tn) * 4, data);
+                    }
+                }
+
+                // Cross-core sync after loads
+                mu_barrier(0, total_warps);
+
+                // --- Compute Phase ---
+
+                // Each thread computes 32 outputs
+                // Mapping: thread 0 -> (0,0)..(0,31), thread 1 -> (1,0)..(1,31), etc.
+                // where (tm,tn) are indices within the 64x64 tile
+                for (uint32_t i = 0; i < 32; i++) {
+                    const uint32_t idx = warp_id * 32 + lane_id + i * 128; // 128 threads per iteration
+                    if (idx < TM * TN) {
+                        const uint32_t tm = idx / TN;
+                        const uint32_t tn = idx % TN;
+
+                        float acc = 0.0f;
+                        for (uint32_t tk = 0; tk < TK; tk++) {
+                            float a_val = load32_shared((uint32_t)(smem_A + tm * TK + tk));
+                            float b_val = load32_shared((uint32_t)(smem_B + tk * TN + tn));
+                            acc += a_val * b_val;
+                        }
+
+                        // Atomically add to smem_C (or just plain store if no race)
+                        // Here, each (tm,tn) is uniquely owned by one thread in this loop
+                        // so plain store is safe.
+                        float old_c = load32_shared((uint32_t)(smem_C + idx));
+                        store_shared((uint32_t)smem_C, idx * 4, old_c + acc);
+                    }
+                }
+
+                // Sync before next K chunk
+                mu_barrier(0, total_warps);
+            } // End K loop
+
+            // --- Write-back Phase ---
+            
+            // Each thread writes back 32 elements of C
+            for (uint32_t i = 0; i < 32; i++) {
+                const uint32_t idx = tid_in_threadblock + i * threads_per_threadblock;
+                if (idx < TM * TN) {
+                    const uint32_t tm = idx / TN;
+                    const uint32_t tn = idx % TN;
+                    const uint32_t global_m = m_base + tm;
+                    const uint32_t global_n = n_base + tn;
+
+                    if (global_m < M && global_n < N) {
+                         float final_val = load32_shared((uint32_t)(smem_C + idx));
+                         args->C[global_m * N + global_n] = final_val;
+                    }
+                }
+            }
+
+        } // End N loop
+    } // End M loop
+}

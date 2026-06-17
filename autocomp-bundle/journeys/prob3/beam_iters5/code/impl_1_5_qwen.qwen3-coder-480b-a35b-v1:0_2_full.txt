@@ -1,0 +1,154 @@
+```cpp
+#include <stdint.h>
+
+// Helper functions for loading/storing floats from/to SMEM using unions to avoid type-punning issues
+static inline float load_float_shared(uint32_t byte_addr) {
+    union { uint32_t i; float f; } u;
+    u.i = load32_shared(byte_addr);
+    return u.f;
+}
+
+static inline void store_float_shared(uint32_t byte_addr, float val) {
+    union { float f; uint32_t i; } u;
+    u.f = val;
+    store_shared(byte_addr, 0, u.i);
+}
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t num_warps = threads_per_threadblock / MU_NUM_THREADS;
+  const float scale = 0.125f;
+
+  // SMEM Offsets (Total size: 110,592 bytes < 128 KiB limit)
+  const uint32_t Q_offset = 0;
+  const uint32_t K_offset = 24576;
+  const uint32_t V_offset = 49152;
+  const uint32_t S_offset = 73728;
+
+  // 1. Stage Q from global memory to SMEM
+  for (uint32_t idx = tid_in_threadblock; idx < 6144; idx += 128) {
+    const __global float* Q_ptr = a->Q + idx;
+    float val = *Q_ptr;
+    store_float_shared(Q_offset + idx * 4, val);
+  }
+
+  // 2. Stage K from global memory to SMEM
+  for (uint32_t idx = tid_in_threadblock; idx < 6144; idx += 128) {
+    const __global float* K_ptr = a->K + idx;
+    float val = *K_ptr;
+    store_float_shared(K_offset + idx * 4, val);
+  }
+
+  // 3. Stage V from global memory and transpose it into SMEM (column-major)
+  // Original V is 96x64; transposed V is stored as 64x96 in SMEM
+  for (uint32_t idx = tid_in_threadblock; idx < 6144; idx += 128) {
+    const uint32_t j = idx / 64; // row in original V
+    const uint32_t k = idx % 64; // col in original V
+    const __global float* V_ptr = a->V + idx;
+    float val = *V_ptr;
+    store_float_shared(V_offset + (k * 96 + j) * 4, val);
+  }
+
+  // Synchronize to ensure Q, K, and V are fully staged across both cores
+  mu_barrier(0, num_warps);
+
+  // 4. Compute attention scores S = Q K^T * scale
+  for (uint32_t idx = tid_in_threadblock; idx < 9216; idx += 128) {
+    const uint32_t i = idx / 96;
+    const uint32_t j = idx % 96;
+    
+    uint32_t q_addr = Q_offset + i * 256; // i * 64 * 4
+    uint32_t k_addr = K_offset + j * 256; // j * 64 * 4
+    float acc = 0.0f;
+    
+    // Shallow unroll by 2 to hide FP32 latency while minimizing register usage
+    for (uint32_t k = 0; k < 32; k++) {
+      float q_val0 = load_float_shared(q_addr);
+      float k_val0 = load_float_shared(k_addr);
+      float q_val1 = load_float_shared(q_addr + 4);
+      float k_val1 = load_float_shared(k_addr + 4);
+      acc += q_val0 * k_val0;
+      acc += q_val1 * k_val1;
+      q_addr += 8;
+      k_addr += 8;
+    }
+    store_float_shared(S_offset + idx * 4, acc * scale);
+  }
+
+  // Synchronize to make scores visible for softmax
+  mu_barrier(0, num_warps);
+
+  // 5. Softmax per row in SMEM
+  for (uint32_t row = tid_in_threadblock; row < 96; row += 128) {
+    const uint32_t s_row_addr = S_offset + row * 384; // 96 * 4 = 384
+    float m = -1e30f; // Initialize to a very small number
+    
+    // Find Max (shallow unroll by 2)
+    uint32_t addr = s_row_addr;
+    for (uint32_t j = 0; j < 48; j++) {
+      float v0 = load_float_shared(addr);
+      float v1 = load_float_shared(addr + 4);
+      if (v0 > m) m = v0;
+      if (v1 > m) m = v1;
+      addr += 8;
+    }
+    
+    // Compute Exp and Sum (shallow unroll by 2)
+    float sum = 0.0f;
+    addr = s_row_addr;
+    for (uint32_t j = 0; j < 48; j++) {
+      float v0 = load_float_shared(addr);
+      float v1 = load_float_shared(addr + 4);
+      float e0 = mu_exp(v0 - m);
+      float e1 = mu_exp(v1 - m);
+      store_float_shared(addr, e0);
+      store_float_shared(addr + 4, e1);
+      sum += e0 + e1;
+      addr += 8;
+    }
+    
+    // Scale by 1/sum (shallow unroll by 2)
+    const float inv = 1.0f / sum;
+    addr = s_row_addr;
+    for (uint32_t j = 0; j < 48; j++) {
+      float e0 = load_float_shared(addr);
+      float e1 = load_float_shared(addr + 4);
+      store_float_shared(addr, e0 * inv);
+      store_float_shared(addr + 4, e1 * inv);
+      addr += 8;
+    }
+  }
+
+  // Synchronize to ensure softmax scaling is complete and visible
+  mu_barrier(0, num_warps);
+
+  // 6. Compute Output O = S V_transposed
+  for (uint32_t idx = tid_in_threadblock; idx < 6144; idx += 128) {
+    const uint32_t i = idx / 64;
+    const uint32_t k = idx % 64;
+    
+    uint32_t s_addr = S_offset + i * 384; // i * 96 * 4
+    uint32_t v_addr = V_offset + k * 384; // k * 96 * 4
+    float acc = 0.0f;
+    
+    // Shallow unroll by 2 for stride-1 contiguous dot product in SMEM
+    for (uint32_t j = 0; j < 48; j++) {
+      float s_val0 = load_float_shared(s_addr);
+      float v_val0 = load_float_shared(v_addr);
+      float s_val1 = load_float_shared(s_addr + 4);
+      float v_val1 = load_float_shared(v_addr + 4);
+      acc += s_val0 * v_val0;
+      acc += s_val1 * v_val1;
+      s_addr += 8;
+      v_addr += 8;
+    }
+    a->O[idx] = acc;
+  }
+}
+```

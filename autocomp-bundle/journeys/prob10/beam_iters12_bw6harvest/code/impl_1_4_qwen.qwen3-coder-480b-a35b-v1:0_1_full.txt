@@ -1,0 +1,111 @@
+```cpp
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  const uint32_t M = args->M;
+  const uint32_t N = args->N;
+  const uint32_t K = args->K;
+
+  // Tile sizes
+  const uint32_t TM = 64;
+  const uint32_t TN = 64;
+  const uint32_t TK = 32;
+
+  // Shared memory layout:
+  // smem_C: 64x64 floats = 16KB (addresses 0x00000 - 0x04000)
+  // smem_A: 64x32 floats = 8KB  (addresses 0x04000 - 0x06000)
+  // smem_B: 32x64 floats = 8KB  (addresses 0x06000 - 0x08000)
+  constexpr uint32_t SMEM_C_ADDR = 0x00000;
+  constexpr uint32_t SMEM_A_ADDR = 0x04000;
+  constexpr uint32_t SMEM_B_ADDR = 0x06000;
+
+  // Thread mapping: 128 threads -> 8 warps -> 64x64 tile (1 elem/output/thread)
+  const uint32_t warp_id = tid_in_threadblock / 16;
+  const uint32_t lane_id = tid_in_threadblock % 16;
+
+  // Precompute warp assignment within the 64x64 tile
+  // Layout: 4 warps vertically (M), 2 warps horizontally (N)
+  const uint32_t warp_m = warp_id % 4;
+  const uint32_t warp_n = warp_id / 4;
+
+  // Per-thread coordinates within warp (1x1)
+  const uint32_t tm = warp_m * 16 + lane_id;
+  const uint32_t tn = warp_n * 32 + (lane_id % 32);
+
+  // Loop over M and N tiles
+  for (uint32_t m_base = 0; m_base < M; m_base += TM) {
+    for (uint32_t n_base = 0; n_base < N; n_base += TN) {
+      // Initialize smem_C tile to zero cooperatively
+      for (uint32_t i = tid_in_threadblock; i < TM * TN; i += threads_per_threadblock) {
+        store32_shared(SMEM_C_ADDR, i * 4, 0);
+      }
+      mu_barrier(0, threads_per_threadblock / 16); // Cross-core sync
+
+      // K-loop with global load staging
+      for (uint32_t k_base = 0; k_base < K; k_base += TK) {
+        // --- Cooperative Global Load Phase ---
+
+        // Load smem_A (64x32) - coalesced by warp
+        // 64 rows, 32 cols -> 2048 elements -> 16 elems/thread
+        const uint32_t a_row_stride = K;
+        for (uint32_t i = tid_in_threadblock; i < TM * TK; i += threads_per_threadblock) {
+          const uint32_t a_tm = i / TK;
+          const uint32_t a_tk = i % TK;
+          const uint32_t gidx = (m_base + a_tm) * a_row_stride + (k_base + a_tk);
+          uint32_t data;
+          asm volatile("lw.global %0, 0(%1)" : "=r"(data) : "r"(&args->A[gidx]) : "memory");
+          store32_shared(SMEM_A_ADDR, i * 4, data);
+        }
+
+        // Load smem_B (32x64) - coalesced by warp
+        // 32 rows, 64 cols -> 2048 elements -> 16 elems/thread
+        const uint32_t b_col_stride = N;
+        for (uint32_t i = tid_in_threadblock; i < TK * TN; i += threads_per_threadblock) {
+          const uint32_t b_tk = i / TN;
+          const uint32_t b_tn = i % TN;
+          const uint32_t gidx = (k_base + b_tk) * b_col_stride + (n_base + b_tn);
+          uint32_t data;
+          asm volatile("lw.global %0, 0(%1)" : "=r"(data) : "r"(&args->B[gidx]) : "memory");
+          store32_shared(SMEM_B_ADDR, i * 4, data);
+        }
+
+        mu_barrier(0, threads_per_threadblock / 16); // Cross-core sync after loads
+
+        // --- Compute Phase ---
+        float acc = 0.0f;
+        for (uint32_t k = 0; k < TK; k++) {
+          const uint32_t a_addr = SMEM_A_ADDR + ((tm * TK + k) * 4);
+          const uint32_t b_addr = SMEM_B_ADDR + ((k * TN + tn) * 4);
+          float a_val, b_val;
+          asm volatile("lw.shared %0, 0(%1)" : "=r"(a_val) : "r"(a_addr) : "memory");
+          asm volatile("lw.shared %0, 0(%1)" : "=r"(b_val) : "r"(b_addr) : "memory");
+          acc += a_val * b_val;
+        }
+
+        // Update smem_C with accumulator
+        const uint32_t c_idx = tm * TN + tn;
+        const uint32_t c_addr = SMEM_C_ADDR + (c_idx * 4);
+        float prev_c;
+        asm volatile("lw.shared %0, 0(%1)" : "=r"(prev_c) : "r"(c_addr) : "memory");
+        store32_shared(c_addr, 0, prev_c + acc);
+
+        mu_barrier(0, threads_per_threadblock / 16); // Sync before next k-tile
+      }
+
+      // --- Writeback Phase ---
+      const uint32_t c_idx = tm * TN + tn;
+      if (c_idx < TM * TN && (m_base + tm) < M && (n_base + tn) < N) {
+        const uint32_t gidx = (m_base + tm) * N + (n_base + tn);
+        const uint32_t c_addr = SMEM_C_ADDR + (c_idx * 4);
+        uint32_t data = load32_shared(c_addr);
+        args->C[gidx] = *(float*)&data;
+      }
+    }
+  }
+}
+```

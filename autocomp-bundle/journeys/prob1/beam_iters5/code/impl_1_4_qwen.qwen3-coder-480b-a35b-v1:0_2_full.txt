@@ -1,0 +1,78 @@
+```cpp
+#include <stdint.h>
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t CKK = 768; // C * KH * KW = 3 * 16 * 16
+  const uint32_t P = 16;    // OH * OW = 4 * 4
+  const uint32_t smem_w_size = P * CKK * 4; // 16 * 768 * 4 = 49152 bytes
+
+  // (1) Stage W flat into SMEM[smem_w..].
+  for (uint32_t i = tid_in_threadblock; i < a->OC * CKK; i += threads_per_threadblock) {
+    uint32_t addr = smem_w_size + (i << 2);
+    store_shared(addr, 0, __builtin_bit_cast(uint32_t, a->w[i]));
+  }
+
+  // (2) Gather im2col patches into SMEM[0..] with transposed layout [CKK, P].
+  {
+    const uint32_t Wd = a->W;
+    const uint32_t HWd = a->H * Wd;
+    const uint32_t stride = a->stride;
+
+    uint32_t p = (tid_in_threadblock >> 9); // tid / 512, but tid < 128 => always 0
+    uint32_t ckk = tid_in_threadblock;      // tid % 512 = tid since tid < 128
+
+    for (uint32_t i = tid_in_threadblock; i < P * CKK; i += threads_per_threadblock) {
+      // Power-of-two arithmetic replacements
+      // c = ckk >> 8; kh = (ckk >> 4) & 15; kw = ckk & 15
+      // ph = p >> 2; pw = p & 3
+      const uint32_t c = ckk >> 8;
+      const uint32_t kh = (ckk >> 4) & 15;
+      const uint32_t kw = ckk & 15;
+      const uint32_t ph = p >> 2;
+      const uint32_t pw = p & 3;
+
+      const uint32_t in_idx = c * HWd + (ph * stride + kh) * Wd + pw * stride + kw;
+      const uint32_t smem_addr = (ckk * P + p) << 2;
+      store_shared(smem_addr, 0, __builtin_bit_cast(uint32_t, a->in[in_idx]));
+
+      // Increment ckk and conditionally increment p
+      ckk += threads_per_threadblock;
+      if (ckk >= CKK) {
+        ckk -= CKK;
+        p++;
+      }
+    }
+  }
+
+  // Synchronize across both cores for cross-core SMEM visibility
+  mu_barrier(0, threads_per_threadblock / MU_NUM_THREADS);
+
+  // (3) Frugal matmul with conflict-free SMEM access
+  {
+    const uint32_t OC_P = a->OC * P;
+    for (uint32_t idx = tid_in_threadblock; idx < OC_P; idx += threads_per_threadblock) {
+      const uint32_t oc = idx >> 4;        // idx / P
+      const uint32_t p_local = idx & 15;   // idx % P
+
+      uint32_t wa = smem_w_size + (oc * CKK << 2); // W base: oc * CKK * 4
+      uint32_t pa = p_local << 2;                  // Patch base: p * 4
+
+      float acc = 0.0f;
+      for (uint32_t k = 0; k < CKK; k++) {
+        acc += __builtin_bit_cast(float, load32_shared(wa)) *
+               __builtin_bit_cast(float, load32_shared(pa));
+        wa += 4;
+        pa += P << 2; // Move by 64 bytes = 16 floats = one column step
+      }
+      a->out[idx] = acc;
+    }
+  }
+}
+```

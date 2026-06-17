@@ -1,0 +1,70 @@
+```cpp
+#include <cstdint>
+
+// Hardcoded specialized dimensions for the vision transformer patch-embedding tile:
+// OUT[16, 4, 4] = IN[3, 64, 64] * W[16, 3, 16, 16], stride 16
+#define SPEC_OC 16
+#define SPEC_P 16    // OH * OW = 4 * 4
+#define SPEC_CKK 768 // C * KH * KW = 3 * 16 * 16
+#define SPEC_SMEM_W (SPEC_P * SPEC_CKK * 4) // 49152 bytes (staged after patches)
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  // (1) stage W flat into SMEM[SPEC_SMEM_W..]
+  for (uint32_t i = tid_in_threadblock; i < SPEC_OC * SPEC_CKK; i += threads_per_threadblock) {
+    store_shared(SPEC_SMEM_W + i * 4, 0, __builtin_bit_cast(uint32_t, a->w[i]));
+  }
+
+  // (2) gather im2col patches into SMEM[0..] (offset 0).
+  // Reorganized cooperative loading loops to completely avoid division.
+  {
+    for (uint32_t p = 0; p < SPEC_P; p++) {
+      const uint32_t p_div_4_times_16 = (p >> 2) << 4;
+      const uint32_t p_mod_4_times_16 = (p & 3) << 4;
+      const uint32_t p_times_768 = p * SPEC_CKK;
+      
+      for (uint32_t k = tid_in_threadblock; k < SPEC_CKK; k += threads_per_threadblock) {
+        const uint32_t ckk_div_256 = k >> 8;
+        const uint32_t ckk_div_16_mod_16 = (k >> 4) & 15;
+        const uint32_t ckk_mod_16 = k & 15;
+        
+        // in_idx = ckk_div_256 * HWd + (p_div_4_times_16 + ckk_div_16_mod_16) * Wd + p_mod_4_times_16 + ckk_mod_16
+        // Where HWd = 4096 and Wd = 64. Using bit-shifts to multiply:
+        const uint32_t in_idx = (ckk_div_256 << 12)
+                              + ((p_div_4_times_16 + ckk_div_16_mod_16) << 6)
+                              + p_mod_4_times_16 + ckk_mod_16;
+        
+        store_shared((p_times_768 + k) << 2, 0, __builtin_bit_cast(uint32_t, a->in[in_idx]));
+      }
+    }
+  }
+
+  // Synchronize both cores using a cross-core barrier (ID 0)
+  mu_barrier(0, threads_per_threadblock / MU_NUM_THREADS);
+
+  // (3) frugal matmul: OUT[oc * SPEC_P + p] = sum_ckk W[oc][ckk] * patch[p][ckk]
+  {
+    for (uint32_t idx = tid_in_threadblock; idx < SPEC_OC * SPEC_P; idx += threads_per_threadblock) {
+      uint32_t wa = SPEC_SMEM_W + ((idx >> 4) * (SPEC_CKK * 4)); // W base (after patches)
+      uint32_t pa = (idx & 15) * (SPEC_CKK * 4);                 // patch base (SMEM offset 0)
+      float acc = 0.0f;
+      
+      // Keep loops rolled to strictly satisfy register constraints
+      for (uint32_t k = 0; k < SPEC_CKK; k++) {
+        acc += __builtin_bit_cast(float, load32_shared(wa)) *
+               __builtin_bit_cast(float, load32_shared(pa));
+        wa += 4;
+        pa += 4;
+      }
+      a->out[idx] = acc;
+    }
+  }
+}
+```

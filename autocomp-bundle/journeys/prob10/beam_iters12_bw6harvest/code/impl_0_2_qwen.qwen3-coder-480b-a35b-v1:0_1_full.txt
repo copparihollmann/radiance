@@ -1,0 +1,91 @@
+```cpp
+#include <stdint.h>
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  (void)threads_per_threadblock;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  // Shared memory layout:
+  // smem_a: 8 rows * 64 cols * 4 bytes = 2048 bytes
+  // smem_b: 64 rows * 16 cols * 4 bytes = 4096 bytes
+  const uint32_t smem_a_base = 0;
+  const uint32_t smem_b_base = 2048;
+
+  // Thread mapping within 8x16 tile
+  const uint32_t local_row = tid_in_threadblock >> 4;  // tid / 16 (0 to 7)
+  const uint32_t local_col = tid_in_threadblock & 15;  // tid % 16 (0 to 15)
+
+  // Process 32 8x16 blocks to cover the full 64x64 output
+  for (uint32_t block_id = 0; block_id < 32; block_id++) {
+    const uint32_t block_row = (block_id >> 2) << 3;  // (block_id / 4) * 8
+    const uint32_t block_col = (block_id & 3) << 4;   // (block_id % 4) * 16
+
+    float accumulator = 0.0f;
+
+    // K-dimension streaming in steps of 64
+    for (uint32_t k_step = 0; k_step < 12; k_step++) {
+      const uint32_t k_outer_offset = k_step << 6;  // k_step * 64
+
+      // --- Load A tile (8x64) into shared memory ---
+      // Cooperatively load 4 elements per thread (stride-1, coalesced)
+      for (uint32_t i = 0; i < 4; i++) {
+        const uint32_t global_row = block_row + local_row;
+        const uint32_t global_col = k_outer_offset + (tid_in_threadblock & 63) + (i << 6);
+        const uint32_t linear_index = global_row * 768 + global_col;
+        float val = args->A[linear_index];
+        const uint32_t smem_offset = (tid_in_threadblock + (i << 7)) << 2; // * 128 * 4
+        store_shared(smem_a_base, smem_offset, __builtin_bit_cast(uint32_t, val));
+      }
+
+      // --- Load B tile (64x16) into shared memory ---
+      // Cooperatively load 8 elements per thread (stride-1, coalesced)
+      for (uint32_t i = 0; i < 8; i++) {
+        const uint32_t global_row = k_outer_offset + (tid_in_threadblock >> 3) + (i << 4);
+        const uint32_t global_col = block_col + local_col;
+        const uint32_t linear_index = global_row * 64 + global_col;
+        float val = args->B[linear_index];
+        const uint32_t smem_offset = (tid_in_threadblock + (i << 7)) << 2; // * 128 * 4
+        store_shared(smem_b_base, smem_offset, __builtin_bit_cast(uint32_t, val));
+      }
+
+      // Cross-core sync after SMEM loads
+      mu_barrier(0, 8);
+
+      // --- Compute partial dot product ---
+      // Use pointer arithmetic to minimize register usage
+      uint32_t a_ptr = smem_a_base + (local_row << 8); // local_row * 64 * 4
+      uint32_t b_ptr = smem_b_base + (local_col << 2);
+      const uint32_t a_end_ptr = a_ptr + 256; // + 64 elements * 4 bytes
+
+      // Unroll by 2 to balance performance and register pressure
+      while (a_ptr < a_end_ptr) {
+        float a_val0 = __builtin_bit_cast(float, load32_shared(a_ptr));
+        float b_val0 = __builtin_bit_cast(float, load32_shared(b_ptr));
+        accumulator += a_val0 * b_val0;
+        a_ptr += 4;
+        b_ptr += 64; // Move to next row in B (16 elements * 4 bytes)
+
+        float a_val1 = __builtin_bit_cast(float, load32_shared(a_ptr));
+        float b_val1 = __builtin_bit_cast(float, load32_shared(b_ptr));
+        accumulator += a_val1 * b_val1;
+        a_ptr += 4;
+        b_ptr += 64;
+      }
+
+      // Sync before loading the next K slice
+      mu_barrier(0, 8);
+    }
+
+    // --- Write result to global memory ---
+    const uint32_t global_out_row = block_row + local_row;
+    const uint32_t global_out_col = block_col + local_col;
+    args->C[global_out_row * 64 + global_out_col] = accumulator;
+  }
+}
+```

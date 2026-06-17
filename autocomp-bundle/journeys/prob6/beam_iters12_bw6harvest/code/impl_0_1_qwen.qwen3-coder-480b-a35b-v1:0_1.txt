@@ -1,0 +1,106 @@
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t M = args->M, N = args->N, K = args->K;
+  const uint32_t num_warps = threads_per_threadblock / MU_NUM_THREADS;
+
+  // Use minimal SMEM layout to stay under register limits
+  const uint32_t smem_a = 0;           // 64 * 32 * 4 = 8192 bytes
+  const uint32_t smem_b = 8192;        // 32 * 64 * 4 = 8192 bytes  
+  const uint32_t smem_c = 16384;       // 64 * 64 * 4 = 16384 bytes
+
+  // Thread mapping: 128 threads -> 8x16 grid covering 64x64 output tile
+  const uint32_t thread_row = tid_in_threadblock / 16;
+  const uint32_t thread_col = tid_in_threadblock % 16;
+
+  // Each thread processes 4 C elements (2x2 subtile)
+  const uint32_t c_row0 = (thread_row / 2) * 2;
+  const uint32_t c_row1 = c_row0 + 1;
+  const uint32_t c_col0 = (thread_col / 2) * 2;
+  const uint32_t c_col1 = c_col0 + 1;
+
+  // Initialize local accumulators (minimal register usage)
+  float acc00 = 0.0f, acc01 = 0.0f, acc10 = 0.0f, acc11 = 0.0f;
+
+  // K-tiling loop
+  for (uint32_t k_outer = 0; k_outer < K; k_outer += 32) {
+    // Collaborative load of A tile (64 rows x 32 cols)
+    for (uint32_t i = tid_in_threadblock; i < 64 * 32; i += 128) {
+      uint32_t row = i / 32;
+      uint32_t col = i % 32;
+      uint32_t g_idx = row * K + k_outer + col;
+      if (k_outer + col < K && row < 64) {
+        store_shared(smem_a + i * 4, 0, __builtin_bit_cast(uint32_t, args->A[g_idx]));
+      } else {
+        store_shared(smem_a + i * 4, 0, 0);
+      }
+    }
+
+    // Collaborative load of B tile (32 rows x 64 cols)
+    for (uint32_t i = tid_in_threadblock; i < 32 * 64; i += 128) {
+      uint32_t row = i / 64;
+      uint32_t col = i % 64;
+      uint32_t g_idx = (k_outer + row) * N + col;
+      if (k_outer + row < K && col < 64) {
+        store_shared(smem_b + i * 4, 0, __builtin_bit_cast(uint32_t, args->B[g_idx]));
+      } else {
+        store_shared(smem_b + i * 4, 0, 0);
+      }
+    }
+
+    // Cross-core synchronization for SMEM writes
+    mu_barrier(0, num_warps);
+
+    // Compute MACs for this K-tile
+    for (uint32_t k_inner = 0; k_inner < 32; k_inner++) {
+      // Load A values for current row
+      float a0 = __builtin_bit_cast(float, load32_shared(smem_a + (c_row0 * 32 + k_inner) * 4));
+      float a1 = __builtin_bit_cast(float, load32_shared(smem_a + (c_row1 * 32 + k_inner) * 4));
+
+      // Load B values for current column
+      float b0 = __builtin_bit_cast(float, load32_shared(smem_b + (k_inner * 64 + c_col0) * 4));
+      float b1 = __builtin_bit_cast(float, load32_shared(smem_b + (k_inner * 64 + c_col1) * 4));
+
+      // Accumulate
+      acc00 += a0 * b0;
+      acc01 += a0 * b1;
+      acc10 += a1 * b0;
+      acc11 += a1 * b1;
+    }
+
+    // Synchronize before next iteration
+    mu_barrier(0, num_warps);
+  }
+
+  // Write final results to SMEM staging area
+  if (c_row0 < M && c_col0 < N) {
+    store_shared(smem_c + (c_row0 * 64 + c_col0) * 4, 0, __builtin_bit_cast(uint32_t, acc00));
+  }
+  if (c_row0 < M && c_col1 < N) {
+    store_shared(smem_c + (c_row0 * 64 + c_col1) * 4, 0, __builtin_bit_cast(uint32_t, acc01));
+  }
+  if (c_row1 < M && c_col0 < N) {
+    store_shared(smem_c + (c_row1 * 64 + c_col0) * 4, 0, __builtin_bit_cast(uint32_t, acc10));
+  }
+  if (c_row1 < M && c_col1 < N) {
+    store_shared(smem_c + (c_row1 * 64 + c_col1) * 4, 0, __builtin_bit_cast(uint32_t, acc11));
+  }
+
+  // Final cross-core sync before global writeback
+  mu_barrier(0, num_warps);
+
+  // Coalesced writeback to global memory
+  for (uint32_t i = tid_in_threadblock; i < 64 * 64; i += 128) {
+    uint32_t row = i / 64;
+    uint32_t col = i % 64;
+    uint32_t g_idx = row * N + col;
+    if (row < M && col < N) {
+      args->C[g_idx] = __builtin_bit_cast(float, load32_shared(smem_c + i * 4));
+    }
+  }
+}

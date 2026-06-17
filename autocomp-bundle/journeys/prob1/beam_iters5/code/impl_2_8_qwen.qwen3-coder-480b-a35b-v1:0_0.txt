@@ -1,0 +1,81 @@
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t CKK = a->C * a->KH * a->KW;
+  const uint32_t P = a->OH * a->OW;
+  const uint32_t smem_w = P * CKK * 4; // Weight staging area in SMEM (after patches)
+
+  // (1) Stage W flat into SMEM[smem_w..] using scalarized loop (no register tiling)
+  for (uint32_t i = tid_in_threadblock; i < a->OC * CKK; i += threads_per_threadblock) {
+    store_shared(smem_w + i * 4, 0, __builtin_bit_cast(uint32_t, a->w[i]));
+  }
+
+  // (2) Gather im2col patches into SMEM[0..] using nested loop with iterative induction
+  {
+    const uint32_t OW = a->OW;
+    const uint32_t KH = a->KH;
+    const uint32_t KW = a->KW;
+    const uint32_t HWd = a->H * a->W;
+    const uint32_t Wd = a->W;
+    const uint32_t stride = a->stride;
+    const uint32_t d_kw = threads_per_threadblock % KW;
+    const uint32_t d_kh = threads_per_threadblock / KW;
+
+    // Initialize multi-dimensional indices from linear tid_in_threadblock (once)
+    uint32_t c = tid_in_threadblock / (KH * KW);
+    uint32_t kh = (tid_in_threadblock / KW) % KH;
+    uint32_t kw = tid_in_threadblock % KW;
+
+    // Nested loop structure: outer loop over patch index p, inner loop over CKK
+    for (uint32_t p = 0; p < P; p++) {
+      const uint32_t ph = p / OW;
+      const uint32_t pw = p % OW;
+      const uint32_t p_offset = (ph * stride) * Wd + pw * stride; // Constant per patch
+
+      for (uint32_t local_ckk = tid_in_threadblock; local_ckk < CKK; local_ckk += threads_per_threadblock) {
+        const uint32_t in_idx = c * HWd + kh * Wd + kw + p_offset;
+        const uint32_t smem_i = p * CKK + local_ckk;
+        store_shared(smem_i * 4, 0, __builtin_bit_cast(uint32_t, a->in[in_idx]));
+
+        // Update multi-dimensional indices iteratively (carry-over logic)
+        kw += d_kw;
+        if (kw >= KW) {
+          kw -= KW;
+          kh++;
+        }
+        kh += d_kh;
+        while (kh >= KH) {
+          kh -= KH;
+          c++;
+        }
+      }
+    }
+  }
+
+  // Cross-core barrier ensures visibility of SMEM writes before reads
+  mu_barrier(0, threads_per_threadblock / MU_NUM_THREADS);
+
+  // (3) Frugal GEMM with incremental pointer chasing (no register tiling/unroll)
+  for (uint32_t idx = tid_in_threadblock; idx < a->OC * P; idx += threads_per_threadblock) {
+    const uint32_t oc = idx / P;
+    const uint32_t p = idx % P;
+    uint32_t wa = smem_w + oc * CKK * 4;
+    uint32_t pa = p * CKK * 4;
+    float acc = 0.0f;
+
+    // Rolled loop to minimize register usage and avoid unroll-induced ILP overuse
+    for (uint32_t k = 0; k < CKK; k++) {
+      acc += __builtin_bit_cast(float, load32_shared(wa)) *
+             __builtin_bit_cast(float, load32_shared(pa));
+      wa += 4;
+      pa += 4;
+    }
+
+    a->out[idx] = acc;
+  }
+}

@@ -1,0 +1,119 @@
+```cpp
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t seq = a->seq;
+  const uint32_t d = a->d;
+  const uint32_t nw = threads_per_threadblock / MU_NUM_THREADS;
+
+  // Shared memory layout:
+  // smem_Q:     0x00000 - 0x08000 (32 KiB)
+  // smem_K:     0x08000 - 0x10000 (32 KiB)
+  // smem_scratch: 0x10000 - 0x20000 (64 KiB)
+  // For phase 3:
+  // smem_V:     0x00000 - 0x08000 (32 KiB, reuses smem_Q)
+  // smem_O:     0x08000 - 0x10000 (32 KiB, reuses smem_K)
+
+  const uint32_t smem_Q_base     = 0x00000;
+  const uint32_t smem_K_base     = 0x08000;
+  const uint32_t smem_scratch_base = 0x10000;
+  const uint32_t smem_V_base     = 0x00000;  // Reuse smem_Q
+  const uint32_t smem_O_base     = 0x08000;  // Reuse smem_K
+
+  // Phase 1: Load Q and K into SMEM with coalesced access
+  for (uint32_t idx = tid_in_threadblock; idx < seq * d; idx += threads_per_threadblock) {
+    const uint32_t i = idx / d;
+    const uint32_t k = idx % d;
+    if (i < seq && k < d) {
+      const __global float* Qi = a->Q + i * d;
+      const __global float* Ki = a->K + i * d;
+      store_shared(smem_Q_base, idx * 4, Qi[k]);
+      store_shared(smem_K_base, idx * 4, Ki[k]);
+    }
+  }
+  mu_barrier(0, nw); // Cross-core sync after loading Q and K
+
+  // Phase 1: Compute S[i][j] = scale * Q[i]·K[j] in SMEM
+  for (uint32_t i = tid_in_threadblock; i < seq; i += threads_per_threadblock) {
+    for (uint32_t j = 0; j < seq; j++) {
+      float acc = 0.0f;
+      for (uint32_t k = 0; k < d; k++) {
+        float qik = load32_shared(smem_Q_base + (i * d + k) * 4);
+        float kj_val = load32_shared(smem_K_base + (j * d + k) * 4);
+        acc += qik * kj_val;
+      }
+      store_shared(smem_scratch_base, (i * seq + j) * 4, acc * 0.125f);
+    }
+  }
+  mu_barrier(0, nw); // Cross-core sync after writing scratch
+
+  // Phase 2: Softmax in place on SMEM data
+  for (uint32_t i = tid_in_threadblock; i < seq; i += threads_per_threadblock) {
+    float* sp_row = (float*)(smem_scratch_base + i * seq * 4);
+    
+    // Find max
+    float m = load32_shared((uint32_t)sp_row);
+    for (uint32_t j = 1; j < seq; j++) {
+      float val = load32_shared((uint32_t)(sp_row + j));
+      if (val > m) m = val;
+    }
+
+    // Exponentiate and sum
+    float sum = 0.0f;
+    for (uint32_t j = 0; j < seq; j++) {
+      float val = load32_shared((uint32_t)(sp_row + j));
+      float e = mu_exp(val - m);
+      store_shared((uint32_t)sp_row, j * 4, e);
+      sum += e;
+    }
+
+    // Normalize
+    float inv_sum = 1.0f / sum;
+    for (uint32_t j = 0; j < seq; j++) {
+      float val = load32_shared((uint32_t)(sp_row + j));
+      store_shared((uint32_t)sp_row, j * 4, val * inv_sum);
+    }
+  }
+  mu_barrier(0, nw); // Cross-core sync after softmax
+
+  // Phase 3: Load V into SMEM with coalesced access (reuse Q's space)
+  for (uint32_t idx = tid_in_threadblock; idx < seq * d; idx += threads_per_threadblock) {
+    const uint32_t j = idx / d;
+    const uint32_t k = idx % d;
+    if (j < seq && k < d) {
+      const __global float* Vj = a->V + j * d;
+      store_shared(smem_V_base, idx * 4, Vj[k]);
+    }
+  }
+  mu_barrier(0, nw); // Cross-core sync after loading V
+
+  // Phase 3: Compute O[i][k] = sum_j P[i][j] * V[j][k] in SMEM
+  for (uint32_t i = tid_in_threadblock; i < seq; i += threads_per_threadblock) {
+    for (uint32_t k = 0; k < d; k++) {
+      float acc = 0.0f;
+      for (uint32_t j = 0; j < seq; j++) {
+        float pij = load32_shared(smem_scratch_base + (i * seq + j) * 4);
+        float vjk = load32_shared(smem_V_base + (j * d + k) * 4);
+        acc += pij * vjk;
+      }
+      store_shared(smem_O_base, (i * d + k) * 4, acc);
+    }
+  }
+  mu_barrier(0, nw); // Cross-core sync after computing O
+
+  // Phase 3: Copy result from SMEM to global memory O with coalesced access
+  for (uint32_t idx = tid_in_threadblock; idx < seq * d; idx += threads_per_threadblock) {
+    const uint32_t i = idx / d;
+    const uint32_t k = idx % d;
+    if (i < seq && k < d) {
+      float val = load32_shared(smem_O_base + idx * 4);
+      a->O[idx] = val;
+    }
+  }
+}
+```

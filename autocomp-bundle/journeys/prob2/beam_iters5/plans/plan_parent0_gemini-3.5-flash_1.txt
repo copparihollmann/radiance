@@ -1,0 +1,136 @@
+An elegant and highly effective optimization plan to improve the latency of the single-head attention kernel.
+
+### Optimization Plan
+
+1. **Full Shared Memory Staging (Strategy 5 & 8)**:
+   The total memory required for $Q$ (16 KiB), $K$ (16 KiB), $V$ (16 KiB), and the intermediate softmax scores $S$ (16 KiB) is 64 KiB. Since the Radiance Muon cluster features 128 KiB of dual-ported, high-bandwidth Shared Memory (SMEM) addressable at address `0`, we can fit all matrices entirely into SMEM. By pre-loading $Q$, $K$, and $V$ into SMEM, we avoid the ~400-cycle global memory latency for subsequent matrix multiplications and softmax calculations.
+
+2. **Load-Balanced Softmax Across Cores**:
+   The threadblock consists of 128 threads across 2 cores (64 threads per core). Since we have exactly 64 rows to process for softmax, assigning 1 thread per row allows us to process the entire softmax phase with zero intra-warp reduction overhead. To balance the load evenly across both cores, we assign rows 0..31 to threads 0..31 (Core 0) and rows 32..63 to threads 64..95 (Core 1).
+
+3. **Strict Register Wall Adherence & Rolled Loops (Strategy 11)**:
+   To strictly respect the target's hard limit of $\le 31$ registers per thread and avoid RTL register-subscription errors, we compile all loops with `#pragma GCC unroll 1` and accumulate values into a single register per thread. 
+
+4. **Coalesced Memory Transmissions**:
+   Global memory loading and storing are done using stride-1 access patterns across thread lanes (e.g., `idx = tid_in_threadblock; idx < 4096; idx += 128`) to maximize the L0D/L1 memory coalescing efficiency.
+
+5. **Cross-Core SMEM Visibility**:
+   Because the threadblock spans two cores, threads on Core 1 will read SMEM data written by Core 0. We enforce correct memory visibility and execution order using the cross-core barrier instruction `mu_barrier(0, 8)` (barrier ID 0, spanning all 8 warps) after the loading phase, the score-computation phase, and the softmax phase.
+
+---
+
+### Optimized C++ Implementation
+
+```cpp
+#include <vx_intrinsics.h>
+#include <mu_intrinsics.h>
+#include <mu_schedule.h>
+#include <shared_mem.h>
+#include <math.h>
+#include <stdint.h>
+
+struct KernelArgs {
+  __global float* Q;
+  __global float* K;
+  __global float* V;
+  __global float* O;
+  __global float* scratch;
+  uint32_t seq;
+  uint32_t d;
+};
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  (void)threads_per_threadblock;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const float scale = 0.125f; // 1/sqrt(64)
+
+  // Layout 64 KiB of Shared Memory: Q, K, V, and S (scores) each take 16 KiB
+  __local float* s_Q = (__local float*)0;
+  __local float* s_K = (__local float*)(16384);
+  __local float* s_V = (__local float*)(32768);
+  __local float* s_S = (__local float*)(49152);
+
+  // Phase 0: Coalesced global loads into SMEM
+  for (uint32_t idx = tid_in_threadblock; idx < 4096; idx += 128) {
+    s_Q[idx] = a->Q[idx];
+  }
+  for (uint32_t idx = tid_in_threadblock; idx < 4096; idx += 128) {
+    s_K[idx] = a->K[idx];
+  }
+  for (uint32_t idx = tid_in_threadblock; idx < 4096; idx += 128) {
+    s_V[idx] = a->V[idx];
+  }
+
+  // Cross-core barrier to ensure SMEM staging is complete across both cores
+  mu_barrier(0, 8);
+
+  // Phase 1: Compute attention scores (S = Q K^T * scale)
+  for (uint32_t idx = tid_in_threadblock; idx < 4096; idx += 128) {
+    uint32_t i = idx >> 6;
+    uint32_t j = idx & 63;
+    uint32_t i_offset = i << 6;
+    float acc = 0.0f;
+    #pragma GCC unroll 1
+    for (uint32_t k = 0; k < 64; k++) {
+      acc += s_Q[i_offset + k] * s_K[(j << 6) + k];
+    }
+    s_S[idx] = acc * scale;
+  }
+
+  // Cross-core barrier to guarantee scores are fully computed
+  mu_barrier(0, 8);
+
+  // Phase 2: Row-wise Softmax
+  // Distribute 64 rows evenly: 32 rows to Core 0, 32 rows to Core 1
+  uint32_t row = 999;
+  if (tid_in_threadblock < 32) {
+    row = tid_in_threadblock;
+  } else if (tid_in_threadblock >= 64 && tid_in_threadblock < 96) {
+    row = tid_in_threadblock - 32;
+  }
+
+  if (row < 64) {
+    uint32_t row_offset = row << 6;
+    float m = s_S[row_offset];
+    #pragma GCC unroll 1
+    for (uint32_t j = 1; j < 64; j++) {
+      float v = s_S[row_offset + j];
+      if (v > m) m = v;
+    }
+    float sum = 0.0f;
+    #pragma GCC unroll 1
+    for (uint32_t j = 0; j < 64; j++) {
+      float e = mu_exp(s_S[row_offset + j] - m);
+      s_S[row_offset + j] = e;
+      sum += e;
+    }
+    float inv = 1.0f / sum;
+    #pragma GCC unroll 1
+    for (uint32_t j = 0; j < 64; j++) {
+      s_S[row_offset + j] *= inv;
+    }
+  }
+
+  // Cross-core barrier to finalize softmax probabilities prior to product step
+  mu_barrier(0, 8);
+
+  // Phase 3: Compute output product (O = S V)
+  for (uint32_t idx = tid_in_threadblock; idx < 4096; idx += 128) {
+    uint32_t i = idx >> 6;
+    uint32_t k = idx & 63;
+    uint32_t i_offset = i << 6;
+    float acc = 0.0f;
+    #pragma GCC unroll 1
+    for (uint32_t j = 0; j < 64; j++) {
+      acc += s_S[i_offset + j] * s_V[(j << 6) + k];
+    }
+    a->O[idx] = acc;
+  }
+}
+```

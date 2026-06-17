@@ -1,0 +1,184 @@
+An elegant and highly effective optimization plan to address the performance bottleneck in the vision transformer patch-embedding kernel.
+
+### Inefficiency Analysis
+1. **Severe Shared Memory Bank Conflicts (The Primary Bottleneck):**
+   In the matmul phase of the baseline kernel, each thread accesses input patches from SMEM with stride `CKK * 4` bytes. Since `CKK = 768` is a multiple of 16 (and a power-of-two-friendly multiple of 64), the stride `3072` bytes causes **every single lane in a warp to access the same SMEM bank**. This results in a massive **16-way bank conflict** on every input load, completely serializing the SMEM reads and bloating execution time.
+2. **Redundant SMEM Bandwidth Consumption:**
+   Each thread sequentially processes two output elements (`idx` and `idx + 128`). For each element, it separately loads the entire 768-float input patch from SMEM, consuming redundant SMEM read bandwidth.
+
+---
+
+### Optimization Plan
+We will apply **Strategy 7 (Pad the inner dimensions of shared memory allocations)** alongside a targeted loop restructuring to eliminate these inefficiencies while keeping register usage minimal:
+
+1. **Pad SMEM Inner Dimension (`CKK_PADDED`):**
+   We define `CKK_PADDED = 768 + 1 = 769` (adding 1 float pad). Because `769` is odd, it is coprime to 16 (the number of SMEM banks). Lane $i$ will now access bank `(i * 769 + k) % 16`, which maps every lane in a warp to a distinct bank. This **completely eliminates bank conflicts**, speeding up SMEM reads by up to $16\times$.
+2. **Cooperative Restructuring for Weight & Input Staging:**
+   We rewrite the staging loops to store data in the padded layout. We make sure that all global reads are perfectly coalesced across lanes (using sequential 4-byte steps).
+3. **Register-Safe Dual-Accumulator Restructuring:**
+   Instead of sequentially computing `idx` and `idx + 128`, we compute them concurrently using two registers `acc0` and `acc1`. Because `idx` and `idx + 128` share the exact same column (input patch), we can load the patch value once and reuse it across both accumulations, reducing total SMEM reads by 25%.
+4. **Register Count Safety:**
+   We keep the loop unrolled by only 4 to limit register pressure, strictly abiding by the hardware's 31-register limit.
+
+---
+
+### Optimized Code
+
+```cpp
+#include <stdint.h>
+
+#define MU_NUM_THREADS 16
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t CKK = a->C * a->KH * a->KW;
+  
+  // Padding the inner dimension from 768 to 769 to completely eliminate bank conflicts
+  const uint32_t CKK_PAD = 1;
+  const uint32_t CKK_PADDED = CKK + CKK_PAD;
+  const uint32_t smem_w = a->OH * a->OW * CKK_PADDED * 4; // W staged AFTER patches
+
+  // (1) Stage weights flat into SMEM with padded rows
+  const uint32_t OC = a->OC;
+  if (__builtin_constant_p(CKK) && CKK == 768) {
+    for (uint32_t r = 0; r < OC; ++r) {
+      uint32_t smem_row_base = smem_w + r * CKK_PADDED * 4;
+      uint32_t global_row_base = r * CKK;
+      #pragma GCC unroll 1
+      for (uint32_t k = tid_in_threadblock; k < CKK; k += 128) {
+        store_shared(smem_row_base + k * 4, 0, __builtin_bit_cast(uint32_t, a->w[global_row_base + k]));
+      }
+    }
+  } else {
+    // Generic fallback weight staging
+    const uint32_t total_w = OC * CKK;
+    for (uint32_t i = tid_in_threadblock; i < total_w; i += threads_per_threadblock) {
+      const uint32_t r = i / CKK;
+      const uint32_t ckk = i % CKK;
+      store_shared(smem_w + r * CKK_PADDED * 4 + ckk * 4, 0, __builtin_bit_cast(uint32_t, a->w[i]));
+    }
+  }
+
+  // (2) Gather im2col patches into SMEM
+  const uint32_t KH = a->KH, KW = a->KW, OW = a->OW;
+  const uint32_t Wd = a->W, HWd = a->H * Wd, stride = a->stride;
+  const uint32_t OH = a->OH;
+
+  if (__builtin_constant_p(KW) && __builtin_constant_p(KH) && __builtin_constant_p(OW) &&
+      KW == 16 && KH == 16 && OW == 4) {
+    
+    for (uint32_t ph = 0; ph < OH; ++ph) {
+      const uint32_t ph_stride_Wd = ph * stride * Wd;
+      for (uint32_t pw = 0; pw < 4; ++pw) {
+        const uint32_t p = ph * 4 + pw;
+        const uint32_t pw_stride = pw * stride;
+        const uint32_t smem_p_base = p * CKK_PADDED * 4;
+        
+        // Unrolled by 6 (perfectly staging CKK=768)
+        #pragma GCC unroll 1
+        for (uint32_t s = 0; s < 6; ++s) {
+          const uint32_t ckk = tid_in_threadblock + s * 128;
+          const uint32_t c = ckk >> 8;
+          const uint32_t kh = (ckk >> 4) & 15;
+          const uint32_t kw = ckk & 15;
+          const uint32_t in_idx = c * HWd + ph_stride_Wd + kh * Wd + pw_stride + kw;
+          store_shared(smem_p_base + ckk * 4, 0, __builtin_bit_cast(uint32_t, a->in[in_idx]));
+        }
+      }
+    }
+  } else {
+    // Generic fallback input staging
+    const uint32_t total = OH * OW * CKK;
+    for (uint32_t i = tid_in_threadblock; i < total; i += threads_per_threadblock) {
+      const uint32_t p = i / CKK;
+      const uint32_t ckk = i % CKK;
+      const uint32_t in_idx = (ckk / (KH * KW)) * HWd
+                            + ((p / OW) * stride + (ckk / KW) % KH) * Wd
+                            + (p % OW) * stride + ckk % KW;
+      store_shared(p * CKK_PADDED * 4 + ckk * 4, 0, __builtin_bit_cast(uint32_t, a->in[in_idx]));
+    }
+  }
+
+  // Cross-core SMEM staging barrier (using ID 0 to ensure coherence across cores)
+  mu_barrier(0, threads_per_threadblock / MU_NUM_THREADS);
+
+  // (3) Matmul phase
+  const uint32_t P = OH * OW;
+  if (__builtin_constant_p(P) && P == 16 && __builtin_constant_p(CKK) && CKK == 768) {
+    // Each thread registers two accumulators (row, row+8) for the same patch/column
+    const uint32_t col = tid_in_threadblock & 15;
+    const uint32_t row0 = tid_in_threadblock >> 4;
+    const uint32_t row1 = row0 + 8;
+
+    uint32_t wa0 = smem_w + row0 * CKK_PADDED * 4;
+    uint32_t wa1 = smem_w + row1 * CKK_PADDED * 4;
+    uint32_t pa  = col * CKK_PADDED * 4;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    // Loop unrolled by 4. Reuses temporary registers to respect register limitations.
+    for (uint32_t k = 0; k < CKK; k += 4) {
+      float p, w0, w1;
+
+      p  = __builtin_bit_cast(float, load32_shared(pa));
+      w0 = __builtin_bit_cast(float, load32_shared(wa0));
+      w1 = __builtin_bit_cast(float, load32_shared(wa1));
+      acc0 += w0 * p;
+      acc1 += w1 * p;
+
+      p  = __builtin_bit_cast(float, load32_shared(pa + 4));
+      w0 = __builtin_bit_cast(float, load32_shared(wa0 + 4));
+      w1 = __builtin_bit_cast(float, load32_shared(wa1 + 4));
+      acc0 += w0 * p;
+      acc1 += w1 * p;
+
+      p  = __builtin_bit_cast(float, load32_shared(pa + 8));
+      w0 = __builtin_bit_cast(float, load32_shared(wa0 + 8));
+      w1 = __builtin_bit_cast(float, load32_shared(wa1 + 8));
+      acc0 += w0 * p;
+      acc1 += w1 * p;
+
+      p  = __builtin_bit_cast(float, load32_shared(pa + 12));
+      w0 = __builtin_bit_cast(float, load32_shared(wa0 + 12));
+      w1 = __builtin_bit_cast(float, load32_shared(wa1 + 12));
+      acc0 += w0 * p;
+      acc1 += w1 * p;
+
+      wa0 += 16;
+      wa1 += 16;
+      pa  += 16;
+    }
+
+    a->out[row0 * 16 + col] = acc0;
+    a->out[row1 * 16 + col] = acc1;
+  } else {
+    // Generic fallback matmul path (utilizing CKK_PADDED to avoid conflicts)
+    const uint32_t total_out = OC * P;
+    for (uint32_t idx = tid_in_threadblock; idx < total_out; idx += threads_per_threadblock) {
+      uint32_t wa = smem_w + (idx / P) * CKK_PADDED * 4;
+      uint32_t pa = (idx % P) * CKK_PADDED * 4;
+      float acc = 0.0f;
+      uint32_t k = 0;
+      for (; k + 1 < CKK; k += 2) {
+        acc += __builtin_bit_cast(float, load32_shared(wa)) *
+               __builtin_bit_cast(float, load32_shared(pa));
+        acc += __builtin_bit_cast(float, load32_shared(wa + 4)) *
+               __builtin_bit_cast(float, load32_shared(pa + 4));
+        wa += 8; pa += 8;
+      }
+      if (k < CKK) {
+        acc += __builtin_bit_cast(float, load32_shared(wa)) *
+               __builtin_bit_cast(float, load32_shared(pa));
+      }
+      a->out[idx] = acc;
+    }
+  }
+}
+```

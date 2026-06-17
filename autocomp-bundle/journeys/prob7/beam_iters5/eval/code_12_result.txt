@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n j) * 4);\n      |                             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:123:29: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  123 |       float s_ij = *(float*)&load32_shared(s_addr);\n      |                             ^~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:133:26: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  133 |       float e = *(float*)&load32_shared(s_addr);\n      |                          ^~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:134:78: error: cannot take the address of an rvalue of type 'float'\n  134 |       store_shared(SMEM_BASE + SMEM_S_OFFSET, (i * seq + j) * 4, *(uint32_t*)&(e * inv_sum));\n      |                                                                              ^ ~~~~~~~~~~~\nkernel.cpp:153:31: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  153 |         float p_ij = *(float*)&load32_shared(SMEM_BASE + SMEM_S_OFFSET + (i * seq + j) * 4);\n      |                               ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:154:31: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  154 |         float v_jk = *(float*)&load32_shared(SMEM_BASE + SMEM_V_OFFSET + (j * d + k) * 4);\n      |                               ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n10 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

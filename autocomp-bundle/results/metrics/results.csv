@@ -1,0 +1,15 @@
+prob,label,category,baseline_total,best_total,speedup_total,overhead,baseline_net,best_net,speedup_net,util_net_pct,best_kernel,provenance
+0,matmul_64cubed,real-model? no (synthetic anchor),480918,419797,1.146,377080,103838,42717,2.431,19.2,sol0_smem_manual.cpp,hand-verified SMEM (RTL-confirmed); search beam_best==baseline
+1,conv_patchembed (openvla),real-model,102215,79286,1.289,31298,70917,47988,1.478,NA,muon_1_beam_iters8.cpp,generated: constexpr shapes + bank-pad SMEM
+2,attn_seq64 (rdt),real-model,1308352,1292929,1.012,338664,969688,954265,1.016,NA,muon_2_beam_iters8.cpp,generated
+3,attn_seq96 (rdt),real-model,2759774,2759774,1.000,503908,2255866,2255866,1.000,NA,muon_3_beam_iters8.cpp,generated (==baseline)
+4,swiglu (rdt),real-model,780625,780326,1.000,NA,NA,NA,NA,NA,muon_4_beam_iters8.cpp,generated (==baseline)
+5,softmax (rdt),real-model,509523,NA,NA,NA,NA,NA,NA,NA,muon_5_beam_iters8.cpp,generated best fails to run
+6,matmul_K128 (smolvla),real-model,487016,480444,1.014,377136,109880,103308,1.064,15.9,muon_6_beam_iters8.cpp,generated; baseline already SMEM-staged
+7,flash_attn (pi05),real-model,NA,NA,NA,669514,NA,NA,NA,NA,muon_7_beam_iters6.cpp,baseline times out @bw6 (memory wall)
+8,layer_norm (smolvla),real-model,5735899,5507821,1.041,NA,NA,NA,NA,NA,muon_8_beam_iters8.cpp,generated
+9,gelu (smolvla),real-model,3059220,3059220,1.000,NA,NA,NA,NA,NA,muon_9_beam_iters8.cpp,generated (==baseline)
+10,matmul_K384 (smolvla),real-model,998938,987528,1.012,377126,621812,610402,1.019,8.1,harvest best_candidate,generated; baseline already SMEM-staged
+11,attn_seq96_d72 (pi05),real-model,3465399,NA,NA,NA,NA,NA,NA,NA,sol11_baseline,no optimized best (search quota-blocked)
+12,flash_attn_seq192 (pi05),real-model,NA,NA,NA,NA,NA,NA,NA,NA,sol12_baseline,register-infeasible (>256 phys regs); dropped
+13,matmul_tall_skinny_8x256x768 (tiny_llama/rdt),real-model,3548850,NA,NA,NA,NA,NA,NA,NA,sol13_baseline,no optimized best (search quota-blocked)

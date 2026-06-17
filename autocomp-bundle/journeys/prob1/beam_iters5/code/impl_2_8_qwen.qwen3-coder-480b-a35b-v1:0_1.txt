@@ -1,0 +1,86 @@
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t CKK = a->C * a->KH * a->KW;
+  const uint32_t P = a->OH * a->OW;
+  const uint32_t smem_w = P * CKK * 4; // Weight staging area in SMEM (after patches)
+
+  // (1) Stage W flat into SMEM[smem_w..] - sequential store
+  for (uint32_t i = tid_in_threadblock; i < a->OC * CKK; i += threads_per_threadblock) {
+    store_shared(smem_w + i * 4, 0, __builtin_bit_cast(uint32_t, a->w[i]));
+  }
+
+  // (2) Gather im2col patches into SMEM[0..] using iterative induction variables
+  {
+    const uint32_t OW = a->OW;
+    const uint32_t KH = a->KH;
+    const uint32_t KW = a->KW;
+    const uint32_t HWd = a->H * a->W;
+    const uint32_t Wd = a->W;
+    const uint32_t stride = a->stride;
+    const uint32_t d_kw = threads_per_threadblock % KW;
+    const uint32_t d_kh = threads_per_threadblock / KW;
+
+    // Precalculate initial induction values for ckk starting at tid_in_threadblock
+    uint32_t c_init = tid_in_threadblock / (KH * KW);
+    uint32_t rem = tid_in_threadblock % (KH * KW);
+    uint32_t kh_init = rem / KW;
+    uint32_t kw_init = rem % KW;
+
+    for (uint32_t p = 0; p < P; p++) {
+      const uint32_t ph = p / OW;
+      const uint32_t pw = p % OW;
+      const uint32_t p_offset = (ph * stride) * Wd + pw * stride;
+
+      uint32_t c = c_init;
+      uint32_t kh = kh_init;
+      uint32_t kw = kw_init;
+
+      for (uint32_t ckk = tid_in_threadblock; ckk < CKK; ckk += threads_per_threadblock) {
+        const uint32_t in_idx = c * HWd + kh * Wd + kw + p_offset;
+        const uint32_t i = p * CKK + ckk;
+        store_shared(i * 4, 0, __builtin_bit_cast(uint32_t, a->in[in_idx]));
+
+        // Advance induction variables iteratively (No division or modulo)
+        kw += d_kw;
+        kh += d_kh;
+        if (kw >= KW) {
+          kw -= KW;
+          kh++;
+        }
+        while (kh >= KH) {
+          kh -= KH;
+          c++;
+        }
+      }
+    }
+  }
+
+  // Cross-core SMEM staging: the threadblock spans MU_NUM_CORES cores, so warps on one core
+  // read patches/W staged by warps on another. mu_barrier syncs execution but does NOT flush
+  // SMEM write buffers across cores; fence.s makes the staged writes visible before any core
+  // proceeds past the barrier to read them. Without it, RTL reads stale SMEM (cyclotron, which
+  // models SMEM as instantly coherent, does not catch this).
+  mu_barrier(0, threads_per_threadblock / MU_NUM_THREADS); // ID 0 = cross-core/cluster barrier
+
+  // (3) Frugal matmul: OUT[oc*P + p] = sum_ckk W[oc][ckk] * patch[p][ckk].
+  {
+    const uint32_t total_out = a->OC * P;
+    for (uint32_t idx = tid_in_threadblock; idx < total_out; idx += threads_per_threadblock) {
+      uint32_t wa = smem_w + (idx / P) * CKK * 4; // W base (after patches)
+      uint32_t pa = (idx % P) * CKK * 4;          // patch base (SMEM offset 0)
+      float acc = 0.0f;
+      for (uint32_t k = 0; k < CKK; k++) {
+        acc += __builtin_bit_cast(float, load32_shared(wa)) *
+               __builtin_bit_cast(float, load32_shared(pa));
+        wa += 4; pa += 4;
+      }
+      a->out[idx] = acc;
+    }
+  }
+}

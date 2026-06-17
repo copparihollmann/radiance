@@ -1,0 +1,197 @@
+```cpp
+#include <stdint.h>
+
+#define MU_NUM_THREADS 16
+
+struct KernelArgs {
+  float* A;
+  float* B;
+  float* C;
+  uint32_t M;
+  uint32_t N;
+  uint32_t K;
+};
+
+// Utility to bitcast float <-> uint32_t
+static inline float bits_to_float(uint32_t b) {
+    union { uint32_t u; float f; } c;
+    c.u = b;
+    return c.f;
+}
+static inline uint32_t float_to_bits(float f) {
+    union { uint32_t u; float f; } c;
+    c.f = f;
+    return c.u;
+}
+
+/**
+ * Optimized MatMul using 2D threadblock tiling with minimal register usage.
+ *
+ * THREAD MAPPING:
+ * - 128 threads indexed by tid_in_threadblock [0, 127]
+ * - Decomposed into 4 warps x 16 lanes, spanning 2 cores.
+ * - Logical tile: 16 rows (y) x 32 cols (x) in output C.
+ *     => 16x32 / 128 = 4 elements/thread.
+ * - Per-thread tile: vertical vector of 4 floats in a column.
+ * - Row index: r_thread = tid / 32, within tile = r_base + [0..3]
+ * - Col index: c = tid % 32
+ *
+ * DATAFLOW:
+ * - Stage A_tile (16x16) and B_tile (16x32) into SMEM cooperatively.
+ * - Cross-core writes -> barrier ID 0 (num_warps=8).
+ * - Accordion-style computation in-register.
+ * - One accumulator per element (4 total) stored in registers. Loop kept rolled.
+ *
+ * REGISTER USAGE:
+ * - Minimal register footprint (<31 distinct registers):
+ *     - ~8 for indices (tid-based)
+ *     - ~4 for accumulators
+ *     - ~4 for loop counters and bases
+ *     - Rest for temps during loading/computation
+ */
+
+static inline void kernel_body(
+    void* raw_arg,
+    uint32_t tid_in_threadblock,
+    uint32_t threads_per_threadblock,
+    uint32_t threadblock_id
+) {
+    (void)threadblock_id;
+    auto* args = reinterpret_cast<const KernelArgs*>(raw_arg);
+
+    const uint32_t M = args->M;
+    const uint32_t N = args->N;
+    const uint32_t K = args->K;
+
+    const uint32_t tid = tid_in_threadblock;
+
+    // Total number of warps in threadblock (across both cores)
+    const uint32_t num_warps = threads_per_threadblock / MU_NUM_THREADS; // 8 warps
+
+    // Shared memory layout:
+    // - smem_a: 16 rows x 16 cols x 4 bytes = 1024 bytes
+    // - smem_b: 16 rows x 32 cols x 4 bytes = 2048 bytes
+    const uint32_t smem_a = 0;
+    const uint32_t smem_b = 1024;
+
+    // Thread mapping to logical tile coordinates
+    const uint32_t r_thread = tid >> 5; // tid / 32
+    const uint32_t c = tid & 31;        // tid % 32
+    const uint32_t r_base = r_thread << 2; // r_thread * 4
+
+    // Outer loops over 16x32 sub-blocks of the output
+    for (uint32_t by = 0; by < (M + 15) / 16; ++by) {
+        const uint32_t y_base = by * 16;
+        if (y_base >= M) continue;
+
+        for (uint32_t bx = 0; bx < (N + 31) / 32; ++bx) {
+            const uint32_t x_base = bx * 32;
+            if (x_base >= N) continue;
+
+            // Accumulators for this thread's 4-element column tile
+            float acc0 = 0.0f;
+            float acc1 = 0.0f;
+            float acc2 = 0.0f;
+            float acc3 = 0.0f;
+
+            const uint32_t y_limit = (y_base + 16 > M) ? (M - y_base) : 16;
+            const uint32_t x_limit = (x_base + 32 > N) ? (N - x_base) : 32;
+
+            // Skip entire tile if out of bounds
+            if (y_limit == 0 || x_limit == 0) continue;
+
+            // K-loop blocked into 16-element segments
+            for (uint32_t k = 0; k < K; k += 16) {
+                const uint32_t k_limit = (k + 16 > K) ? (K - k) : 16;
+
+                // === Cooperatively load A_tile into SMEM ===
+                // Load 2 rows/t per thread => 128 threads cover 256 rows (max 16x16 tile)
+                // Each writes 1 row element into SMEM
+                const uint32_t a_idx1 = tid;
+                const uint32_t a_row1 = a_idx1 >> 4;
+                const uint32_t a_col1 = a_idx1 & 15;
+                if (a_row1 < 16 && a_col1 < k_limit) {
+                    const uint32_t a_addr = (y_base + a_row1) * K + k + a_col1;
+                    store_shared(smem_a + ((a_row1 * 16 + a_col1) * 4), 0,
+                                 float_to_bits(args->A[a_addr]));
+                }
+
+                const uint32_t a_idx2 = tid + 128;
+                const uint32_t a_row2 = a_idx2 >> 4;
+                const uint32_t a_col2 = a_idx2 & 15;
+                if (a_row2 < 16 && a_col2 < k_limit) {
+                    const uint32_t a_addr = (y_base + a_row2) * K + k + a_col2;
+                    store_shared(smem_a + ((a_row2 * 16 + a_col2) * 4), 0,
+                                 float_to_bits(args->A[a_addr]));
+                }
+
+                // === Cooperatively load B_tile into SMEM ===
+                // Each lane accesses its column; row is broadcasted via warp shuffle or similar logic
+                const uint32_t b_lane = tid & 31;
+                const uint32_t b_warp_quad = tid >> 5; // warp group id within tile
+
+                // Broadcast load: each warp quadrant writes 4 rows (out of possible 16)
+                uint32_t b_row_offset = b_warp_quad * 4;
+                for (int j = 0; j < 4 && (b_row_offset + j) < k_limit; ++j) {
+                    const uint32_t b_row = b_row_offset + j;
+                    const uint32_t local_b_col = b_lane;
+                    if (local_b_col < x_limit) {
+                        const uint32_t b_addr = (k + b_row) * N + x_base + local_b_col;
+                        uint32_t smem_addr = (b_row * 32 + local_b_col) * 4;
+                        store_shared(smem_b + smem_addr, 0,
+                                     float_to_bits(args->B[b_addr]));
+                    }
+                }
+
+                // Synchronize loads globally (cross-core visibility ensured)
+                mu_barrier(0, num_warps);
+
+                // === Inner product using loaded tiles ===
+                // For limited register usage, avoid full 16x unroll.
+                // Instead, use simple rolled loop.
+                for (uint32_t kk = 0; kk < k_limit; ++kk) {
+                    // Load single value of B once per iteration
+                    uint32_t b_offset = (kk * 32 + c) * 4;
+                    uint32_t b_data = load32_shared(smem_b + b_offset);
+                    float b_val = bits_to_float(b_data);
+
+                    // Load corresponding A values (broadcast-like reuse pattern)
+                    if (r_base < y_limit) {
+                        uint32_t a_off0 = ((r_base + 0) * 16 + kk) * 4;
+                        acc0 += bits_to_float(load32_shared(smem_a + a_off0)) * b_val;
+                    }
+                    if (r_base + 1 < y_limit) {
+                        uint32_t a_off1 = ((r_base + 1) * 16 + kk) * 4;
+                        acc1 += bits_to_float(load32_shared(smem_a + a_off1)) * b_val;
+                    }
+                    if (r_base + 2 < y_limit) {
+                        uint32_t a_off2 = ((r_base + 2) * 16 + kk) * 4;
+                        acc2 += bits_to_float(load32_shared(smem_a + a_off2)) * b_val;
+                    }
+                    if (r_base + 3 < y_limit) {
+                        uint32_t a_off3 = ((r_base + 3) * 16 + kk) * 4;
+                        acc3 += bits_to_float(load32_shared(smem_a + a_off3)) * b_val;
+                    }
+                }
+
+                // Re-sync before proceeding to next k-block
+                mu_barrier(0, num_warps);
+            }
+
+            // === Write results back to global memory ===
+            if (r_base < y_limit) {
+                args->C[(y_base + r_base + 0) * N + x_base + c] = acc0;
+            }
+            if (r_base + 1 < y_limit) {
+                args->C[(y_base + r_base + 1) * N + x_base + c] = acc1;
+            }
+            if (r_base + 2 < y_limit) {
+                args->C[(y_base + r_base + 2) * N + x_base + c] = acc2;
+            }
+            if (r_base + 3 < y_limit) {
+                args->C[(y_base + r_base + 3) * N + x_base + c] = acc3;
+            }
+        }
+    }
+}
+```

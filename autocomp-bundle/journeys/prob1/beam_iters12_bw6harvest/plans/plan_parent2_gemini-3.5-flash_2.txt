@@ -1,0 +1,159 @@
+Here is our plan to optimize the performance of the vision transformer patch-embedding convolution kernel:
+
+### Optimization Plan
+
+1. **Register Tiling & SMEM Reuse (Strategy 8/9)**:
+   - We will restructure the threads inside the threadblock as a $2\text{D}$ grid of $8 \times 16$ threads (representing output channels and input patches).
+   - Each thread will compute a register tile of $2 \times 1$ elements along the output channel (`OC`) and patch (`P`) dimensions. Specifically, thread `tid` will compute results for `(t_oc, t_p)` and `(t_oc + 8, t_p)`.
+   - By structuring the computation this way, both accumulated outputs share the exact same input patch elements. We can load the patch value from shared memory once, and reuse it to multiply both weight values, cutting shared memory load transactions for patches by **50%**.
+
+2. **Loop Structure & Index-Arithmetic Optimization**:
+   - In the im2col patch staging phase, we will swap the nested loops. The original code computed division and modulo arithmetic on `ckk` inside the inner loop of `p` (which executes $16$ times).
+   - Swapping the loops lets us compute the division, modulo, and global memory index offsets for `ckk` only $6$ times per thread instead of $96$ times, saving massive integer instruction overhead.
+   - We will also streamline the flat `W` matrix staging to avoid nested loop branch overhead.
+
+### Optimized Code
+
+```cpp
+#include <stdint.h>
+
+#define MU_NUM_THREADS 16
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t CKK = a->C * a->KH * a->KW;
+  const uint32_t smem_w = a->OH * a->OW * CKK * 4; // W staged AFTER patches
+
+  // (1) Stage W flat into SMEM[smem_w..], fully coalesced and streamlined
+  {
+    const uint32_t total_w = a->OC * CKK;
+    for (uint32_t i = tid_in_threadblock; i < total_w; i += threads_per_threadblock) {
+      store_shared(smem_w + i * 4, 0, __builtin_bit_cast(uint32_t, a->w[i]));
+    }
+  }
+
+  // (2) Gather im2col patches into SMEM[0..]
+  {
+    const uint32_t KH = a->KH, KW = a->KW, OW = a->OW;
+    const uint32_t Wd = a->W, HWd = a->H * Wd, stride = a->stride;
+
+    if (__builtin_constant_p(KW) && __builtin_constant_p(KH) && __builtin_constant_p(OW) &&
+        KW == 16 && KH == 16 && OW == 4) {
+      
+      const uint32_t stride_Wd = stride * Wd;
+      
+      // Swap loop order to compute heavy division/modulo operations only 6 times instead of 96 times
+      #pragma GCC unroll 1
+      for (uint32_t s = 0; s < 6; ++s) {
+        const uint32_t ckk = tid_in_threadblock + (s << 7); // s * 128
+        const uint32_t c = ckk >> 8;
+        const uint32_t kh = (ckk >> 4) & 15;
+        const uint32_t kw = ckk & 15;
+        const uint32_t c_kh_kw_offset = c * HWd + kh * Wd + kw;
+        
+        #pragma GCC unroll 1
+        for (uint32_t p = 0; p < 16; ++p) {
+          const uint32_t ph = p >> 2;
+          const uint32_t pw = p & 3;
+          const uint32_t in_idx = c_kh_kw_offset + ph * stride_Wd + pw * stride;
+          store_shared((p * 768 + ckk) * 4, 0, __builtin_bit_cast(uint32_t, a->in[in_idx]));
+        }
+      }
+    } else {
+      // Generic fallback path for arbitrary shapes
+      const uint32_t total = a->OH * OW * CKK;
+      for (uint32_t i = tid_in_threadblock; i < total; i += threads_per_threadblock) {
+        const uint32_t p = i / CKK;
+        const uint32_t ckk = i % CKK;
+        const uint32_t in_idx = (ckk / (KH * KW)) * HWd
+                              + ((p / OW) * stride + (ckk / KW) % KH) * Wd
+                              + (p % OW) * stride + ckk % KW;
+        store_shared(i * 4, 0, __builtin_bit_cast(uint32_t, a->in[in_idx]));
+      }
+    }
+  }
+
+  // Cross-core SMEM staging barrier (ID 0)
+  mu_barrier(0, threads_per_threadblock / MU_NUM_THREADS);
+
+  // (3) Matmul phase
+  {
+    const uint32_t P = a->OH * a->OW;
+    if (__builtin_constant_p(P) && P == 16) {
+      // Map 128 threads to 8 output channels x 16 patches
+      const uint32_t t_oc = tid_in_threadblock / 16;
+      const uint32_t t_p = tid_in_threadblock % 16;
+
+      const uint32_t wa0_base = smem_w + t_oc * CKK * 4;
+      const uint32_t wa1_base = smem_w + (t_oc + 8) * CKK * 4;
+      const uint32_t pa_base = t_p * CKK * 4;
+
+      float acc0 = 0.0f;
+      float acc1 = 0.0f;
+
+      // Keep variables inside scoped blocks to maximize register-allocation reuse
+      #pragma GCC unroll 1
+      for (uint32_t k = 0; k < CKK; k += 4) {
+        {
+          float p = __builtin_bit_cast(float, load32_shared(pa_base + k * 4));
+          float w0 = __builtin_bit_cast(float, load32_shared(wa0_base + k * 4));
+          float w1 = __builtin_bit_cast(float, load32_shared(wa1_base + k * 4));
+          acc0 += w0 * p;
+          acc1 += w1 * p;
+        }
+        {
+          float p = __builtin_bit_cast(float, load32_shared(pa_base + k * 4 + 4));
+          float w0 = __builtin_bit_cast(float, load32_shared(wa0_base + k * 4 + 4));
+          float w1 = __builtin_bit_cast(float, load32_shared(wa1_base + k * 4 + 4));
+          acc0 += w0 * p;
+          acc1 += w1 * p;
+        }
+        {
+          float p = __builtin_bit_cast(float, load32_shared(pa_base + k * 4 + 8));
+          float w0 = __builtin_bit_cast(float, load32_shared(wa0_base + k * 4 + 8));
+          float w1 = __builtin_bit_cast(float, load32_shared(wa1_base + k * 4 + 8));
+          acc0 += w0 * p;
+          acc1 += w1 * p;
+        }
+        {
+          float p = __builtin_bit_cast(float, load32_shared(pa_base + k * 4 + 12));
+          float w0 = __builtin_bit_cast(float, load32_shared(wa0_base + k * 4 + 12));
+          float w1 = __builtin_bit_cast(float, load32_shared(wa1_base + k * 4 + 12));
+          acc0 += w0 * p;
+          acc1 += w1 * p;
+        }
+      }
+
+      a->out[t_oc * 16 + t_p] = acc0;
+      a->out[(t_oc + 8) * 16 + t_p] = acc1;
+    } else {
+      // Generic fallback path for arbitrary shapes (unrolled by 2)
+      const uint32_t total_out = a->OC * P;
+      for (uint32_t idx = tid_in_threadblock; idx < total_out; idx += threads_per_threadblock) {
+        uint32_t wa = smem_w + (idx / P) * CKK * 4;
+        uint32_t pa = (idx % P) * CKK * 4;
+        float acc = 0.0f;
+        uint32_t k = 0;
+        for (; k + 1 < CKK; k += 2) {
+          acc += __builtin_bit_cast(float, load32_shared(wa)) *
+                 __builtin_bit_cast(float, load32_shared(pa));
+          acc += __builtin_bit_cast(float, load32_shared(wa + 4)) *
+                 __builtin_bit_cast(float, load32_shared(pa + 4));
+          wa += 8; pa += 8;
+        }
+        if (k < CKK) {
+          acc += __builtin_bit_cast(float, load32_shared(wa)) *
+                 __builtin_bit_cast(float, load32_shared(pa));
+        }
+        a->out[idx] = acc;
+      }
+    }
+  }
+}
+```

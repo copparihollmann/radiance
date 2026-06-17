@@ -1,0 +1,106 @@
+#include <stdint.h>
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+  
+  const uint32_t M = args->M;
+  const uint32_t N = args->N;
+  const uint32_t K = args->K;
+  
+  // Shared memory layout
+  const uint32_t smem_a = 0;           // 8 rows * 32 cols * 4 bytes = 1024 bytes
+  const uint32_t smem_b = 1024;        // 32 rows * 64 cols * 4 bytes = 8192 bytes
+  
+  // Thread mapping
+  const uint32_t tid = tid_in_threadblock;
+  const uint32_t warp_id = tid / 16;
+  const uint32_t lane_id = tid % 16;
+  
+  // Each thread processes one output element
+  const uint32_t tile_rows = 64;   // M dimension of our working tile
+  const uint32_t tile_cols = 64;   // N dimension of our working tile
+  const uint32_t bk = 32;          // K dimension of our working tile
+  
+  // Calculate which tile this threadblock is working on
+  const uint32_t num_m_tiles = (M + tile_rows - 1) / tile_rows;
+  const uint32_t threadblock_row = threadblock_id / ((N + tile_cols - 1) / tile_cols);
+  const uint32_t threadblock_col = threadblock_id % ((N + tile_cols - 1) / tile_cols);
+  
+  if (threadblock_row * tile_rows >= M || threadblock_col * tile_cols >= N) {
+    return; // Out of bounds
+  }
+  
+  const uint32_t start_row = threadblock_row * tile_rows;
+  const uint32_t start_col = threadblock_col * tile_cols;
+  
+  // Bounds checking
+  const uint32_t actual_tile_rows = (start_row + tile_rows > M) ? (M - start_row) : tile_rows;
+  const uint32_t actual_tile_cols = (start_col + tile_cols > N) ? (N - start_col) : tile_cols;
+  
+  // Process the tile one row at a time to keep register pressure low
+  for (uint32_t outer_row = 0; outer_row < actual_tile_rows; outer_row++) {
+    const uint32_t global_row = start_row + outer_row;
+    
+    // Each thread computes one element of the output row
+    for (uint32_t col_offset = 0; col_offset < actual_tile_cols; col_offset += 16) {
+      const uint32_t local_col = col_offset + lane_id;
+      if (local_col >= actual_tile_cols) continue;
+      
+      const uint32_t global_col = start_col + local_col;
+      float accumulator = 0.0f;
+      
+      // Iterate over K in chunks
+      for (uint32_t k = 0; k < K; k += bk) {
+        const uint32_t actual_bk = (k + bk > K) ? (K - k) : bk;
+        
+        // Cooperatively load A tile (8x32 elements, but we only need 1 row)
+        // Each thread loads 2 elements
+        uint32_t a_base_offset = (outer_row * 32);
+        if (tid < actual_bk) {
+          uint32_t a_addr = (global_row * K) + (k + tid);
+          if (a_addr < M * K) {
+            float a_val = args->A[a_addr];
+            store_shared(smem_a, (a_base_offset + tid) * 4, __builtin_bit_cast(uint32_t, a_val));
+          }
+        }
+        
+        // Cooperatively load B tile (32x64 elements -> 32x16 per thread group)
+        // Each of 16 threads loads 2 elements per row
+        for (uint32_t bk_idx = 0; bk_idx < actual_bk; bk_idx++) {
+          uint32_t b_row = k + bk_idx;
+          uint32_t b_col = global_col;
+          uint32_t b_addr_linear = b_row * N + b_col;
+          
+          if (b_row < K && b_col < N) {
+            float b_val = args->B[b_addr_linear];
+            store_shared(smem_b, (bk_idx * 64 + local_col) * 4, __builtin_bit_cast(uint32_t, b_val));
+          }
+        }
+        
+        // Synchronize to ensure all SMEM writes are complete
+        mu_barrier(0, 8); // Cross-core barrier for 8 warps total
+        
+        // Compute partial dot product
+        for (uint32_t kk = 0; kk < actual_bk; kk++) {
+          float a_val = __builtin_bit_cast(float, load32_shared(smem_a + (a_base_offset + kk) * 4));
+          float b_val = __builtin_bit_cast(float, load32_shared(smem_b + (kk * 64 + local_col) * 4));
+          accumulator += a_val * b_val;
+        }
+        
+        // Synchronize before next iteration
+        mu_barrier(0, 8);
+      }
+      
+      // Write result
+      if (global_row < M && global_col < N) {
+        args->C[global_row * N + global_col] = accumulator;
+      }
+    }
+  }
+}

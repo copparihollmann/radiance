@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nned int')\n  122 |     float max_val = *(float*)&load32_shared(smem_s + row_offset);\n      |                              ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:124:28: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  124 |       float val = *(float*)&load32_shared(smem_s + row_offset + j * 4);\n      |                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:131:28: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  131 |       float val = *(float*)&load32_shared(smem_s + row_offset + j * 4);\n      |                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:140:32: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  140 |       float exp_val = *(float*)&load32_shared(smem_s + row_offset + j * 4);\n      |                                ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:163:30: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  163 |       float p_val = *(float*)&load32_shared(s_base + j * 4);\n      |                              ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nkernel.cpp:164:30: error: cannot take the address of an rvalue of type 'uint32_t' (aka 'unsigned int')\n  164 |       float v_val = *(float*)&load32_shared(v_base + j * 4);\n      |                              ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n8 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

@@ -1,0 +1,115 @@
+```cpp
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t CKK = a->C * a->KH * a->KW;
+  const uint32_t smem_w = a->OH * a->OW * CKK * 4; // W staged AFTER patches
+
+  // (1) Stage W[OC][CKK] flat into SMEM[smem_w..].
+  for (uint32_t i = tid_in_threadblock; i < a->OC * CKK; i += threads_per_threadblock) {
+    store_shared(smem_w + i * 4, 0, __builtin_bit_cast(uint32_t, a->w[i]));
+  }
+
+  // (2) Gather im2col patches into SMEM[0..] using shift/mask optimizations
+  {
+    const uint32_t KH = a->KH, KW = a->KW, OW = a->OW;
+    const uint32_t Wd = a->W, HWd = a->H * Wd, stride = a->stride;
+
+    // Specialize for ViT patch embedding config: KH=16, KW=16, OW=4
+    if (__builtin_expect(KW == 16 && KH == 16 && OW == 4, 1)) {
+      const uint32_t OH = a->OH;
+      for (uint32_t ph = 0; ph < OH; ++ph) {
+        const uint32_t ph_off = ph * stride * Wd;
+        for (uint32_t pw = 0; pw < 4; ++pw) {
+          const uint32_t p = (ph << 2) + pw; // ph * 4 + pw
+          const uint32_t pw_off = pw * stride;
+          const uint32_t smem_p_base = p * CKK * 4;
+
+          for (uint32_t ckk = tid_in_threadblock; ckk < CKK; ckk += threads_per_threadblock) {
+            const uint32_t c = ckk >> 8;              // ckk / 256
+            const uint32_t kh = (ckk >> 4) & 0xF;     // (ckk / 16) % 16
+            const uint32_t kw = ckk & 0xF;            // ckk % 16
+            const uint32_t in_idx = c * HWd + ph_off + kh * Wd + pw_off + kw;
+            store_shared(smem_p_base + ckk * 4, 0, __builtin_bit_cast(uint32_t, a->in[in_idx]));
+          }
+        }
+      }
+    } else {
+      // Generic fallback path
+      const uint32_t total = a->OH * OW * CKK;
+      for (uint32_t i = tid_in_threadblock; i < total; i += threads_per_threadblock) {
+        const uint32_t p = i / CKK;
+        const uint32_t ckk = i % CKK;
+        const uint32_t in_idx = (ckk / (KH * KW)) * HWd +
+                                ((p / OW) * stride + (ckk / KW) % KH) * Wd +
+                                (p % OW) * stride + (ckk % KW);
+        store_shared(i * 4, 0, __builtin_bit_cast(uint32_t, a->in[in_idx]));
+      }
+    }
+  }
+
+  // Cross-core SMEM staging barrier
+  mu_barrier(0, threads_per_threadblock / MU_NUM_THREADS);
+
+  // (3) Frugal matmul: OUT[oc][p] = sum_ckk W[oc][ckk] * patch[p][ckk]
+  {
+    const uint32_t P = a->OH * a->OW;
+
+    // Optimize for P=16 (ViT patch embedding)
+    if (__builtin_expect(P == 16, 1)) {
+      const uint32_t total_out = a->OC * 16;
+      for (uint32_t idx = tid_in_threadblock; idx < total_out; idx += threads_per_threadblock) {
+        const uint32_t oc = idx >> 4;             // idx / 16
+        const uint32_t p = idx & 0xF;             // idx % 16
+
+        uint32_t w_addr = smem_w + oc * CKK * 4;
+        uint32_t p_addr = p * CKK * 4;
+        float acc = 0.0f;
+
+        // Mild unroll x2 to help hide smem load latency
+        uint32_t k = 0;
+        for (; k + 1 < CKK; k += 2) {
+          const float w0 = __builtin_bit_cast(float, load32_shared(w_addr + 0));
+          const float p0 = __builtin_bit_cast(float, load32_shared(p_addr + 0));
+          const float w1 = __builtin_bit_cast(float, load32_shared(w_addr + 4));
+          const float p1 = __builtin_bit_cast(float, load32_shared(p_addr + 4));
+          acc += w0 * p0 + w1 * p1;
+          w_addr += 8;
+          p_addr += 8;
+        }
+        if (k < CKK) {
+          acc += __builtin_bit_cast(float, load32_shared(w_addr)) *
+                 __builtin_bit_cast(float, load32_shared(p_addr));
+        }
+
+        a->out[idx] = acc;
+      }
+    } else {
+      // Generic fallback
+      const uint32_t total_out = a->OC * P;
+      for (uint32_t idx = tid_in_threadblock; idx < total_out; idx += threads_per_threadblock) {
+        const uint32_t oc = idx / P;
+        const uint32_t p = idx % P;
+
+        uint32_t w_addr = smem_w + oc * CKK * 4;
+        uint32_t p_addr = p * CKK * 4;
+        float acc = 0.0f;
+
+        for (uint32_t k = 0; k < CKK; ++k) {
+          acc += __builtin_bit_cast(float, load32_shared(w_addr)) *
+                 __builtin_bit_cast(float, load32_shared(p_addr));
+          w_addr += 4;
+          p_addr += 4;
+        }
+
+        a->out[idx] = acc;
+      }
+    }
+  }
+}
+```

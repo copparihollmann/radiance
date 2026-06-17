@@ -1,0 +1,75 @@
+```cpp
+#include <cstdint>
+
+// Efficient bit-cast from uint32_t to float
+inline float bits_to_float(uint32_t bits) {
+  return __builtin_bit_cast(float, bits);
+}
+
+// Load 32-bit word from shared memory with immediate offset
+inline uint32_t load32_shared_offset(uint32_t address, uint32_t offset) {
+  uint32_t data;
+  asm volatile("lw.shared %0, %1(%2)" : "=r"(data) : "I"(offset), "r"(address) : "memory");
+  return data;
+}
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  // Define SMEM layouts
+  const uint32_t smem_a = 0;
+  const uint32_t smem_b = 16384; // 16 KiB offset for B matrix (transposed + padded)
+
+  // 1. Cooperatively load A into SMEM (row-major)
+  for (uint32_t i = tid_in_threadblock; i < 4096; i += threads_per_threadblock) {
+    uint32_t val;
+    asm volatile("lw.global %0, 0(%1)" : "=r"(val) : "r"(&args->A[i]) : "memory");
+    store_shared(smem_a, i * 4, val);
+  }
+
+  // 2. Cooperatively load B into SMEM (transposed + padded)
+  for (uint32_t i = tid_in_threadblock; i < 4096; i += threads_per_threadblock) {
+    uint32_t val;
+    asm volatile("lw.global %0, 0(%1)" : "=r"(val) : "r"(&args->B[i]) : "memory");
+    uint32_t k = i >> 6;      // i / 64
+    uint32_t n = i & 63;      // i % 64
+    store_shared(smem_b, (n * 65 + k) * 4, val); // Transpose and pad by 1 to avoid bank conflicts
+  }
+
+  // Cross-core synchronization after SMEM staging
+  mu_barrier(0, threads_per_threadblock / 16); // 8 warps total
+
+  // 3. Compute outputs with conflict-free access pattern
+  for (uint32_t idx = tid_in_threadblock; idx < 4096; idx += threads_per_threadblock) {
+    uint32_t m = idx >> 6;   // row index
+    uint32_t n0 = idx & 63;  // base column index
+
+    // Register accumulator (only one to stay under register limit)
+    float acc = 0.0f;
+
+    // Shared memory pointers
+    uint32_t a_base = smem_a + m * 64 * 4;
+    uint32_t b_base = smem_b + n0 * 65 * 4;
+
+    // Inner product loop with manual unrolling by 2 to increase ILP while keeping registers low
+    for (uint32_t k = 0; k < 64; k += 2) {
+      float a0 = bits_to_float(load32_shared_offset(a_base, k * 4));
+      float b0 = bits_to_float(load32_shared_offset(b_base, k * 4));
+      acc += a0 * b0;
+
+      float a1 = bits_to_float(load32_shared_offset(a_base, (k + 1) * 4));
+      float b1 = bits_to_float(load32_shared_offset(b_base, (k + 1) * 4));
+      acc += a1 * b1;
+    }
+
+    // Write result directly to global memory
+    args->C[idx] = acc;
+  }
+}
+```

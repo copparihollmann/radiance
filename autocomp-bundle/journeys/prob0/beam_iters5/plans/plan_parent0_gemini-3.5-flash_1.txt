@@ -1,0 +1,84 @@
+An elegant and highly effective optimization for this phase is **Strategy 11: Template-Specialize Kernel Shapes to Eliminate Modulo Arithmetic**. 
+
+### Inefficiency in the Baseline Kernel
+In the baseline kernel, every thread computes its 2D coordinates `row` and `col` from a 1D index using division and modulo operations:
+```cpp
+const uint32_t row = idx / args->N;
+const uint32_t col = idx % args->N;
+```
+On RISC-V (RV32IM), integer division (`div`) and remainder (`rem`) instructions are exceptionally slow (often taking up to 32 cycles each) and put significant pressure on the limited register file. This is particularly problematic since these instructions must execute 32 times per thread (4096 total elements divided across 128 threads).
+
+### Optimization Plan
+1. **Template Specialization**: We will define a helper function templated on the matrix dimensions `M`, `N`, and `K`. 
+2. **Compile-Time Constant Propagation**: When the matrix dimensions are known compile-time constants (e.g., `N = 64` and `K = 64`), the compiler will automatically optimize away all division, modulo, and multiplication operations:
+   - `idx / 64` is compiled into a fast bitwise right-shift instruction: `idx >> 6` (1 cycle).
+   - `idx % 64` is compiled into a fast bitwise AND instruction: `idx & 63` (1 cycle).
+   - `row * 64` and `k * 64` are compiled into fast bitwise left-shifts: `row << 6` and `k << 6` (1 cycle).
+3. **Register-Saving Fallback**: This strategy keeps register pressure extremely low, well within the target's strict limit of <= 31 distinct registers, while completely avoiding complex address-arithmetic instructions. We will include a fallback path to preserve generality.
+
+Here is the high-performance, template-specialized implementation.
+
+```cpp
+#include <stdint.h>
+
+// Assuming KernelArgs struct layout matches the harness
+struct KernelArgs {
+  float* A;
+  float* B;
+  float* C;
+  uint32_t M;
+  uint32_t N;
+  uint32_t K;
+};
+
+template <uint32_t M, uint32_t N, uint32_t K>
+__attribute__((always_inline))
+static inline void kernel_body_templated(
+  KernelArgs* args,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock
+) {
+  const uint32_t total = M * N;
+
+  for (uint32_t idx = tid_in_threadblock; idx < total; idx += threads_per_threadblock) {
+    const uint32_t row = idx / N;  // Optimized to: idx >> log2(N)
+    const uint32_t col = idx % N;  // Optimized to: idx & (N - 1)
+    
+    float acc = 0.0f;
+    const float* a_ptr = &args->A[row * K]; // Optimized to: row << log2(K)
+    
+    for (uint32_t k = 0; k < K; k++) {
+      acc += a_ptr[k] * args->B[k * N + col]; // k * N optimized to: k << log2(N)
+    }
+    args->C[idx] = acc;
+  }
+}
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  // Dispatch to the specialized 64x64x64 template to eliminate costly div/rem operations
+  if (args->M == 64 && args->N == 64 && args->K == 64) {
+    kernel_body_templated<64, 64, 64>(args, tid_in_threadblock, threads_per_threadblock);
+  } else {
+    // Dynamic fallback path for arbitrary shapes
+    const uint32_t total = args->M * args->N;
+    for (uint32_t idx = tid_in_threadblock; idx < total; idx += threads_per_threadblock) {
+      const uint32_t row = idx / args->N;
+      const uint32_t col = idx % args->N;
+      float acc = 0.0f;
+      const float* a_ptr = &args->A[row * args->K];
+      for (uint32_t k = 0; k < args->K; k++) {
+        acc += a_ptr[k] * args->B[k * args->N + col];
+      }
+      args->C[idx] = acc;
+    }
+  }
+}
+```

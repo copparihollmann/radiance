@@ -1,0 +1,83 @@
+```cpp
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  const uint32_t M = args->M;
+  const uint32_t N = args->N;
+  const uint32_t K = args->K;
+
+  // Use shared memory to stage A and B
+  // Assumes M=N=K=64 for this optimized version
+  const uint32_t smem_a_base = 0x00000000;
+  const uint32_t smem_b_base = 0x00004000; // 16 KB after A
+
+  const uint32_t padded_K = K + 16; // Bank conflict avoidance for B
+
+  const uint32_t warp_id = tid_in_threadblock / 16;
+  const uint32_t lane_id = tid_in_threadblock % 16;
+
+  const __global float* a = args->A;
+  const __global float* b = args->B;
+  float* c = args->C;
+
+  // Cooperative load of A into SMEM: each thread loads 8 elements (64*64 -> 128 threads, 32 elements each)
+  // But we need 64*64=4096 elements, 128 threads => 32 elements per thread
+  // We can do 2 rows per thread: 2 * 64 = 128 floats = 32 32-bit words
+  for (uint32_t i = 0; i < 32; ++i) {
+    uint32_t idx = tid_in_threadblock * 32 + i;
+    if (idx < 64 * 64) {
+      uint32_t row = idx / 64;
+      uint32_t col = idx % 64;
+      uint32_t addr = smem_a_base + (row * 64 + col) * sizeof(float);
+      float val = a[idx];
+      asm volatile("sw.shared %1, 0(%0)" :: "r"(addr), "r"(val) : "memory");
+    }
+  }
+
+  // Cooperative load of B into SMEM: same logic
+  for (uint32_t i = 0; i < 32; ++i) {
+    uint32_t idx = tid_in_threadblock * 32 + i;
+    if (idx < 64 * 64) {
+      uint32_t row = idx / 64;
+      uint32_t col = idx % 64;
+      uint32_t addr = smem_b_base + (row * padded_K + col) * sizeof(float);
+      float val = b[idx];
+      asm volatile("sw.shared %1, 0(%0)" :: "r"(addr), "r"(val) : "memory");
+    }
+  }
+
+  // Cross-core barrier: ensure both cores see all SMEM data
+  mu_barrier(0, 8);
+
+  // Now compute output
+  uint32_t out_row = tid_in_threadblock / 64;
+  uint32_t out_col = tid_in_threadblock % 64;
+
+  if (out_row < M && out_col < N) {
+    float acc = 0.0f;
+    uint32_t a_row_addr = smem_a_base + out_row * 64 * sizeof(float);
+    uint32_t b_col_base = smem_b_base + out_col * sizeof(float);
+    
+    // Main loop over K with interleaved addressing/compute
+    uint32_t a_ptr = a_row_addr;
+    uint32_t b_ptr = b_col_base;
+    for (uint32_t k = 0; k < K; ++k) {
+      float aval, bval;
+      asm volatile("lw.shared %0, 0(%1)" : "=r"(aval) : "r"(a_ptr) : "memory");
+      asm volatile("lw.shared %0, 0(%1)" : "=r"(bval) : "r"(b_ptr) : "memory");
+      
+      acc += aval * bval;
+      
+      a_ptr += sizeof(float);
+      b_ptr += padded_K * sizeof(float);
+    }
+    c[out_row * N + out_col] = acc;
+  }
+}
+```

@@ -1,0 +1,118 @@
+An elegant and highly effective way to optimize this kernel within the strict register-budget limits of the hardware is to apply **Strategy 6: Eliminate expensive division and modulo (`/`, `%`) operations in the index calculation of the im2col/gather phase.**
+
+### Inefficiency Analysis
+In the original gather phase, each thread computes:
+```cpp
+const uint32_t p = i / CKK;
+const uint32_t ckk = i % CKK;
+const uint32_t in_idx = (ckk / (KH * KW)) * HWd
+                      + ((p / OW) * stride + (ckk / KW) % KH) * Wd
+                      + (p % OW) * stride + ckk % KW;
+```
+On RISC-V targets, integer division and modulo operations are extremely slow. Because the dimensions (`KH`, `KW`, `OW`, `CKK`) are runtime variables passed via the argument struct, the compiler cannot optimize them to bitwise shifts or masks. These dynamic divisions occur inside the inner loop for every single loaded element, creating a massive compute bottleneck.
+
+### Optimization Plan
+1. **Specialized Power-of-Two Fast-Path**: For the standard Vision Transformer patch-embedding configuration (where `KW = 16`, `KH = 16`, and `OW = 4`), we can replace all dynamic division and modulo operations with extremely fast bitwise shifts and logical `AND` operators.
+2. **Loop Refactoring**: We decompose the flat 1D loop of the gather phase into nested loops over the spatial dimensions `ph` and `pw`. This completely avoids the need to divide or modulo the patch index `p` to find its spatial components.
+3. **Specialized Matmul Phase**: We apply the same optimization to the index mapping in the matmul phase. For the standard configuration where the number of patches $P = 16$, the division and modulo operations `idx / P` and `idx % P` are replaced with `idx >> 4` and `idx & 15`.
+4. **Register-Frugal Unrolling**: We use a mild unroll factor of 2 in the inner loop of the matmul phase. This helps hide shared memory load latency while strictly staying under the 31-register limit.
+
+Here is the complete, highly-optimized implementation:
+
+```cpp
+#include <stdint.h>
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t CKK = a->C * a->KH * a->KW;
+  const uint32_t smem_w = a->OH * a->OW * CKK * 4; // W staged AFTER patches
+
+  // (1) stage W flat into SMEM[smem_w..].
+  {
+    const uint32_t total_w = a->OC * CKK;
+    for (uint32_t i = tid_in_threadblock; i < total_w; i += threads_per_threadblock) {
+      store_shared(smem_w + i * 4, 0, __builtin_bit_cast(uint32_t, a->w[i]));
+    }
+  }
+
+  // (2) gather im2col patches into SMEM[0..] (eliminating div/mod)
+  {
+    const uint32_t KH = a->KH, KW = a->KW, OW = a->OW;
+    const uint32_t Wd = a->W, HWd = a->H * Wd, stride = a->stride;
+
+    if (KW == 16 && KH == 16 && OW == 4) {
+      const uint32_t OH = a->OH;
+      for (uint32_t ph = 0; ph < OH; ++ph) {
+        const uint32_t ph_stride_Wd = ph * stride * Wd;
+        for (uint32_t pw = 0; pw < 4; ++pw) {
+          const uint32_t p = ph * 4 + pw;
+          const uint32_t pw_stride = pw * stride;
+          const uint32_t smem_p_base = p * CKK * 4;
+          for (uint32_t ckk = tid_in_threadblock; ckk < CKK; ckk += threads_per_threadblock) {
+            const uint32_t c = ckk >> 8;           // ckk / 256
+            const uint32_t kh = (ckk >> 4) & 15;    // (ckk / 16) % 16
+            const uint32_t kw = ckk & 15;           // ckk % 16
+            const uint32_t in_idx = c * HWd + ph_stride_Wd + kh * Wd + pw_stride + kw;
+            store_shared(smem_p_base + ckk * 4, 0, __builtin_bit_cast(uint32_t, a->in[in_idx]));
+          }
+        }
+      }
+    } else {
+      // Generic fallback path for arbitrary shapes
+      const uint32_t total = a->OH * OW * CKK;
+      for (uint32_t i = tid_in_threadblock; i < total; i += threads_per_threadblock) {
+        const uint32_t p = i / CKK;
+        const uint32_t ckk = i % CKK;
+        const uint32_t in_idx = (ckk / (KH * KW)) * HWd
+                              + ((p / OW) * stride + (ckk / KW) % KH) * Wd
+                              + (p % OW) * stride + ckk % KW;
+        store_shared(i * 4, 0, __builtin_bit_cast(uint32_t, a->in[in_idx]));
+      }
+    }
+  }
+
+  // Cross-core SMEM staging barrier
+  mu_fence_smem();
+  mu_barrier(0, threads_per_threadblock / MU_NUM_THREADS); // ID 0 = cross-core/cluster barrier
+
+  // (3) frugal matmul: OUT[oc*P + p] = sum_ckk W[oc][ckk] * patch[p][ckk].
+  {
+    const uint32_t P = a->OH * a->OW;
+    if (P == 16) {
+      const uint32_t total_out = a->OC * 16;
+      for (uint32_t idx = tid_in_threadblock; idx < total_out; idx += threads_per_threadblock) {
+        uint32_t wa = smem_w + (idx >> 4) * CKK * 4; // W base (idx / 16)
+        uint32_t pa = (idx & 15) * CKK * 4;          // patch base (idx % 16)
+        float acc = 0.0f;
+        #pragma unroll 2
+        for (uint32_t k = 0; k < CKK; k++) {
+          acc += __builtin_bit_cast(float, load32_shared(wa)) *
+                 __builtin_bit_cast(float, load32_shared(pa));
+          wa += 4; pa += 4;
+        }
+        a->out[idx] = acc;
+      }
+    } else {
+      // Generic fallback path for arbitrary shapes
+      const uint32_t total_out = a->OC * P;
+      for (uint32_t idx = tid_in_threadblock; idx < total_out; idx += threads_per_threadblock) {
+        uint32_t wa = smem_w + (idx / P) * CKK * 4; // W base
+        uint32_t pa = (idx % P) * CKK * 4;          // patch base
+        float acc = 0.0f;
+        for (uint32_t k = 0; k < CKK; k++) {
+          acc += __builtin_bit_cast(float, load32_shared(wa)) *
+                 __builtin_bit_cast(float, load32_shared(pa));
+          wa += 4; pa += 4;
+        }
+        a->out[idx] = acc;
+      }
+    }
+  }
+}
+```

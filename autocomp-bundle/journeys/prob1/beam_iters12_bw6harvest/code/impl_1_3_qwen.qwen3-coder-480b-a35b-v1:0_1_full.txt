@@ -1,0 +1,102 @@
+```cpp
+#include <mu_intrinsics.h>
+#include <mu_schedule.h>
+#include <stdint.h>
+
+// Assuming KernelArgs struct layout is defined as follows in the harness:
+struct KernelArgs {
+  __global float* in;
+  __global float* w;
+  __global float* out;
+  uint32_t C;
+  uint32_t H;
+  uint32_t W;
+  uint32_t KH;
+  uint32_t KW;
+  uint32_t OC;
+  uint32_t OH;
+  uint32_t OW;
+  uint32_t stride;
+};
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  // Vision Transformer Patch-Embedding Tile Dimensions
+  constexpr uint32_t OC = 16;
+  constexpr uint32_t CKK = 768;
+  constexpr uint32_t CKK_PADDED = 769; // Pad to prevent 16-bank conflict
+  constexpr uint32_t P = 16;
+  constexpr uint32_t OW = 4;
+  constexpr uint32_t KH = 16;
+  constexpr uint32_t KW = 16;
+  constexpr uint32_t HWd = 64 * 64;
+  constexpr uint32_t Wd = 64;
+  constexpr uint32_t stride = 16;
+
+  // Shared memory layout
+  constexpr uint32_t SMEM_W_BASE = 0;
+  constexpr uint32_t SMEM_IN_BASE = OC * CKK_PADDED * 4; // After W staging area
+
+  // (1) Stage W (weights) into shared memory with padding to avoid bank conflicts
+  {
+    uint32_t w_shared_base = SMEM_W_BASE;
+    for (uint32_t oc = 0; oc < OC; ++oc) {
+      for (uint32_t k = tid_in_threadblock; k < CKK; k += threads_per_threadblock) {
+        store_shared(w_shared_base + k * 4, 0, __builtin_bit_cast(uint32_t, a->w[oc * CKK + k]));
+      }
+      w_shared_base += CKK_PADDED * 4;
+    }
+  }
+
+  // (2) Restructured gather of im2col patches into shared memory with padding
+  {
+    uint32_t p_shared_base = SMEM_IN_BASE;
+    for (uint32_t p = 0; p < P; ++p) {
+      const uint32_t p_div_OW = p / OW;
+      const uint32_t p_mod_OW = p % OW;
+      const uint32_t h_base = p_div_OW * stride;
+      const uint32_t w_base = p_mod_OW * stride;
+
+      for (uint32_t ckk = tid_in_threadblock; ckk < CKK; ckk += threads_per_threadblock) {
+        const uint32_t c = ckk / (KH * KW);
+        const uint32_t rem = ckk % (KH * KW);
+        const uint32_t kh = rem / KW;
+        const uint32_t kw = rem % KW;
+
+        const uint32_t in_idx = c * HWd + (h_base + kh) * Wd + (w_base + kw);
+        store_shared(p_shared_base + ckk * 4, 0, __builtin_bit_cast(uint32_t, a->in[in_idx]));
+      }
+      p_shared_base += CKK_PADDED * 4;
+    }
+  }
+
+  // Cross-core synchronization: ensure all SMEM writes are visible
+  mu_barrier(0, threads_per_threadblock / MU_NUM_THREADS);
+
+  // (3) Matrix multiplication with optimized memory access and reduced register usage
+  for (uint32_t idx = tid_in_threadblock; idx < OC * P; idx += threads_per_threadblock) {
+    const uint32_t oc = idx / P;
+    const uint32_t p = idx % P;
+
+    uint32_t wa = SMEM_W_BASE + oc * CKK_PADDED * 4;
+    uint32_t pa = SMEM_IN_BASE + p * CKK_PADDED * 4;
+    float acc = 0.0f;
+
+    #pragma GCC unroll 4
+    for (uint32_t k = 0; k < CKK; ++k) {
+      acc += __builtin_bit_cast(float, load32_shared(wa)) *
+             __builtin_bit_cast(float, load32_shared(pa));
+      wa += 4;
+      pa += 4;
+    }
+    a->out[idx] = acc;
+  }
+}
+```

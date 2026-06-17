@@ -1,0 +1,126 @@
+```cpp
+#include <stdint.h>
+
+// KernelArgs is defined by the harness, do not redefine
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  
+  const uint32_t C = a->C;      // 3
+  const uint32_t H = a->H;      // 34
+  const uint32_t W = a->W;      // 34
+  const uint32_t OC = a->OC;    // 16
+  const uint32_t OH = a->OH;    // 16
+  const uint32_t OW = a->OW;    // 4
+  const uint32_t KH = a->KH;    // 16
+  const uint32_t KW = a->KW;    // 16
+  const uint32_t stride = a->stride; // 1
+
+  const uint32_t P = OH * OW;             // 16 * 4 = 64
+  const uint32_t CKK = C * KH * KW;       // 3 * 16 * 16 = 768
+  const uint32_t smem_w_offset = CKK * P * 4; // 768 * 64 * 4 = 0x30000 (192 KB)
+
+  // (1) Stage W[oc][ckk] into SMEM[smem_w_offset ..]
+  for (uint32_t i = tid_in_threadblock; i < OC * CKK; i += threads_per_threadblock) {
+    // Address = base + (i * 4)
+    uint32_t addr = smem_w_offset + (i << 2);
+    store_shared(addr, 0, __builtin_bit_cast(uint32_t, a->w[i]));
+  }
+
+  // (2) Gather im2col patch matrix into SMEM[0 .. smem_w_offset-1] with transposed layout [CKK][P]
+  {
+    const uint32_t HWd = H * W;
+    const uint32_t Wd = W;
+
+    // Coordinate tracking initialization
+    uint32_t p = 0;
+    uint32_t ckk = tid_in_threadblock;
+
+    for (uint32_t i = tid_in_threadblock; i < P * CKK; i += threads_per_threadblock) {
+      // Decompose ckk into c, kh, kw
+      // ckk = c * KH * KW + kh * KW + kw
+      // Since KH=16, KW=16 (powers of 2):
+      uint32_t c = ckk >> 8;                     // ckk / 256
+      uint32_t kh = (ckk >> 4) & 0xF;            // (ckk / 16) % 16
+      uint32_t kw = ckk & 0xF;                   // ckk % 16
+
+      // Decompose p into ph, pw
+      // p = ph * OW + pw
+      uint32_t ph = p >> 2;                      // p / 4
+      uint32_t pw = p & 0x3;                     // p % 4
+
+      // Calculate input index
+      // in_idx = c*(H*W) + (ph*stride + kh)*W + (pw*stride + kw)
+      uint32_t h_idx = (ph * stride + kh) * Wd;
+      uint32_t w_idx = pw * stride + kw;
+      uint32_t in_idx = c * HWd + h_idx + w_idx;
+
+      // Store into transposed SMEM layout: [CKK][P]
+      // Address = (ckk * P + p) * 4
+      uint32_t smem_addr = ((ckk << 6) + p) << 2; // Equivalent to (ckk * 64 + p) * 4
+      store_shared(smem_addr, 0, __builtin_bit_cast(uint32_t, a->in[in_idx]));
+
+      // Increment loop counters
+      ckk += threads_per_threadblock;
+      if (ckk >= CKK) {
+        ckk -= CKK;
+        p++;
+        if (p >= P) break; // Safety check to prevent overruns
+      }
+    }
+  }
+
+  // Cross-core synchronization: use barrier ID 0 for visibility across cores
+  mu_barrier(0, threads_per_threadblock / MU_NUM_THREADS);
+
+  // (3) Conflict-free matmul: OUT[oc][p] = sum_ckk W[oc][ckk] * patch[p][ckk]
+  {
+    for (uint32_t idx = tid_in_threadblock; idx < OC * P; idx += threads_per_threadblock) {
+      uint32_t oc = idx >> 6;               // idx / P = idx / 64
+      uint32_t p  = idx & 0x3F;             // idx % P = idx % 64
+
+      // Base addresses in SMEM:
+      // W base: oc * CKK * 4 = oc * 768 * 4
+      uint32_t wa_base = smem_w_offset + (oc * CKK << 2);
+      // Patch base: p * 4 (transposed layout)
+      uint32_t pa_base = p << 2;
+
+      float acc = 0.0f;
+      uint32_t wa = wa_base;
+      uint32_t pa = pa_base;
+
+      // Main loop - unroll by 4 to balance ILP and register usage
+      uint32_t k = 0;
+      for (; k + 3 < CKK; k += 4) {
+        acc += __builtin_bit_cast(float, load32_shared(wa + 0)) *
+               __builtin_bit_cast(float, load32_shared(pa + 0));
+        acc += __builtin_bit_cast(float, load32_shared(wa + 4)) *
+               __builtin_bit_cast(float, load32_shared(pa + 64));
+        acc += __builtin_bit_cast(float, load32_shared(wa + 8)) *
+               __builtin_bit_cast(float, load32_shared(pa + 128));
+        acc += __builtin_bit_cast(float, load32_shared(wa + 12)) *
+               __builtin_bit_cast(float, load32_shared(pa + 192));
+
+        wa += 16;
+        pa += 256; // P * 4 * 4 strides = 64 * 4 = 256
+      }
+
+      // Handle remainder
+      for (; k < CKK; k++) {
+        acc += __builtin_bit_cast(float, load32_shared(wa)) *
+               __builtin_bit_cast(float, load32_shared(pa));
+        wa += 4;
+        pa += 64;
+      }
+
+      a->out[idx] = acc;
+    }
+  }
+}
+```

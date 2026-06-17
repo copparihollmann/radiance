@@ -1,0 +1,166 @@
+```cpp
+#include <stdint.h>
+
+#define MU_NUM_THREADS 16
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t CKK = a->C * a->KH * a->KW;
+
+  // Padding the inner dimension from 768 to 784 (next multiple of 16) to completely eliminate bank conflicts
+  const uint32_t CKK_PADDED = (CKK + 15) & ~15;
+  const uint32_t smem_w = a->OH * a->OW * CKK_PADDED * 4; // W staged AFTER patches
+
+  // (1) stage W flat into SMEM[smem_w..], unrolled by 4
+  {
+    const uint32_t total_w = a->OC * CKK;
+    const uint32_t step = threads_per_threadblock * 4;
+    for (uint32_t i = tid_in_threadblock; i < total_w; i += step) {
+      #pragma GCC unroll 1
+      for (uint32_t s = 0; s < 4; ++s) {
+        const uint32_t offset = s * threads_per_threadblock;
+        if (i + offset < total_w) {
+          const uint32_t oc = (i + offset) / CKK;
+          const uint32_t ckk = (i + offset) % CKK;
+          store_shared(smem_w + (oc * CKK_PADDED + ckk) * 4, 0, __builtin_bit_cast(uint32_t, a->w[i + offset]));
+        }
+      }
+    }
+  }
+
+  // (2) gather im2col patches into SMEM[0..]
+  {
+    const uint32_t KH = a->KH, KW = a->KW, OW = a->OW;
+    const uint32_t Wd = a->W, HWd = a->H * Wd, stride = a->stride;
+
+    if (__builtin_constant_p(KW) && __builtin_constant_p(KH) && __builtin_constant_p(OW) &&
+        KW == 16 && KH == 16 && OW == 4) {
+      
+      const uint32_t OH = a->OH;
+      for (uint32_t ph = 0; ph < OH; ++ph) {
+        const uint32_t ph_stride_Wd = ph * stride * Wd;
+        for (uint32_t pw = 0; pw < 4; ++pw) {
+          const uint32_t p = ph * 4 + pw;
+          const uint32_t pw_stride = pw * stride;
+          const uint32_t smem_p_base = p * CKK_PADDED * 4;
+          
+          // Unrolled by 6 with no bounds check since CKK=768 and threads=128
+          #pragma GCC unroll 1
+          for (uint32_t s = 0; s < 6; ++s) {
+            const uint32_t ckk = tid_in_threadblock + s * 128;
+            if (ckk < CKK) {
+              const uint32_t c = ckk >> 8;
+              const uint32_t kh = (ckk >> 4) & 15;
+              const uint32_t kw = ckk & 15;
+              const uint32_t in_idx = c * HWd + ph_stride_Wd + kh * Wd + pw_stride + kw;
+              store_shared(smem_p_base + ckk * 4, 0, __builtin_bit_cast(uint32_t, a->in[in_idx]));
+            }
+          }
+        }
+      }
+    } else {
+      // Generic fallback path for arbitrary shapes
+      const uint32_t total = a->OH * OW * CKK;
+      for (uint32_t i = tid_in_threadblock; i < total; i += threads_per_threadblock) {
+        const uint32_t p = i / CKK;
+        const uint32_t ckk = i % CKK;
+        const uint32_t in_idx = (ckk / (KH * KW)) * HWd
+                              + ((p / OW) * stride + (ckk / KW) % KH) * Wd
+                              + (p % OW) * stride + ckk % KW;
+        store_shared((p * CKK_PADDED + ckk) * 4, 0, __builtin_bit_cast(uint32_t, a->in[in_idx]));
+      }
+    }
+  }
+
+  // Cross-core SMEM staging barrier
+  mu_barrier(0, threads_per_threadblock / MU_NUM_THREADS);
+
+  // (3) Matmul phase
+  {
+    const uint32_t P = a->OH * a->OW;
+    if (__builtin_constant_p(P) && P == 16 && __builtin_constant_p(CKK) && CKK == 768) {
+      // Optimized path for CKK=768, P=16
+      
+      // Each thread computes two outputs: row and row+8 for the same patch/column
+      const uint32_t col = tid_in_threadblock & 15;
+      const uint32_t row0 = tid_in_threadblock >> 4;
+      const uint32_t row1 = row0 + 8;
+      
+      // Pointers to weight matrices for both rows
+      uint32_t wa0 = smem_w + row0 * CKK_PADDED * 4;
+      uint32_t wa1 = smem_w + row1 * CKK_PADDED * 4;
+      
+      // Pointer to input patch
+      uint32_t pa  = col * CKK_PADDED * 4;
+      
+      float acc0 = 0.0f;
+      float acc1 = 0.0f;
+
+      // Manually unrolled loop by 4 to keep register usage low
+      for (uint32_t k = 0; k < CKK; k += 4) {
+        float p, w0, w1;
+
+        p  = __builtin_bit_cast(float, load32_shared(pa));
+        w0 = __builtin_bit_cast(float, load32_shared(wa0));
+        w1 = __builtin_bit_cast(float, load32_shared(wa1));
+        acc0 += w0 * p;
+        acc1 += w1 * p;
+
+        p  = __builtin_bit_cast(float, load32_shared(pa + 4));
+        w0 = __builtin_bit_cast(float, load32_shared(wa0 + 4));
+        w1 = __builtin_bit_cast(float, load32_shared(wa1 + 4));
+        acc0 += w0 * p;
+        acc1 += w1 * p;
+
+        p  = __builtin_bit_cast(float, load32_shared(pa + 8));
+        w0 = __builtin_bit_cast(float, load32_shared(wa0 + 8));
+        w1 = __builtin_bit_cast(float, load32_shared(wa1 + 8));
+        acc0 += w0 * p;
+        acc1 += w1 * p;
+
+        p  = __builtin_bit_cast(float, load32_shared(pa + 12));
+        w0 = __builtin_bit_cast(float, load32_shared(wa0 + 12));
+        w1 = __builtin_bit_cast(float, load32_shared(wa1 + 12));
+        acc0 += w0 * p;
+        acc1 += w1 * p;
+
+        wa0 += 16;
+        wa1 += 16;
+        pa  += 16;
+      }
+      
+      a->out[row0 * 16 + col] = acc0;
+      a->out[row1 * 16 + col] = acc1;
+    } else {
+      // Generic fallback path for arbitrary shapes (unrolled by 2)
+      const uint32_t total_out = a->OC * P;
+      for (uint32_t idx = tid_in_threadblock; idx < total_out; idx += threads_per_threadblock) {
+        const uint32_t oc = idx / P;
+        const uint32_t p = idx % P;
+        uint32_t wa = smem_w + oc * CKK_PADDED * 4;
+        uint32_t pa = p * CKK_PADDED * 4;
+        float acc = 0.0f;
+        uint32_t k = 0;
+        for (; k + 1 < CKK; k += 2) {
+          acc += __builtin_bit_cast(float, load32_shared(wa)) *
+                 __builtin_bit_cast(float, load32_shared(pa));
+          acc += __builtin_bit_cast(float, load32_shared(wa + 4)) *
+                 __builtin_bit_cast(float, load32_shared(pa + 4));
+          wa += 8; pa += 8;
+        }
+        if (k < CKK) {
+          acc += __builtin_bit_cast(float, load32_shared(wa)) *
+                 __builtin_bit_cast(float, load32_shared(pa));
+        }
+        a->out[idx] = acc;
+      }
+    }
+  }
+}
+```

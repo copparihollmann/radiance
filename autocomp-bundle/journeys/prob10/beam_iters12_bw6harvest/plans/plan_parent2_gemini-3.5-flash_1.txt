@@ -1,0 +1,136 @@
+An elegant and highly optimized plan to accelerate the large-K matrix multiplication kernel.
+
+### Optimization Plan
+
+1. **Reduce Global Memory Traffic via SMEM Staging & Block Tiling**:
+   The baseline kernel suffers from huge global memory redundancy, accessing DRAM ~25 million times because it loads $A$ and $B$ elements repeatedly. By staging tiles of $A$ and $B$ in the fast Shared Memory (SMEM) and processing them in chunks of size $BK = 32$, we can drastically reduce memory bandwidth pressure (reducing global traffic by over $14\times$).
+
+2. **Phase-based Computation (Outer-loop over M-tiles)**:
+   Since the register file has a hard limit of 31 distinct registers, we cannot store too many accumulators at once. We partition the $64 \times 64$ output matrix $C$ into 8 phases of size $8 \times 64$. In each phase, the 128 threads cooperatively compute 512 outputs of $C$, with each thread responsible for 4 horizontal outputs (a $1 \times 4$ tile). This keeps the active registers (only 4 accumulators per thread) extremely low.
+
+3. **Coalesced Cooperative DRAM Loads**:
+   We map the 128 threads to cooperatively load the $8 \times 32$ $A$ tile and the $32 \times 64$ $B$ tile.
+   - For $A$, each thread loads exactly 2 elements.
+   - For $B$, each thread loads 16 elements in a coalesced stride-1 access pattern across the columns.
+
+4. **Minimized SMEM Address Arithmetic**:
+   Inside the inner loop, instead of computing indices with complex multiplication, we maintain a single pointer `a_ptr` and `b_ptr` and simply increment them by the layout strides (`+4` and `+256` bytes respectively) in each iteration.
+
+5. **Cross-Core Synchronization**:
+   Since the threadblock spans 2 cores, the cooperative loads require proper synchronization. We use the cross-core barrier `mu_barrier(0, 8)` preceded by `mu_fence_smem()` to ensure both cores have completed writing to and reading from SMEM safely.
+
+---
+
+### Optimized Kernel Code
+
+```cpp
+#include <stdint.h>
+
+// Assuming KernelArgs is defined as:
+// struct KernelArgs {
+//   float* A;
+//   float* B;
+//   float* C;
+//   uint32_t M, N, K;
+// };
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  (void)threads_per_threadblock;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+  
+  const uint32_t tid = tid_in_threadblock;
+  const uint32_t K = args->K;
+  const uint32_t N = args->N;
+  
+  // Shared memory base addresses (within 128 KiB limit)
+  const uint32_t smem_a = 0;
+  const uint32_t smem_b = 1024; // 8 rows * 32 cols * 4 bytes = 1024
+  
+  // Thread mapping within the 8x64 phase submatrix
+  const uint32_t tr = tid / 16;       // Row index (0..7)
+  const uint32_t col0 = (tid % 16) * 4; // Starting column index (0, 4, ..., 60)
+  
+  // Loop over 8 phases (each phase computes a 8x64 block of C)
+  for (uint32_t p = 0; p < 8; p++) {
+    const uint32_t row_start = p * 8;
+    
+    // Register tiling: 4 local accumulators per thread
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+    
+    // Stream K in chunks of BK = 32
+    for (uint32_t k_offset = 0; k_offset < 768; k_offset += 32) {
+      
+      // 1. Cooperatively load A_tile (8 x 32) into SMEM
+      {
+        uint32_t a_idx1 = tid;
+        uint32_t a_idx2 = tid + 128;
+        
+        uint32_t a_r1 = a_idx1 / 32;
+        uint32_t a_c1 = a_idx1 % 32;
+        uint32_t a_r2 = a_idx2 / 32;
+        uint32_t a_c2 = a_idx2 % 32;
+        
+        float val_a1 = args->A[(row_start + a_r1) * K + k_offset + a_c1];
+        float val_a2 = args->A[(row_start + a_r2) * K + k_offset + a_c2];
+        
+        store_shared(smem_a, a_idx1 * 4, __builtin_bit_cast(uint32_t, val_a1));
+        store_shared(smem_a, a_idx2 * 4, __builtin_bit_cast(uint32_t, val_a2));
+      }
+      
+      // 2. Cooperatively load B_tile (32 x 64) into SMEM (stride-1 coalesced)
+      {
+        for (uint32_t i = 0; i < 16; i++) {
+          uint32_t b_idx = tid + i * 128;
+          uint32_t b_r = b_idx / 64;
+          uint32_t b_c = b_idx % 64;
+          float val_b = args->B[(k_offset + b_r) * N + b_c];
+          store_shared(smem_b, b_idx * 4, __builtin_bit_cast(uint32_t, val_b));
+        }
+      }
+      
+      // Synchronize to ensure all writes to SMEM are complete across both cores
+      mu_fence_smem();
+      mu_barrier(0, 8); // Barrier ID 0 = Cross-Core, 8 warps total
+      
+      // 3. Compute using register tiling and incrementing pointers
+      {
+        uint32_t a_ptr = smem_a + tr * 128;   // tr * 32 * 4 bytes
+        uint32_t b_ptr = smem_b + col0 * 4;   // col0 * 4 bytes
+        
+        #pragma GCC unroll 4
+        for (uint32_t k = 0; k < 32; k++) {
+          float a = __builtin_bit_cast(float, load32_shared(a_ptr));
+          acc0 += a * __builtin_bit_cast(float, load32_shared(b_ptr + 0));
+          acc1 += a * __builtin_bit_cast(float, load32_shared(b_ptr + 4));
+          acc2 += a * __builtin_bit_cast(float, load32_shared(b_ptr + 8));
+          acc3 += a * __builtin_bit_cast(float, load32_shared(b_ptr + 12));
+          
+          a_ptr += 4;   // Move to the next element in row
+          b_ptr += 256; // Move to the next row of B (64 columns * 4 bytes)
+        }
+      }
+      
+      // Synchronize before next chunk of K overwrites SMEM
+      mu_fence_smem();
+      mu_barrier(0, 8);
+    }
+    
+    // Write back computed block of C (fully coalesced DRAM writes)
+    const uint32_t global_row = row_start + tr;
+    const uint32_t global_col = col0;
+    args->C[global_row * 64 + global_col + 0] = acc0;
+    args->C[global_row * 64 + global_col + 1] = acc1;
+    args->C[global_row * 64 + global_col + 2] = acc2;
+    args->C[global_row * 64 + global_col + 3] = acc3;
+  }
+}
+```

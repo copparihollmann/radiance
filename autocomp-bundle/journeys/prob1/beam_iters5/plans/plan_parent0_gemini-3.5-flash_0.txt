@@ -1,0 +1,155 @@
+An elegant and highly effective optimization strategy for this kernel is **Strategy 7: Specialize kernels via C++ template parameters for power-of-two dimensions to enable the compiler to replace division and modulo with fast bitwise shifts and masks.**
+
+### Inefficiency Analysis
+In the original kernel, both the gather phase and the matmul phase rely heavily on integer division (`/`) and modulo (`%`) operations:
+- `p = i / CKK`, `ckk = i % CKK`
+- `ckk / (KH * KW)`, `(ckk / KW) % KH`, `ckk % KW`
+- `p / OW`, `p % OW`
+- `oc = idx / P`, `p = idx % P`
+
+Since RISC-V Zfinx does not have a single-cycle hardware divider, these operations compile into multi-cycle iterative division routines or expensive library helper calls. These routines consume considerable cycle budgets and increase register pressure.
+
+### Optimization Plan
+1. **Create a Templated Specialized Helper**: Implement a templated version of the kernel body where the dimensions are template parameters (`OC`, `C`, `KH`, `KW`, `OH`, `OW`, `stride`).
+2. **Compile-Time Constant Propagation**: By defining these values as `constexpr` template parameters, the compiler can perform aggressive constant folding. All divisions/modulos by power-of-two quantities (such as `OW = 4`, `KW = 16`, `KH = 16`, `P = 16`) are automatically optimized into fast bitwise shifts (`>>`) and masks (`&`).
+3. **Dispatch to Specialized Kernel**: In the main `kernel_body`, inspect the runtime arguments. If they match the expected shape of the target model patch-embedding layer (`OC=16`, `C=3`, `KH=16`, `KW=16`, `OH=4`, `OW=4`, `stride=16`), dispatch to the optimized templated function. Otherwise, fall back to the generic implementation to maintain semantic equivalence.
+
+### Optimized Code
+
+```cpp
+#include <stdint.h>
+#include <type_traits>
+
+// Template-specialized kernel implementation
+template <
+  uint32_t OC,
+  uint32_t C,
+  uint32_t KH,
+  uint32_t KW,
+  uint32_t OH,
+  uint32_t OW,
+  uint32_t stride
+>
+static inline void kernel_body_specialized(
+  KernelArgs* a,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock
+) {
+  constexpr uint32_t CKK = C * KH * KW;
+  constexpr uint32_t P = OH * OW;
+  constexpr uint32_t smem_w = P * CKK * 4;
+
+  // (1) Stage W flat into SMEM
+  for (uint32_t i = tid_in_threadblock; i < OC * CKK; i += threads_per_threadblock) {
+    store_shared(smem_w + i * 4, 0, __builtin_bit_cast(uint32_t, a->w[i]));
+  }
+
+  // (2) Gather im2col patches into SMEM
+  {
+    const uint32_t Wd = a->W;
+    const uint32_t HWd = a->H * Wd;
+    for (uint32_t p = 0; p < P; ++p) {
+      const uint32_t pr = p / OW; // Compiler optimizes to p >> 2
+      const uint32_t pc = p % OW; // Compiler optimizes to p & 3
+      const uint32_t out_p_base = p * CKK;
+      
+      for (uint32_t ckk = tid_in_threadblock; ckk < CKK; ckk += threads_per_threadblock) {
+        const uint32_t c = ckk / (KH * KW);   // Compiler optimizes to ckk >> 8
+        const uint32_t kh = (ckk / KW) % KH;  // Compiler optimizes to (ckk >> 4) & 15
+        const uint32_t kw = ckk % KW;         // Compiler optimizes to ckk & 15
+        
+        const uint32_t in_idx = c * HWd
+                              + (pr * stride + kh) * Wd
+                              + pc * stride + kw;
+        store_shared((out_p_base + ckk) * 4, 0, __builtin_bit_cast(uint32_t, a->in[in_idx]));
+      }
+    }
+  }
+
+  mu_fence_smem();
+  mu_barrier(0, threads_per_threadblock / MU_NUM_THREADS);
+
+  // (3) Frugal matmul with pointer bumping
+  {
+    for (uint32_t idx = tid_in_threadblock; idx < OC * P; idx += threads_per_threadblock) {
+      const uint32_t oc = idx / P; // Compiler optimizes to idx >> 4
+      const uint32_t p = idx % P;  // Compiler optimizes to idx & 15
+      
+      uint32_t wa = smem_w + oc * CKK * 4;
+      uint32_t pa = p * CKK * 4;
+      float acc = 0.0f;
+      
+      for (uint32_t k = 0; k < CKK; k++) {
+        acc += __builtin_bit_cast(float, load32_shared(wa)) *
+               __builtin_bit_cast(float, load32_shared(pa));
+        wa += 4;
+        pa += 4;
+      }
+      a->out[idx] = acc;
+    }
+  }
+}
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  // Specialize for the exact vision transformer patch embedding layout:
+  // OUT[16,4,4] = IN[3,64,64] * W[16,3,16,16], stride 16
+  if (a->OC == 16 && a->C == 3 && a->KH == 16 && a->KW == 16 &&
+      a->OH == 4 && a->OW == 4 && a->stride == 16) {
+    kernel_body_specialized<16, 3, 16, 16, 4, 4, 16>(
+      a, tid_in_threadblock, threads_per_threadblock
+    );
+  } else {
+    // Fallback generic implementation
+    const uint32_t CKK = a->C * a->KH * a->KW;
+    const uint32_t smem_w = a->OH * a->OW * CKK * 4;
+
+    for (uint32_t i = tid_in_threadblock; i < a->OC * CKK; i += threads_per_threadblock) {
+      store_shared(smem_w + i * 4, 0, __builtin_bit_cast(uint32_t, a->w[i]));
+    }
+
+    const uint32_t KH = a->KH, KW = a->KW, OW = a->OW;
+    const uint32_t Wd = a->W, HWd = a->H * Wd, stride = a->stride;
+    const uint32_t P = a->OH * OW;
+
+    for (uint32_t p = 0; p < P; ++p) {
+      const uint32_t pr = p / OW;
+      const uint32_t pc = p % OW;
+      const uint32_t out_p_base = p * CKK;
+      for (uint32_t ckk = tid_in_threadblock; ckk < CKK; ckk += threads_per_threadblock) {
+        const uint32_t c = ckk / (KH * KW);
+        const uint32_t kh = (ckk / KW) % KH;
+        const uint32_t kw = ckk % KW;
+        const uint32_t in_idx = c * HWd
+                              + (pr * stride + kh) * Wd
+                              + pc * stride + kw;
+        store_shared((out_p_base + ckk) * 4, 0, __builtin_bit_cast(uint32_t, a->in[in_idx]));
+      }
+    }
+
+    mu_fence_smem();
+    mu_barrier(0, threads_per_threadblock / MU_NUM_THREADS);
+
+    for (uint32_t idx = tid_in_threadblock; idx < a->OC * P; idx += threads_per_threadblock) {
+      const uint32_t oc = idx / P;
+      const uint32_t p = idx % P;
+      uint32_t wa = smem_w + oc * CKK * 4;
+      uint32_t pa = p * CKK * 4;
+      float acc = 0.0f;
+      for (uint32_t k = 0; k < CKK; k++) {
+        acc += __builtin_bit_cast(float, load32_shared(wa)) *
+               __builtin_bit_cast(float, load32_shared(pa));
+        wa += 4; pa += 4;
+      }
+      a->out[idx] = acc;
+    }
+  }
+}
+```

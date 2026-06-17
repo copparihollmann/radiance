@@ -1,0 +1,102 @@
+#include <stdint.h>
+
+// Helper template to load from shared memory using compile-time immediate offset.
+// Saves address-calculation instructions by folding offset directly into load.
+template <uint32_t Offset>
+inline uint32_t load32_shared_off(uint32_t address) {
+    uint32_t data;
+    asm volatile("lw.shared %0, %1(%2)" : "=r"(data) : "I"(Offset), "r"(address) : "memory");
+    return data;
+}
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  
+  const uint32_t KH = a->KH, KW = a->KW, OW = a->OW;
+  const uint32_t CKK = a->C * KH * KW;
+  const uint32_t P = a->OH * OW; // Guaranteed to be 16 for this kernel
+  const uint32_t smem_patch_size = CKK * P * 4;
+  const uint32_t smem_w_offset = smem_patch_size;
+
+  // (1) Stage filter weights W[OC][CKK] into shared memory after patches
+  for (uint32_t i = tid_in_threadblock; i < a->OC * CKK; i += threads_per_threadblock) {
+    store_shared(smem_w_offset + i * 4, 0, __builtin_bit_cast(uint32_t, a->w[i]));
+  }
+
+  // (2) Gather im2col patches into transposed layout patch[CKK][P=16]
+  // Index i = ckk * P + p => addr = i * 4. Eliminates div/mod.
+  {
+    const uint32_t Wd = a->W, H = a->H, stride = a->stride;
+    const uint32_t HWd = H * Wd;
+    const uint32_t total = CKK * P;
+    
+    for (uint32_t i = tid_in_threadblock; i < total; i += threads_per_threadblock) {
+      const uint32_t ckk = i >> 4;  // Divide by 16 (P)
+      const uint32_t p = i & 15;    // Modulo 16
+      
+      // Bitwise-optimal indexing for power-of-two dims
+      const uint32_t c = ckk >> 8;              // ckk / (KH * KW) = ckk / 256
+      const uint32_t kh = (ckk >> 4) & 15;      // (ckk / KW) % KH = (ckk / 16) % 16
+      const uint32_t kw = ckk & 15;             // ckk % KW = ckk % 16
+      
+      const uint32_t oh = p >> 2;               // p / OW = p / 4
+      const uint32_t ow = p & 3;                // p % OW = p % 4
+      
+      const uint32_t h_idx = oh * stride + kh;
+      const uint32_t w_idx = ow * stride + kw;
+      
+      const uint32_t in_idx = c * HWd + h_idx * Wd + w_idx;
+      
+      store_shared(i * 4, 0, __builtin_bit_cast(uint32_t, a->in[in_idx]));
+    }
+  }
+
+  // Cross-core shared memory visibility enforced with ID 0 barrier
+  mu_barrier(0, threads_per_threadblock / MU_NUM_THREADS);
+
+  // (3) Frugal MatMul using transposed patch layout to eliminate bank conflicts
+  for (uint32_t idx = tid_in_threadblock; idx < a->OC * P; idx += threads_per_threadblock) {
+    const uint32_t oc = idx >> 4;  // idx / P
+    const uint32_t p = idx & 15;   // idx % P
+    
+    uint32_t wa_base = smem_w_offset + oc * CKK * 4;
+    uint32_t pa_base = p * 4; 
+    
+    float acc = 0.0f;
+    
+    // Software-pipelined load-unroll by factor 4
+    // Uses template-immediates to remove address arithmetic
+    for (uint32_t k = 0; k < CKK; k += 4) {
+      float w0 = __builtin_bit_cast(float, load32_shared(wa_base));
+      float p0 = __builtin_bit_cast(float, load32_shared(pa_base));
+      
+      float w1 = __builtin_bit_cast(float, load32_shared_off<4>(wa_base));
+      float p1 = __builtin_bit_cast(float, load32_shared_off<64>(pa_base));
+      
+      acc += w0 * p0;
+      
+      float w2 = __builtin_bit_cast(float, load32_shared_off<8>(wa_base));
+      float p2 = __builtin_bit_cast(float, load32_shared_off<128>(pa_base));
+      
+      acc += w1 * p1;
+      
+      float w3 = __builtin_bit_cast(float, load32_shared_off<12>(wa_base));
+      float p3 = __builtin_bit_cast(float, load32_shared_off<192>(pa_base));
+      
+      acc += w2 * p2;
+      acc += w3 * p3;
+      
+      wa_base += 16;     // Advance 4 floats in W (row-major, 4 elems)
+      pa_base += 256;    // Advance 4 rows in transposed patch[CKK][P=16]
+                         // i.e., jump over 4 * P * 4 bytes
+    }
+    
+    a->out[idx] = acc;
+  }
+}

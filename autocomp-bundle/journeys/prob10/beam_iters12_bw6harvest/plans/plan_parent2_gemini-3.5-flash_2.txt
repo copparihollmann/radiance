@@ -1,0 +1,129 @@
+An elegant and powerful strategy to optimize this large-K matmul under strict register limits is **2D Thread-Block Partitioning with Conflict-Free Column-Major Vectorized Register Tiling**.
+
+### Explanation of the Strategy
+
+Rather than tiling with a large number of accumulators per thread (which exceeds the core's register limits), we partition the output matrix $C$ into 8 tiles of size $16 \times 32$. The 128 threads of the threadblock are mapped to a 2D grid of size $4 \times 32$. 
+
+Each thread computes a $4 \times 1$ vertical tile of $C$. This mapping achieves three critical hardware-level optimizations simultaneously:
+1. **Zero SMEM Bank Conflicts for Matrix B:** Since the column coordinate $c = \text{tid} \pmod{32}$ increases by 1 for consecutive threads, all threads within a warp access consecutive columns of $B$ in SMEM. This results in perfectly sequential, conflict-free SMEM accesses.
+2. **Zero SMEM Bank Conflicts for Matrix A:** Since the row coordinate $r_{\text{thread}} = \text{tid} / 32$ is identical for all 32 threads in a quadrant, all 16 lanes of any active warp share the same row index when loading $A$. This triggers a hardware broadcast read, eliminating bank conflicts entirely.
+3. **Perfect Global Memory Coalescing:** When writing back results, adjacent threads write to adjacent columns of $C$. This matches the DRAM controller's burst structure, ensuring max throughput.
+4. **Register Wall Protection:** By calculating exactly 4 vertical elements per thread, we only require 4 accumulators per thread. This keeps the total register usage well below the strict limit of 31 distinct registers.
+
+---
+
+### High-Performance Implementation
+
+```cpp
+#include <stdint.h>
+#include <type_traits>
+
+// Core hardware configuration
+#define MU_NUM_THREADS 16
+
+struct KernelArgs {
+  float* A;
+  float* B;
+  float* C;
+  uint32_t M;
+  uint32_t N;
+  uint32_t K;
+};
+
+static inline float bits_to_float(uint32_t b) { union { uint32_t u; float f; } c; c.u = b; return c.f; }
+static inline uint32_t float_to_bits(float f) { union { uint32_t u; float f; } c; c.f = f; return c.u; }
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  (void)threads_per_threadblock;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t N = args->N;
+  const uint32_t K = args->K;
+
+  const uint32_t tid = tid_in_threadblock;
+  const uint32_t num_warps = 8; // 128 threads / 16 threads/warp = 8 warps
+
+  // Allocate 3 KB total SMEM (well within the 128 KB limit)
+  const uint32_t smem_a = 0;      // Size: 16x16 * 4 = 1024 bytes
+  const uint32_t smem_b = 1024;   // Size: 16x32 * 4 = 2048 bytes
+
+  // Thread mapping to 4x32 grid
+  const uint32_t r_thread = tid >> 5;    // tid / 32
+  const uint32_t c = tid & 31;           // tid % 32
+  const uint32_t r_base = r_thread << 2; // r_thread * 4
+
+  // Iterate over 8 blocks of size 16x32 in C
+  for (uint32_t by = 0; by < 4; by++) {
+    const uint32_t by_16 = by << 4;
+    for (uint32_t bx = 0; bx < 2; bx++) {
+      const uint32_t bx_32 = bx << 5;
+
+      // Keep accumulators in registers
+      float acc0 = 0.0f;
+      float acc1 = 0.0f;
+      float acc2 = 0.0f;
+      float acc3 = 0.0f;
+
+      for (uint32_t k = 0; k < K; k += 16) {
+        // 1. Cooperative load of A_tile (16x16) from Global to SMEM
+        {
+          const uint32_t idx1 = tid;
+          const uint32_t row1 = idx1 >> 4;
+          const uint32_t col1 = idx1 & 15;
+          store_shared(smem_a + idx1 * 4, 0, float_to_bits(args->A[(by_16 + row1) * K + k + col1]));
+
+          const uint32_t idx2 = tid + 128;
+          const uint32_t row2 = idx2 >> 4;
+          const uint32_t col2 = idx2 & 15;
+          store_shared(smem_a + idx2 * 4, 0, float_to_bits(args->A[(by_16 + row2) * K + k + col2]));
+        }
+
+        // 2. Cooperative load of B_tile (16x32) from Global to SMEM
+        {
+          const uint32_t b_col = tid & 31;
+          const uint32_t b_row_base = tid >> 5;
+
+          uint32_t r0 = b_row_base;
+          store_shared(smem_b + tid * 4, 0, float_to_bits(args->B[(k + r0) * N + bx_32 + b_col]));
+
+          uint32_t r1 = b_row_base + 4;
+          store_shared(smem_b + (tid + 128) * 4, 0, float_to_bits(args->B[(k + r1) * N + bx_32 + b_col]));
+
+          uint32_t r2 = b_row_base + 8;
+          store_shared(smem_b + (tid + 256) * 4, 0, float_to_bits(args->B[(k + r2) * N + bx_32 + b_col]));
+
+          uint32_t r3 = b_row_base + 12;
+          store_shared(smem_b + (tid + 384) * 4, 0, float_to_bits(args->B[(k + r3) * N + bx_32 + b_col]));
+        }
+
+        // Cross-core barrier to ensure SMEM staging is visible to all warps
+        mu_barrier(0, num_warps);
+
+        // 3. Compute phase (accumulating from SMEM)
+        #pragma unroll 4
+        for (uint32_t kk = 0; kk < 16; kk++) {
+          float b_val = bits_to_float(load32_shared(smem_b + (kk * 32 + c) * 4));
+          acc0 += bits_to_float(load32_shared(smem_a + ((r_base + 0) * 16 + kk) * 4)) * b_val;
+          acc1 += bits_to_float(load32_shared(smem_a + ((r_base + 1) * 16 + kk) * 4)) * b_val;
+          acc2 += bits_to_float(load32_shared(smem_a + ((r_base + 2) * 16 + kk) * 4)) * b_val;
+          acc3 += bits_to_float(load32_shared(smem_a + ((r_base + 3) * 16 + kk) * 4)) * b_val;
+        }
+
+        // Barrier before starting next K-tile loads
+        mu_barrier(0, num_warps);
+      }
+
+      // 4. Coalesced write-back of results to global memory
+      args->C[(by_16 + r_base + 0) * N + bx_32 + c] = acc0;
+      args->C[(by_16 + r_base + 1) * N + bx_32 + c] = acc1;
+      args->C[(by_16 + r_base + 2) * N + bx_32 + c] = acc2;
+      args->C[(by_16 + r_base + 3) * N + bx_32 + c] = acc3;
+    }
+  }
+}
+```

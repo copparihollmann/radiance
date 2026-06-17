@@ -1,0 +1,76 @@
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t seq = a->seq;
+  const uint32_t d = a->d;
+
+  // Shared memory layout:
+  // smem_Q: 128 threads * 64 floats = 32 KiB
+  // smem_S: 128 threads * 128 floats = 64 KiB
+  // Total: 96 KiB < 128 KiB
+  const uint32_t smem_Q_base = 0;
+  const uint32_t smem_S_base = 32768; // 32 KiB
+
+  const uint32_t tid = tid_in_threadblock;
+  if (tid >= seq) return; // Only first `seq` threads are active
+
+  const __global float* Qi = a->Q + tid * d;
+  const __global float* Vk_base = a->V;
+  __global float* Oi = a->O + tid * d;
+
+  // Phase 1 + 2 + 3 fused: One thread processes one row independently
+
+  // Stage Q[tid] into SMEM
+  uint32_t smem_q_offset = smem_Q_base + tid * d * sizeof(float);
+  for (uint32_t k = 0; k < d; k++) {
+    store_shared(smem_q_offset + k * sizeof(float), 0, Qi[k]);
+  }
+
+  // Compute and store scores S[tid][j] = scale * Q[tid] · K[j]
+  uint32_t smem_s_row_base = smem_S_base + tid * seq * sizeof(float);
+  for (uint32_t j = 0; j < seq; j++) {
+    const __global float* Kj = a->K + j * d;
+    float acc = 0.0f;
+    for (uint32_t k = 0; k < d; k++) {
+      float q_val = load32_shared(smem_q_offset + k * sizeof(float));
+      acc += q_val * Kj[k];
+    }
+    store_shared(smem_s_row_base + j * sizeof(float), 0, acc * 0.125f);
+  }
+
+  // Softmax in-place on S[tid][:]
+  float maxval = load32_shared(smem_s_row_base);
+  for (uint32_t j = 1; j < seq; j++) {
+    float val = load32_shared(smem_s_row_base + j * sizeof(float));
+    if (val > maxval) maxval = val;
+  }
+
+  float sum = 0.0f;
+  for (uint32_t j = 0; j < seq; j++) {
+    float val = load32_shared(smem_s_row_base + j * sizeof(float));
+    float exp_val = mu_exp(val - maxval);
+    store_shared(smem_s_row_base + j * sizeof(float), 0, exp_val);
+    sum += exp_val;
+  }
+
+  const float inv_sum = 1.0f / sum;
+  for (uint32_t j = 0; j < seq; j++) {
+    float p_val = load32_shared(smem_s_row_base + j * sizeof(float));
+    store_shared(smem_s_row_base + j * sizeof(float), 0, p_val * inv_sum);
+  }
+
+  // Compute output O[tid][k] = sum_j P[tid][j] * V[j][k]
+  for (uint32_t k = 0; k < d; k++) {
+    float acc = 0.0f;
+    for (uint32_t j = 0; j < seq; j++) {
+      float p_val = load32_shared(smem_s_row_base + j * sizeof(float));
+      acc += p_val * Vk_base[j * d + k];
+    }
+    Oi[k] = acc;
+  }
+}

@@ -1,0 +1,29 @@
+An elegant and highly effective optimization plan to significantly reduce latency is to apply **Strategy 3: Assign contiguous thread IDs to contiguous memory addresses for coalesced global loads** by staging all inputs ($Q$, $K$, $V$) and outputs ($O$) in Shared Memory (SMEM).
+
+### Inefficiencies in the Original Code
+1. **Uncoalesced Global Memory Accesses:** 
+   In Phase 1 and Phase 3, each thread $i$ handles an entire row. Across lanes in a warp, the memory accesses (`qi[k]` at stride 64, and `O[i * d + k]` at stride 64) are highly uncoalesced. This triggers separate DRAM/L1 transactions for every single lane, causing massive latency penalties and memory pipeline stalls.
+2. **Redundant Global Memory Accesses:**
+   During Phase 2 (softmax), the intermediate score matrix is repeatedly read from and written to global memory (`scratch`), which has high latency (~400 cycles) compared to SMEM (~2 cycles).
+
+### Optimization Plan: Staging with Contiguous (Coalesced) Threads
+To solve this, we will stage the operands in SMEM. By assigning contiguous thread IDs to contiguous linear offsets during load/store operations, we ensure 100% coalesced global memory operations.
+
+1. **SMEM Layout Planning (within 128 KiB):**
+   * `smem_Q` (offset 0): $128 \times 64 \times 4$ bytes = 32 KiB.
+   * `smem_K` (offset 32 KiB): $128 \times 64 \times 4$ bytes = 32 KiB.
+   * `smem_scratch` (offset 64 KiB): $128 \times 128 \times 4$ bytes = 64 KiB.
+   * Total active SMEM at Phase 1 and 2 = 128 KiB (fits exactly).
+   * For Phase 3, we reuse the first 64 KiB of SMEM to stage `smem_V` (32 KiB) and the output `smem_O` (32 KiB).
+
+2. **Coalesced Staging Strategy:**
+   * **Phase 1 Loads:** Contiguous threads load $Q$ and $K$ into SMEM using `idx = tid_in_threadblock` incremented by `threads_per_threadblock`. This yields stride-1 coalesced accesses.
+   * **Phase 1 & 2 Execution:** Compute the dot products and perform row softmax entirely within SMEM. Since SMEM has 256 B/cycle bandwidth, bank conflicts are minimal and performance is maximized.
+   * **Phase 3 Loads:** Load $V$ into SMEM reusing `smem_Q`'s space with the same coalesced access pattern.
+   * **Phase 3 Execution & Store:** Compute the output matrix $O$ into `smem_O` (SMEM), then copy `smem_O` back to global memory $O$ using 100% coalesced contiguous stores.
+
+3. **Register & Barrier Safety:**
+   * We use `mu_barrier(0, nw)` (ID 0) for cross-core synchronization to ensure that SMEM writes from one core are visible to threads reading from them on the other core.
+   * We keep the loop structures simple and rolled to stay well within the physical limit of **31 distinct registers**.
+
+In the next phase, I will implement this design.

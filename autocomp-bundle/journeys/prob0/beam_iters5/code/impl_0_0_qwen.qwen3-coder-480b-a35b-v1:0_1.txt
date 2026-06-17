@@ -1,0 +1,84 @@
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  const uint32_t M = args->M;
+  const uint32_t N = args->N;
+  const uint32_t K = args->K;
+
+  const __global float* A = args->A;
+  const __global float* B = args->B;
+  float* C = args->C;
+
+  // Tile dimensions
+  const uint32_t TM = 64;
+  const uint32_t TN = 64;
+  const uint32_t TK = 64;
+
+  // Padding to avoid bank conflicts (16 bytes = 4 floats alignment)
+  const uint32_t PAD = 4;
+  const uint32_t A_STRIDE = TK + PAD;
+  const uint32_t B_STRIDE = TK + PAD;
+
+  // Shared memory layout
+  // smem_A: [0, TM * A_STRIDE * 4) => max 16896 bytes
+  // smem_B_transposed: [16896, 16896 + TN * B_STRIDE * 4) => another 16896 bytes
+  // Total: ~33KB which fits in 128KB SMEM easily
+  const uint32_t A_SOFFSET = 0;
+  const uint32_t B_SOFFSET = TM * A_STRIDE * sizeof(float);
+
+  // Pointers into shared memory
+  float* smem_A = reinterpret_cast<float*>(A_SOFFSET);
+  float* smem_B_transposed = reinterpret_cast<float*>(B_SOFFSET);
+
+  // Number of warps in threadblock (across 2 cores)
+  const uint32_t total_warps = threads_per_threadblock / MU_NUM_THREADS; // Should be 8
+
+  // Load A into shared memory cooperatively
+  for (uint32_t i = tid_in_threadblock; i < TM * TK; i += threads_per_threadblock) {
+    uint32_t row = i / TK;
+    uint32_t k = i % TK;
+    uint32_t global_idx = row * K + k;
+    float val = (row < M && k < K) ? A[global_idx] : 0.0f;
+    uint32_t smem_offset = row * A_STRIDE + k;
+    store_shared(reinterpret_cast<uint32_t>(smem_A), smem_offset * sizeof(float), __builtin_bit_cast(uint32_t, val));
+  }
+
+  // Load B^T into shared memory cooperatively
+  for (uint32_t i = tid_in_threadblock; i < TN * TK; i += threads_per_threadblock) {
+    uint32_t col = i / TK;
+    uint32_t k = i % TK;
+    uint32_t global_idx = k * N + col;
+    float val = (k < K && col < N) ? B[global_idx] : 0.0f;
+    uint32_t smem_offset = col * B_STRIDE + k;
+    store_shared(reinterpret_cast<uint32_t>(smem_B_transposed), smem_offset * sizeof(float), __builtin_bit_cast(uint32_t, val));
+  }
+
+  // Synchronize all warps across both cores for cross-core visibility
+  mu_barrier(0, total_warps);
+
+  // Compute phase: each thread computes one element at a time with strided access
+  for (uint32_t idx = tid_in_threadblock; idx < M * N; idx += threads_per_threadblock) {
+    uint32_t row = idx / N;
+    uint32_t col = idx % N;
+
+    float acc = 0.0f;
+
+    if (row < M && col < N) {
+      for (uint32_t k = 0; k < TK; ++k) {
+        uint32_t a_addr = (row % TM) * A_STRIDE + k;
+        uint32_t b_addr = (col % TN) * B_STRIDE + k;
+        float aval = __builtin_bit_cast(float, load32_shared(reinterpret_cast<uint32_t>(smem_A) + a_addr * sizeof(float)));
+        float bval = __builtin_bit_cast(float, load32_shared(reinterpret_cast<uint32_t>(smem_B_transposed) + b_addr * sizeof(float)));
+        acc += aval * bval;
+      }
+    }
+
+    C[idx] = acc;
+  }
+}

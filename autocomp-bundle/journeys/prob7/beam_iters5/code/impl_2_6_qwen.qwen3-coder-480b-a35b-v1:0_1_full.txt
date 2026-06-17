@@ -1,0 +1,95 @@
+```cpp
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t seq = a->seq;
+  const uint32_t d = a->d;
+  const uint32_t nw = threads_per_threadblock / MU_NUM_THREADS;
+
+  // Shared Memory Layout:
+  // smem_q: 0x00000 - 0x08000 (32 KiB) -> Q or V
+  // smem_k: 0x08000 - 0x10000 (32 KiB) -> K or O
+  // smem_s: 0x10000 - 0x20000 (64 KiB) -> S/P
+
+  uint32_t* smem_q = (uint32_t*)0x00000;
+  uint32_t* smem_k = (uint32_t*)0x08000;
+  uint32_t* smem_s = (uint32_t*)0x10000;
+
+  // Phase 1: Coalesced load of Q into SMEM
+  for (uint32_t i = tid_in_threadblock; i < seq * d; i += threads_per_threadblock) {
+    smem_q[i] = ((__global uint32_t*)a->Q)[i];
+  }
+  mu_barrier(0, nw); // Cross-core sync
+
+  // Phase 2: Coalesced load of K into SMEM
+  for (uint32_t i = tid_in_threadblock; i < seq * d; i += threads_per_threadblock) {
+    smem_k[i] = ((__global uint32_t*)a->K)[i];
+  }
+  mu_barrier(0, nw); // Cross-core sync
+
+  // Phase 3: Compute S = Q @ K^T (scaled dot-product attention scores)
+  for (uint32_t i = tid_in_threadblock; i < seq; i += threads_per_threadblock) {
+    const float* qi = (float*)smem_q + i * d;
+    float* si = (float*)smem_s + i * seq;
+    for (uint32_t j = 0; j < seq; j++) {
+      const float* kj = (float*)smem_k + j * d;
+      float acc = 0.0f;
+      for (uint32_t k = 0; k < d; k++) {
+        acc += qi[k] * kj[k];
+      }
+      si[j] = acc * 0.125f;
+    }
+  }
+  mu_barrier(0, nw); // Cross-core sync
+
+  // Phase 4: Softmax in-place on SMEM
+  for (uint32_t i = tid_in_threadblock; i < seq; i += threads_per_threadblock) {
+    float* sp = (float*)smem_s + i * seq;
+    float m = sp[0];
+    for (uint32_t j = 1; j < seq; j++) {
+      if (sp[j] > m) m = sp[j];
+    }
+    float sum = 0.0f;
+    for (uint32_t j = 0; j < seq; j++) {
+      const float e = mu_exp(sp[j] - m);
+      sp[j] = e;
+      sum += e;
+    }
+    const float inv = 1.0f / sum;
+    for (uint32_t j = 0; j < seq; j++) {
+      sp[j] *= inv;
+    }
+  }
+  mu_barrier(0, nw); // Cross-core sync
+
+  // Phase 5: Coalesced load of V into SMEM (reuse smem_q)
+  for (uint32_t i = tid_in_threadblock; i < seq * d; i += threads_per_threadblock) {
+    smem_q[i] = ((__global uint32_t*)a->V)[i];
+  }
+  mu_barrier(0, nw); // Cross-core sync
+
+  // Phase 6: Output projection O = P @ V
+  for (uint32_t i = tid_in_threadblock; i < seq; i += threads_per_threadblock) {
+    const float* sp = (float*)smem_s + i * seq;
+    float* oi = (float*)smem_k + i * d; // Reuse smem_k for output O
+    for (uint32_t k = 0; k < d; k++) {
+      float acc = 0.0f;
+      for (uint32_t j = 0; j < seq; j++) {
+        acc += sp[j] * ((float*)smem_q)[j * d + k];
+      }
+      oi[k] = acc;
+    }
+  }
+  mu_barrier(0, nw); // Cross-core sync
+
+  // Phase 7: Coalesced write-back of O from SMEM to global memory
+  for (uint32_t i = tid_in_threadblock; i < seq * d; i += threads_per_threadblock) {
+    ((__global uint32_t*)a->O)[i] = smem_k[i];
+  }
+}
+```

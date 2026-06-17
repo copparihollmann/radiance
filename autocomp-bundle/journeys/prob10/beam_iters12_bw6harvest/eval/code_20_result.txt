@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n             uint32_t a_base = SMEM_A_BASE + (th_r * 8) * K_PAD * sizeof(float);\n      |                                                              ^\nkernel.cpp:126:42: error: use of undeclared identifier 'K_TILE'\n  126 |                 for (uint32_t k = 0; k < K_TILE; k++) {\n      |                                          ^\nkernel.cpp:127:35: error: use of undeclared identifier 'bits_to_float'\n  127 |                     float b_val = bits_to_float(load32_shared(b_base + k * sizeof(float)));\n      |                                   ^\nkernel.cpp:128:70: error: use of undeclared identifier 'K_PAD'\n  128 |                     acc0 += bits_to_float(load32_shared(a_base + 0 * K_PAD * sizeof(float) + k * sizeof(float))) * b_val;\n      |                                                                      ^\nkernel.cpp:129:70: error: use of undeclared identifier 'K_PAD'\n  129 |                     acc1 += bits_to_float(load32_shared(a_base + 1 * K_PAD * sizeof(float) + k * sizeof(float))) * b_val;\n      |                                                                      ^\nkernel.cpp:130:70: error: use of undeclared identifier 'K_PAD'\n  130 |                     acc2 += bits_to_float(load32_shared(a_base + 2 * K_PAD * sizeof(float) + k * sizeof(float))) * b_val;\n      |                                                                      ^\nfatal error: too many errors emitted, stopping now [-ferror-limit=]\n20 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

@@ -1,0 +1,141 @@
+```cpp
+#include <stdint.h>
+
+// Helper functions for float/bits conversion
+static inline float bits_to_float(uint32_t b) { 
+  union { uint32_t u; float f; } c; 
+  c.u = b; 
+  return c.f; 
+}
+static inline uint32_t float_to_bits(float f) { 
+  union { uint32_t u; float f; } c; 
+  c.f = f; 
+  return c.u; 
+}
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  
+  const uint32_t SEQ = 64;
+  const uint32_t D = 64;
+  const uint32_t PAD = 16;
+
+  // Shared memory layout offsets in bytes
+  const uint32_t smem_q_base = 0;
+  const uint32_t smem_k_base = smem_q_base + SEQ * D * 4;                    // Q: 16KB
+  const uint32_t smem_v_base = smem_k_base + D * (SEQ + PAD) * 4;            // K: ~20KB (transposed)
+  const uint32_t smem_s_base = smem_v_base + D * (SEQ + PAD) * 4;            // V: ~20KB (transposed)
+                                                                              
+  // 1. Cooperative Shared Memory Staging with Pre-scaling
+  // Load Q with scaling factor applied
+  for (uint32_t i = tid_in_threadblock; i < SEQ * D; i += threads_per_threadblock) {
+    uint32_t addr = smem_q_base + i * 4;
+    store_shared(addr, 0, float_to_bits(a->Q[i] * 0.125f));
+  }
+
+  // Load K in transposed layout to avoid bank conflicts
+  for (uint32_t i = tid_in_threadblock; i < SEQ * D; i += threads_per_threadblock) {
+    uint32_t row = i / D;
+    uint32_t col = i % D;
+    uint32_t transposed_idx = col * (SEQ + PAD) + row;
+    uint32_t addr = smem_k_base + transposed_idx * 4;
+    store_shared(addr, 0, float_to_bits(a->K[i]));
+  }
+
+  // Load V in transposed layout to avoid bank conflicts
+  for (uint32_t i = tid_in_threadblock; i < SEQ * D; i += threads_per_threadblock) {
+    uint32_t row = i / D;
+    uint32_t col = i % D;
+    uint32_t transposed_idx = col * (SEQ + PAD) + row;
+    uint32_t addr = smem_v_base + transposed_idx * 4;
+    store_shared(addr, 0, float_to_bits(a->V[i]));
+  }
+
+  // Cross-core sync after SMEM staging
+  mu_barrier(0, 8);
+
+  // 2. Phase 1: Compute S = Q * K^T using shared memory
+  for (uint32_t idx = tid_in_threadblock; idx < SEQ * SEQ; idx += threads_per_threadblock) {
+    uint32_t qi = idx / SEQ;  // Query row index
+    uint32_t ki = idx % SEQ;  // Key row index
+    
+    float acc = 0.0f;
+    uint32_t q_row_addr = smem_q_base + qi * D * 4;
+    uint32_t k_col_addr = smem_k_base + ki * (SEQ + PAD) * 4;
+
+#pragma GCC unroll 1
+    for (uint32_t k = 0; k < D; k++) {
+      float q_val = bits_to_float(load32_shared(q_row_addr + k * 4));
+      float k_val = bits_to_float(load32_shared(k_col_addr + k * 4));
+      acc += q_val * k_val;
+    }
+
+    uint32_t s_addr = smem_s_base + idx * 4;
+    store_shared(s_addr, 0, float_to_bits(acc));
+  }
+
+  // Sync before softmax
+  mu_barrier(0, 8);
+
+  // 3. Phase 2: Row-wise Softmax
+  if (tid_in_threadblock < SEQ) {
+    const uint32_t row = tid_in_threadblock;
+    const uint32_t row_offset = smem_s_base + row * SEQ * 4;
+
+    // Find max value in the row
+    float maxval = bits_to_float(load32_shared(row_offset));
+    for (uint32_t j = 1; j < SEQ; j++) {
+      float val = bits_to_float(load32_shared(row_offset + j * 4));
+      if (val > maxval) maxval = val;
+    }
+
+    // Compute exponentials and sum
+    float sum = 0.0f;
+    for (uint32_t j = 0; j < SEQ; j++) {
+      float val = bits_to_float(load32_shared(row_offset + j * 4));
+      float exp_val = mu_exp(val - maxval);
+      sum += exp_val;
+      store_shared(row_offset + j * 4, 0, float_to_bits(exp_val));
+    }
+
+    // Normalize and write to global scratch as well
+    float inv_sum = 1.0f / sum;
+    for (uint32_t j = 0; j < SEQ; j++) {
+      float exp_val = bits_to_float(load32_shared(row_offset + j * 4));
+      float normalized = exp_val * inv_sum;
+      store_shared(row_offset + j * 4, 0, float_to_bits(normalized));
+      a->scratch[row * SEQ + j] = normalized;
+    }
+  } else {
+    asm volatile("nop");
+  }
+
+  // Sync before final GEMM
+  mu_barrier(0, 8);
+
+  // 4. Phase 3: Compute O = P * V
+  for (uint32_t idx = tid_in_threadblock; idx < SEQ * D; idx += threads_per_threadblock) {
+    uint32_t pi = idx / D;  // Probability matrix row
+    uint32_t vi = idx % D;  // Value matrix column
+
+    float acc = 0.0f;
+    uint32_t p_row_addr = smem_s_base + pi * SEQ * 4;
+    uint32_t v_col_addr = smem_v_base + vi * (SEQ + PAD) * 4;
+
+#pragma GCC unroll 1
+    for (uint32_t k = 0; k < SEQ; k++) {
+      float p_val = bits_to_float(load32_shared(p_row_addr + k * 4));
+      float v_val = bits_to_float(load32_shared(v_col_addr + k * 4));
+      acc += p_val * v_val;
+    }
+
+    a->O[idx] = acc;
+  }
+}
+```

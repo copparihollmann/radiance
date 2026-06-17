@@ -1,0 +1,130 @@
+#include <stdint.h>
+
+// Hardware intrinsics and helpers
+inline void store_shared(uint32_t base, uint32_t offset, uint32_t data) {
+    asm volatile("sw.shared %2, %1(%0)" :: "r"(base), "I"(offset), "r"(data) : "memory");
+}
+
+inline uint32_t load32_shared(uint32_t address) {
+    uint32_t data;
+    asm volatile("lw.shared %0, %1(%2)" : "=r"(data) : "I"(0), "r"(address) : "memory");
+    return data;
+}
+
+__attribute__((convergent))
+static void mu_barrier(unsigned barrier_id, unsigned num_warps) {
+    asm volatile ("vx_bar %0, %1" :: "r"(barrier_id), "r"(num_warps) : "memory");
+}
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  const uint32_t M = args->M;
+  const uint32_t N = args->N;
+  const uint32_t K = args->K;
+
+  // Tile size constants
+  const uint32_t TILE_M = 16;
+  const uint32_t TILE_N = 16;
+  const uint32_t TILE_K = 16;
+
+  // Thread indices within the threadblock (0-127)
+  const uint32_t warp_id = tid_in_threadblock >> 4;   // 0..7
+  const uint32_t lane_id = tid_in_threadblock & 15;   // 0..15
+
+  // Thread indices within the 16x16 tile
+  const uint32_t tm = warp_id & 1;           // 0 or 1 (which row of the 2x1 mini-tile)
+  const uint32_t tn = lane_id;               // 0-15 column index
+
+  // Shared memory layout
+  // Pad rows by 1 to avoid bank conflicts
+  const uint32_t SMEM_STRIDE_A = TILE_K + 1; // 17
+  const uint32_t SMEM_STRIDE_B = TILE_N + 1; // 17
+  const uint32_t smem_A_base = 0;
+  const uint32_t smem_B_base = smem_A_base + TILE_M * SMEM_STRIDE_A * sizeof(float); // 16 * 17 * 4 = 1088
+
+  // Grid-stride loop over output tiles
+  for (uint32_t block_row = 0; block_row < M; block_row += TILE_M) {
+    for (uint32_t block_col = 0; block_col < N; block_col += TILE_N) {
+
+      float acc0 = 0.0f;
+      float acc1 = 0.0f;
+
+      // Loop over K dimension in tiles
+      for (uint32_t block_k = 0; block_k < K; block_k += TILE_K) {
+        // --- Cooperative Load Phase ---
+
+        // Load A tile (16x16) -> 128 threads load 2 elements each
+        // Thread (warp_id, lane_id) loads A[block_row + warp_id, block_k + lane_id]
+        // We have 8 warps, 2 elements per warp for 16 rows -> warp_id maps to row pair
+        const uint32_t a_row_0 = block_row + (warp_id / 2) * 2 + 0;
+        const uint32_t a_row_1 = block_row + (warp_id / 2) * 2 + 1;
+        const uint32_t a_col = block_k + lane_id;
+        
+        if (a_row_0 < M && a_col < K) {
+            uint32_t a_val_0_bits = __builtin_bit_cast(uint32_t, args->A[a_row_0 * K + a_col]);
+            store_shared(smem_A_base, (a_row_0 % TILE_M) * SMEM_STRIDE_A * 4 + lane_id * 4, a_val_0_bits);
+        }
+        if (a_row_1 < M && a_col < K) {
+            uint32_t a_val_1_bits = __builtin_bit_cast(uint32_t, args->A[a_row_1 * K + a_col]);
+            store_shared(smem_A_base, (a_row_1 % TILE_M) * SMEM_STRIDE_A * 4 + lane_id * 4, a_val_1_bits);
+        }
+
+        // Load B tile (16x16) -> 128 threads load 2 elements each
+        // Thread (warp_id, lane_id) loads B[block_k + warp_id, block_col + lane_id]
+        const uint32_t b_row_0 = block_k + (warp_id / 2) * 2 + 0;
+        const uint32_t b_row_1 = block_k + (warp_id / 2) * 2 + 1;
+        const uint32_t b_col = block_col + lane_id;
+
+        if (b_row_0 < K && b_col < N) {
+            uint32_t b_val_0_bits = __builtin_bit_cast(uint32_t, args->B[b_row_0 * N + b_col]);
+            store_shared(smem_B_base, (b_row_0 % TILE_K) * SMEM_STRIDE_B * 4 + lane_id * 4, b_val_0_bits);
+        }
+        if (b_row_1 < K && b_col < N) {
+            uint32_t b_val_1_bits = __builtin_bit_cast(uint32_t, args->B[b_row_1 * N + b_col]);
+            store_shared(smem_B_base, (b_row_1 % TILE_K) * SMEM_STRIDE_B * 4 + lane_id * 4, b_val_1_bits);
+        }
+
+        // Cross-core barrier: Ensure all SMEM loads are complete
+        mu_barrier(0, threads_per_threadblock / 16); // 8 warps total
+
+        // --- Compute Phase ---
+        // Each thread computes 2 elements of the output tile
+        // Thread (tm=0/1, tn=lane_id) computes C[row_tm, block_col + tn]
+        const uint32_t row_0 = block_row + (warp_id & 6) + 0; // Warp 0,2,4,6 map to rows 0,2,4,6
+        const uint32_t row_1 = block_row + (warp_id & 6) + 1; // Warp 1,3,5,7 map to rows 1,3,5,7
+
+        #pragma GCC unroll 1
+        for (uint32_t k_elem = 0; k_elem < TILE_K; k_elem++) {
+          float a_frag_0 = __builtin_bit_cast(float, load32_shared(smem_A_base + ((row_0 - block_row) * SMEM_STRIDE_A + k_elem) * 4));
+          float a_frag_1 = __builtin_bit_cast(float, load32_shared(smem_A_base + ((row_1 - block_row) * SMEM_STRIDE_A + k_elem) * 4));
+          float b_frag = __builtin_bit_cast(float, load32_shared(smem_B_base + (k_elem * SMEM_STRIDE_B + tn) * 4));
+
+          acc0 += a_frag_0 * b_frag;
+          acc1 += a_frag_1 * b_frag;
+        }
+
+        // Cross-core barrier: Ensure compute is done before next SMEM load
+        mu_barrier(0, threads_per_threadblock / 16); // 8 warps total
+      }
+
+      // --- Write-back Phase ---
+      const uint32_t out_row_0 = block_row + (warp_id & 6) + 0;
+      const uint32_t out_row_1 = block_row + (warp_id & 6) + 1;
+      const uint32_t out_col = block_col + tn;
+
+      if (out_row_0 < M && out_col < N) {
+        args->C[out_row_0 * N + out_col] = acc0;
+      }
+      if (out_row_1 < M && out_col < N) {
+        args->C[out_row_1 * N + out_col] = acc1;
+      }
+    }
+  }
+}

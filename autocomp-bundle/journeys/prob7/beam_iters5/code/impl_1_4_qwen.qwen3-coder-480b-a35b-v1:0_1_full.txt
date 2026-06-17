@@ -1,0 +1,107 @@
+```cpp
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t seq = a->seq;
+  const uint32_t d = a->d;
+  const uint32_t nw = threads_per_threadblock / MU_NUM_THREADS;
+
+  // Shared Memory Layout (128 KiB):
+  // Buffer A: 0x00000 - 0x10000 (64 KiB)
+  //   Phases 1-3: Q (32 KiB), K (32 KiB)
+  //   Phases 4-6: V (32 KiB), O (32 KiB)
+  // Buffer B: 0x10000 - 0x20000 (64 KiB)
+  //   S (64 KiB, 128x128 floats)
+
+  constexpr uint32_t smem_base_q = 0x00000;
+  constexpr uint32_t smem_base_k = 0x08000;
+  constexpr uint32_t smem_base_v = 0x00000;
+  constexpr uint32_t smem_base_o = 0x08000;
+  constexpr uint32_t smem_base_s = 0x10000;
+
+  // Phase 1: Cooperative load Q and K into SMEM
+  const __global float* Q = a->Q;
+  const __global float* K = a->K;
+  for (uint32_t idx = tid_in_threadblock; idx < seq * d; idx += threads_per_threadblock) {
+    store_shared(smem_base_q, idx * 4, *(Q + idx));
+    store_shared(smem_base_k, idx * 4, *(K + idx));
+  }
+  mu_barrier(0, nw);
+
+  // Phase 2: Compute scores S[i][j] = Q[i] · K[j]
+  for (uint32_t i = tid_in_threadblock; i < seq; i += threads_per_threadblock) {
+    for (uint32_t j = 0; j < seq; j++) {
+      float acc = 0.0f;
+      uint32_t q_offset = (i * d) * 4;
+      uint32_t k_offset = (j * d) * 4;
+      for (uint32_t k = 0; k < d; k++) {
+        float q_val = load32_shared(q_offset + k * 4);
+        float k_val = load32_shared(k_offset + k * 4);
+        acc += q_val * k_val;
+      }
+      uint32_t s_idx = (i * seq + j) * 4;
+      store_shared(smem_base_s, s_idx, acc * 0.125f);
+    }
+  }
+  mu_barrier(0, nw);
+
+  // Phase 3: Softmax in-place on S
+  for (uint32_t i = tid_in_threadblock; i < seq; i += threads_per_threadblock) {
+    uint32_t s_row_base = (i * seq) * 4;
+    float m = load32_shared(s_row_base);
+    for (uint32_t j = 1; j < seq; j++) {
+      float val = load32_shared(s_row_base + j * 4);
+      if (val > m) m = val;
+    }
+
+    float sum = 0.0f;
+    for (uint32_t j = 0; j < seq; j++) {
+      float val = load32_shared(s_row_base + j * 4);
+      float e = mu_exp(val - m);
+      store_shared(smem_base_s, s_row_base + j * 4, e);
+      sum += e;
+    }
+
+    float inv_sum = 1.0f / sum;
+    for (uint32_t j = 0; j < seq; j++) {
+      float val = load32_shared(s_row_base + j * 4);
+      store_shared(smem_base_s, s_row_base + j * 4, val * inv_sum);
+    }
+  }
+  mu_barrier(0, nw);
+
+  // Phase 4: Cooperative load V into SMEM (reusing Q's space)
+  const __global float* V = a->V;
+  for (uint32_t idx = tid_in_threadblock; idx < seq * d; idx += threads_per_threadblock) {
+    store_shared(smem_base_v, idx * 4, *(V + idx));
+  }
+  mu_barrier(0, nw);
+
+  // Phase 5: Compute output O[i][k] = sum_j S[i][j] * V[j][k]
+  for (uint32_t i = tid_in_threadblock; i < seq; i += threads_per_threadblock) {
+    for (uint32_t k = 0; k < d; k++) {
+      float acc = 0.0f;
+      uint32_t s_row_base = (i * seq) * 4;
+      for (uint32_t j = 0; j < seq; j++) {
+        float s_val = load32_shared(s_row_base + j * 4);
+        float v_val = load32_shared(((j * d + k) * 4));
+        acc += s_val * v_val;
+      }
+      store_shared(smem_base_o, ((i * d + k) * 4), acc);
+    }
+  }
+  mu_barrier(0, nw);
+
+  // Phase 6: Write O back to global memory
+  __global float* O = a->O;
+  for (uint32_t idx = tid_in_threadblock; idx < seq * d; idx += threads_per_threadblock) {
+    float val = load32_shared(smem_base_o + idx * 4);
+    *(O + idx) = val;
+  }
+}
+```

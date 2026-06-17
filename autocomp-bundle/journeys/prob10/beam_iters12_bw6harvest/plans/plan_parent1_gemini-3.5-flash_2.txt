@@ -1,0 +1,128 @@
+An elegant and highly optimized implementation for the large-K matrix multiplication has been designed to maximize performance on the Radiance Muon GPU architecture while strictly respecting the **31-register limit**.
+
+### Optimization Plan
+
+1. **The Bottleneck**: The baseline code streams the $K$ dimension directly from global memory for every single output. This leads to extremely high global memory traffic (each element of $A$ and $B$ is loaded $64\times$ redundantly) and uncoalesced memory accesses.
+2. **Strategy Selected**: **8. use separate load and compute phases with a single barrier between them per tile**. We will stage $A$ and $B$ in Shared Memory (SMEM) in tiles of $BK = 16$. 
+3. **Register-Safe Tiling via SMEM Accumulation**: Since the 128 threads must compute 4096 outputs ($64 \times 64$), each thread is responsible for 32 outputs. To keep register usage under 31, we cannot keep 32 accumulators in registers. Instead, we allocate a $64 \times 64$ accumulator array in SMEM (16 KB) and stream the $K$-dimension in tiles of 16. In each tile step, we cooperatively load $A$ and $B$ tiles, synchronize, and then update the SMEM accumulators.
+4. **Bank-Conflict Free Thread Mapping**: We map threads to outputs using `out_idx = op * 128 + tid`. For any warp of 16 threads, this guarantees:
+   - Accesses to `smem_A` have identical row indices, resulting in a **pure broadcast** (zero bank conflicts).
+   - Accesses to `smem_B` have consecutive column indices, mapping perfectly to consecutive banks (zero bank conflicts).
+5. **Instruction and Address Optimization**:
+   - We use pointer-incrementing loops instead of complex index calculations in the inner loop.
+   - We manually unroll the inner loop by 2 to hide the 2-cycle SMEM load latency without bloating the register file.
+
+### C++ Kernel Code
+
+```cpp
+#include <stdint.h>
+
+struct KernelArgs {
+  const __global float* A;
+  const __global float* B;
+  __global float* C;
+  uint32_t M;
+  uint32_t N;
+  uint32_t K;
+};
+
+// Custom helper to store to shared memory using runtime-calculated addresses
+static inline void store32_shared(uint32_t address, uint32_t data) {
+  asm volatile("sw.shared %1, 0(%0)" :: "r"(address), "r"(data) : "memory");
+}
+
+static inline float bits_to_float(uint32_t bits) {
+  return __builtin_bit_cast(float, bits);
+}
+
+static inline uint32_t float_to_bits(float f) {
+  return __builtin_bit_cast(uint32_t, f);
+}
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  (void)threads_per_threadblock;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  const uint32_t N = args->N;
+  const uint32_t K = args->K;
+
+  // Base addresses in SMEM (128 KB total available)
+  const uint32_t smem_A = 0;             // 64 rows * 16 cols * 4 bytes = 4096 bytes
+  const uint32_t smem_B = 1024 * 4;      // 16 rows * 64 cols * 4 bytes = 4096 bytes
+  const uint32_t smem_C = 2048 * 4;      // 64 rows * 64 cols * 4 bytes = 16384 bytes
+
+  // Initialize smem_C to 0 (completely coalesced & bank-conflict free)
+  for (uint32_t i = tid_in_threadblock; i < 4096; i += 128) {
+    store32_shared(smem_C + i * 4, 0);
+  }
+  mu_barrier(0, 8); // Cross-core barrier to sync initialization
+
+  // Stream across K in tiles of BK = 16
+  for (uint32_t kk = 0; kk < K; kk += 16) {
+    
+    // Phase 1: Cooperatively load A and B tiles from Global Mem to SMEM
+    {
+      // Load A tile: 64 rows x 16 cols. Coalesced global reads.
+      for (uint32_t i = tid_in_threadblock; i < 1024; i += 128) {
+        uint32_t r = i / 16;
+        uint32_t c = i % 16;
+        float val = args->A[r * K + kk + c];
+        store32_shared(smem_A + i * 4, float_to_bits(val));
+      }
+
+      // Load B tile: 16 rows x 64 cols. Coalesced global reads.
+      for (uint32_t i = tid_in_threadblock; i < 1024; i += 128) {
+        uint32_t k = i / 64;
+        uint32_t c = i % 64;
+        float val = args->B[(kk + k) * N + c];
+        store32_shared(smem_B + i * 4, float_to_bits(val));
+      }
+    }
+
+    mu_barrier(0, 8); // Wait for SMEM staging to complete across both cores
+
+    // Phase 2: Compute partial products and accumulate in SMEM
+    {
+      for (uint32_t op = 0; op < 32; op++) {
+        uint32_t out_idx = op * 128 + tid_in_threadblock;
+        uint32_t r = out_idx / 64;
+        uint32_t c = out_idx % 64;
+
+        float acc = bits_to_float(load32_shared(smem_C + out_idx * 4));
+
+        uint32_t a_ptr = smem_A + r * 16 * 4;
+        uint32_t b_ptr = smem_B + c * 4;
+
+        // Unroll loop manually by 2 to hide SMEM read latency
+        for (uint32_t k = 0; k < 16; k += 2) {
+          float a0 = bits_to_float(load32_shared(a_ptr));
+          float b0 = bits_to_float(load32_shared(b_ptr));
+          float a1 = bits_to_float(load32_shared(a_ptr + 4));
+          float b1 = bits_to_float(load32_shared(b_ptr + 256));
+
+          acc += a0 * b0;
+          acc += a1 * b1;
+
+          a_ptr += 8;
+          b_ptr += 512;
+        }
+
+        store32_shared(smem_C + out_idx * 4, float_to_bits(acc));
+      }
+    }
+
+    mu_barrier(0, 8); // Sync before staging the next tile
+  }
+
+  // Phase 3: Write finalized outputs from SMEM back to global memory (fully coalesced)
+  for (uint32_t i = tid_in_threadblock; i < 4096; i += 128) {
+    args->C[i] = bits_to_float(load32_shared(smem_C + i * 4));
+  }
+}
+```

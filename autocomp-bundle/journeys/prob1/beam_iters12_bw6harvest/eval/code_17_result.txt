@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nkernel.cpp:66:3: error: unknown type name '__local'\n   66 |   __local float* smem = (__local float*)0;\n      |   ^\nkernel.cpp:66:26: error: use of undeclared identifier '__local'\n   66 |   __local float* smem = (__local float*)0;\n      |                          ^\nkernel.cpp:99:5: error: unknown type name '__local'\n   99 |     __local float* wa = &smem[smem_w_offset + oc * CKK];\n      |     ^\nkernel.cpp:100:5: error: unknown type name '__local'\n  100 |     __local float* pa = &smem[p * CKK_padded];\n      |     ^\n4 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

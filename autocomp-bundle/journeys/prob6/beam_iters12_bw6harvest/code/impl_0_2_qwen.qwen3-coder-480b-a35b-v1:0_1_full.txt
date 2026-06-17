@@ -1,0 +1,113 @@
+```cpp
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t M = args->M, N = args->N, K = args->K;
+  const uint32_t num_warps = threads_per_threadblock / MU_NUM_THREADS;
+
+  // Use 64x64 output tile with 32x16 per-threadblock chunk
+  const uint32_t TILE_M = 32;
+  const uint32_t TILE_N = 16;
+  const uint32_t BLOCK_K = 32;
+
+  // Shared memory layout with padding to avoid bank conflicts
+  const uint32_t A_SMEM_STRIDE = TILE_M + 1;  // 33 to avoid 4-way conflicts
+  const uint32_t B_SMEM_STRIDE = TILE_N + 1;  // 17 to avoid 16-way conflicts
+  const uint32_t smem_a = 0;
+  const uint32_t smem_b = A_SMEM_STRIDE * BLOCK_K * sizeof(float);
+
+  // Thread mapping: 32 threads in M-dim, 4 threads in N-dim
+  const uint32_t th_y = tid_in_threadblock / 4;
+  const uint32_t th_x = tid_in_threadblock % 4;
+
+  // Loop over 64x64 output tiles
+  for (uint32_t by = 0; by < M; by += TILE_M * 2) {
+    for (uint32_t bx = 0; bx < N; bx += TILE_N * 4) {
+      // Loop over sub-tiles within the 64x64 tile
+      for (uint32_t ty = 0; ty < 2; ++ty) {
+        for (uint32_t tx = 0; tx < 4; ++tx) {
+          float acc = 0.0f;
+          
+          // Compute base positions for this sub-tile
+          const uint32_t m_base = by + ty * TILE_M;
+          const uint32_t n_base = bx + tx * TILE_N;
+          
+          // Boundary check
+          if (m_base + th_y >= M || n_base + th_x * 4 >= N) continue;
+
+          // Main K-loop with tiling
+          for (uint32_t k_outer = 0; k_outer < K; k_outer += BLOCK_K) {
+            // Stage A tile to shared memory (coalesced)
+            for (uint32_t i = tid_in_threadblock; i < TILE_M * BLOCK_K; i += threads_per_threadblock) {
+              const uint32_t local_m = i / BLOCK_K;
+              const uint32_t local_k = i % BLOCK_K;
+              const uint32_t global_m = m_base + local_m;
+              const uint32_t global_k = k_outer + local_k;
+              
+              if (global_m < M && global_k < K) {
+                const uint32_t addr = smem_a + (local_m * A_SMEM_STRIDE + local_k) * sizeof(float);
+                store_shared(addr, 0, __builtin_bit_cast(uint32_t, args->A[global_m * K + global_k]));
+              }
+            }
+
+            // Stage B tile to shared memory (coalesced)
+            for (uint32_t i = tid_in_threadblock; i < TILE_N * BLOCK_K; i += threads_per_threadblock) {
+              const uint32_t local_k = i / TILE_N;
+              const uint32_t local_n = i % TILE_N;
+              const uint32_t global_k = k_outer + local_k;
+              const uint32_t global_n = n_base + local_n;
+              
+              if (global_k < K && global_n < N) {
+                const uint32_t addr = smem_b + (local_k * B_SMEM_STRIDE + local_n) * sizeof(float);
+                store_shared(addr, 0, __builtin_bit_cast(uint32_t, args->B[global_k * N + global_n]));
+              }
+            }
+
+            // Cross-core synchronization after SMEM staging
+            mu_barrier(0, num_warps);
+
+            // Compute partial products
+            const uint32_t a_addr_base = smem_a + th_y * A_SMEM_STRIDE * sizeof(float);
+            const uint32_t b_addr_base = smem_b + th_x * 4 * sizeof(float);
+            
+            for (uint32_t k_inner = 0; k_inner < BLOCK_K; ++k_inner) {
+              const uint32_t a_addr = a_addr_base + k_inner * A_SMEM_STRIDE * sizeof(float);
+              const uint32_t b_addr = b_addr_base + k_inner * B_SMEM_STRIDE * sizeof(float);
+              
+              float a_val = __builtin_bit_cast(float, load32_shared(a_addr));
+              
+              #pragma GCC unroll 1
+              for (uint32_t j = 0; j < 4; ++j) {
+                float b_val = __builtin_bit_cast(float, load32_shared(b_addr + j * sizeof(float)));
+                if (j == 0) acc += a_val * b_val;
+              }
+            }
+
+            // Synchronize before reusing SMEM
+            mu_barrier(0, num_warps);
+          }
+
+          // Write back result
+          const uint32_t c_m = m_base + th_y;
+          const uint32_t c_n_base = n_base + th_x * 4;
+          
+          if (c_m < M) {
+            #pragma GCC unroll 1
+            for (uint32_t j = 0; j < 4; ++j) {
+              const uint32_t c_n = c_n_base + j;
+              if (c_n < N) {
+                args->C[c_m * N + c_n] = acc;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```

@@ -1,0 +1,84 @@
+#include <stdint.h>
+
+struct KernelArgs {
+  const float* A;
+  const float* B;
+  float* C;
+  uint32_t M;
+  uint32_t N;
+  uint32_t K;
+};
+
+static inline float bits_to_float(uint32_t b) { union { uint32_t u; float f; } c; c.u = b; return c.f; }
+static inline uint32_t float_to_bits(float f) { union { uint32_t u; float f; } c; c.f = f; return c.u; }
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  const uint32_t M = args->M;
+  const uint32_t N = args->N;
+  const uint32_t K = args->K;
+
+  const uint32_t smem_a = 0;
+  const uint32_t smem_b = 16 * 768 * 4; 
+  const uint32_t PAD = 16;              
+  const uint32_t b_stride = 768 + PAD;  
+
+  for (uint32_t block_row = 0; block_row < (M + 15) / 16; block_row++) {
+    for (uint32_t block_col = 0; block_col < (N + 15) / 16; block_col++) {
+
+      const uint32_t global_row_base = block_row * 16;
+      const uint32_t global_col_base = block_col * 16;
+
+      // Load A tile: 16 rows x K elements
+      for (uint32_t i = tid_in_threadblock; i < 16 * K && global_row_base + (i / K) < M; i += threads_per_threadblock) {
+        const uint32_t local_row = i / K;
+        const uint32_t k = i % K;
+        const uint32_t global_row = global_row_base + local_row;
+        const uint32_t global_idx = global_row * K + k;
+        store_shared(smem_a + (local_row * K + k) * 4, 0, float_to_bits(args->A[global_idx]));
+      }
+
+      // Load B tile: K rows x 16 cols (transposed and padded)
+      for (uint32_t i = tid_in_threadblock; i < K * 16 && global_col_base + (i % 16) < N; i += threads_per_threadblock) {
+        const uint32_t k = i / 16;
+        const uint32_t local_col = i % 16;
+        const uint32_t global_col = global_col_base + local_col;
+        const uint32_t global_idx = k * N + global_col;
+        store_shared(smem_b + (local_col * b_stride + k) * 4, 0, float_to_bits(args->B[global_idx]));
+      }
+
+      mu_barrier(0, threads_per_threadblock / 16); 
+
+      // Compute and store results
+      if (global_row_base + (tid_in_threadblock / 16) < M && global_col_base + (tid_in_threadblock % 16) < N) {
+        const uint32_t local_row = tid_in_threadblock / 16;
+        const uint32_t local_col = tid_in_threadblock % 16;
+
+        float acc = 0.0f;
+        uint32_t ptr_a = smem_a + local_row * K * 4;
+        uint32_t ptr_b = smem_b + local_col * b_stride * 4;
+
+        for (uint32_t k = 0; k < K; k++) {
+          const float a_val = bits_to_float(load32_shared(ptr_a));
+          const float b_val = bits_to_float(load32_shared(ptr_b));
+          acc += a_val * b_val;
+          ptr_a += 4;
+          ptr_b += 4;
+        }
+
+        const uint32_t global_row = global_row_base + local_row;
+        const uint32_t global_col = global_col_base + local_col;
+        args->C[global_row * N + global_col] = acc;
+      }
+
+      mu_barrier(0, threads_per_threadblock / 16);
+    }
+  }
+}

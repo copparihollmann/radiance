@@ -1,0 +1,81 @@
+```cpp
+#include <vx_intrinsics.h>
+#include <mu_intrinsics.h>
+#include <mu_schedule.h>
+#include <shared_mem.h>
+#include <stdint.h>
+
+struct KernelArgs {
+  __global float* A;
+  __global float* B;
+  __global float* C;
+  uint32_t M;
+  uint32_t K;
+  uint32_t N;
+};
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  (void)threads_per_threadblock;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  // Shared memory layout: 128 floats for A tile, 256 floats for B tile
+  __shared float* const smem = reinterpret_cast<__shared float*>(0x0);
+  __shared float* As = smem;
+  __shared float* Bs = smem + 128;
+
+  const uint32_t tid = tid_in_threadblock;
+  const uint32_t i = tid >> 4;  // Row within tile (0..7)
+  const uint32_t j = tid & 15;  // Column within tile (0..15)
+
+  // Precompute base pointers and strides
+  const __global float* A_base = args->A;
+  const __global float* B_base = args->B;
+  __global float* C_base = args->C;
+
+  // Loop over M dimension in blocks of 8 rows
+  for (uint32_t block_r = 0; block_r < 8; block_r++) {
+    // Loop over N dimension in blocks of 16 columns
+    for (uint32_t block_c = 0; block_c < 4; block_c++) {
+      float acc = 0.0f;
+
+      // Loop over K dimension in blocks of 16
+      for (uint32_t ks = 0; ks < 4; ks++) {
+        // Load A tile (8x16) - coalesced access
+        uint32_t a_row = (block_r << 3) + i;
+        uint32_t a_col = (ks << 4) + j;
+        As[tid] = A_base[(a_row << 6) + a_col];
+
+        // Load B tile (16x16) - split into two parts for coalescing
+        uint32_t b_row1 = (ks << 4) + i;
+        uint32_t b_row2 = (ks << 4) + i + 8;
+        uint32_t b_col = (block_c << 4) + j;
+        Bs[tid]       = B_base[(b_row1 << 6) + b_col];
+        Bs[tid + 128] = B_base[(b_row2 << 6) + b_col];
+
+        // Cross-core barrier: ensure SMEM writes are visible
+        mu_barrier(0, 8);
+
+        // Compute partial product for this K-slice
+        #pragma GCC unroll 1
+        for (uint32_t k = 0; k < 16; k++) {
+          acc += As[(i << 4) + k] * Bs[(k << 4) + j];
+        }
+
+        // Synchronize before next iteration
+        mu_barrier(0, 8);
+      }
+
+      // Write result back to global memory - coalesced access
+      uint32_t c_row = (block_r << 3) + i;
+      uint32_t c_col = (block_c << 4) + j;
+      C_base[(c_row << 6) + c_col] = acc;
+    }
+  }
+}
+```

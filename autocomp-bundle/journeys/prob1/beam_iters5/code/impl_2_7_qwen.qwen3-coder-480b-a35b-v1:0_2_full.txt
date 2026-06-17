@@ -1,0 +1,101 @@
+```cpp
+#include <stdint.h>
+
+// Definition of KernelArgs matching the harness
+struct KernelArgs {
+  float* in;
+  float* w;
+  float* out;
+  uint32_t OC, C, KH, KW, H, W, OH, OW, stride;
+};
+
+static inline void store_shared(uint32_t base, uint32_t offset, uint32_t data) {
+    asm volatile("sw.shared %2, %1(%0)" :: "r"(base), "I"(offset), "r"(data) : "memory");
+}
+
+static inline uint32_t load32_shared(uint32_t address) {
+    uint32_t data;
+    asm volatile("lw.shared %0, %1(%2)" : "=r"(data) : "I"(0), "r"(address) : "memory");
+    return data;
+}
+
+static inline void mu_barrier(unsigned barrier_id, unsigned num_warps) {
+    asm volatile ("vx_bar %0, %1" :: "r"(barrier_id), "r"(num_warps) : "memory");
+}
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  
+  const uint32_t CKK = a->C * a->KH * a->KW; // 3 * 16 * 16 = 768
+  const uint32_t P = a->OH * a->OW;          // 4 * 4 = 16
+  const uint32_t smem_patch_stride = 769;    // padded stride to avoid bank conflicts
+  const uint32_t smem_w_offset = smem_patch_stride * P; // Start of weights in SMEM
+  
+  // (1) Stage weights W[OC][CKK] into SMEM
+  for (uint32_t i = tid_in_threadblock; i < a->OC * CKK; i += threads_per_threadblock) {
+    store_shared(smem_w_offset * 4 + i * 4, 0, __builtin_bit_cast(uint32_t, a->w[i]));
+  }
+
+  // (2) Gather patches into SMEM with padding to eliminate bank conflicts
+  {
+    const uint32_t Wd = a->W;
+    const uint32_t H = a->H;
+    const uint32_t stride = a->stride;
+    
+    // Iterate over chunks of ckk to maintain coalescing
+    for (uint32_t p = 0; p < P; ++p) {
+      const uint32_t out_row = p / a->OW;
+      const uint32_t out_col = p % a->OW;
+      
+      for (uint32_t ckk_base = 0; ckk_base < CKK; ckk_base += threads_per_threadblock) {
+        const uint32_t ckk_tid = ckk_base + tid_in_threadblock;
+        if (ckk_tid >= CKK) continue;
+
+        // Fast index calculation using shifts/masks
+        const uint32_t c = ckk_tid >> 8;              // ckk / 256
+        const uint32_t kh = (ckk_tid >> 4) & 0xF;     // (ckk % 256) / 16
+        const uint32_t kw = ckk_tid & 0xF;            // ckk % 16
+        
+        const uint32_t in_h = out_row * stride + kh;
+        const uint32_t in_w = out_col * stride + kw;
+        const uint32_t in_idx = c * H * Wd + in_h * Wd + in_w;
+        
+        store_shared((p * smem_patch_stride + ckk_tid) * 4, 0, __builtin_bit_cast(uint32_t, a->in[in_idx]));
+      }
+    }
+  }
+
+  // Synchronize after SMEM writes from both cores
+  mu_barrier(0, threads_per_threadblock / 16);
+
+  // (3) Frugal matmul: OUT[oc*P + p] = sum_ckk W[oc][ckk] * patch[p][ckk]
+  for (uint32_t idx = tid_in_threadblock; idx < a->OC * P; idx += threads_per_threadblock) {
+    const uint32_t oc = idx / P;
+    const uint32_t p = idx % P;
+    
+    const uint32_t w_base_addr = smem_w_offset * 4 + oc * CKK * 4;
+    const uint32_t patch_base_addr = p * smem_patch_stride * 4;
+    
+    float acc = 0.0f;
+    uint32_t w_addr = w_base_addr;
+    uint32_t patch_addr = patch_base_addr;
+    
+    // Inner product loop with fixed unroll factor to stay under register limit
+    for (uint32_t k = 0; k < CKK; ++k) {
+      const float w_val = __builtin_bit_cast(float, load32_shared(w_addr));
+      const float patch_val = __builtin_bit_cast(float, load32_shared(patch_addr));
+      acc += w_val * patch_val;
+      w_addr += 4;
+      patch_addr += 4;
+    }
+    
+    a->out[idx] = acc;
+  }
+}
+```

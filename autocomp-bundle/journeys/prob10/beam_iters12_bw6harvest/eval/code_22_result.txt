@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\ne $x99\n  BEQ killed renamable $x99, $x0, %bb.11\n\nbb.31.if.then102:\n; predecessors: %bb.30\n  successors: %bb.11(0x80000000); %bb.11(100.00%)\n  liveins: $x5, $x6, $x7, $x10, $x11, $x12, $x13, $x14, $x15, $x16, $x17, $x28, $x29, $x30, $x31, $x32, $x33, $x34, $x35, $x36, $x37, $x38, $x39, $x40, $x41, $x42, $x43, $x44, $x45, $x46, $x47, $x96, $x98, $x105\n  renamable $x97 = LW renamable $x10, 8 :: (load (s32) from %ir.sunkaddr224, !tbaa !36)\n  renamable $x100 = SLLI killed renamable $x98, 2\n  renamable $x98 = ADD renamable $x7, killed renamable $x100\n  renamable $x99 = ADD killed renamable $x97, killed renamable $x98\n  SW killed renamable $x105, killed renamable $x99, 0 :: (store (s32) into %ir.arrayidx105, !tbaa !23)\n  PseudoBR %bb.11\n\nbb.32:\n; predecessors: %bb.8\n  successors: %bb.33(0x80000000); %bb.33(100.00%)\n  liveins: $x13, $x14, $x36\n  $x1 = LW $x2, 12 :: (load (s32) from %stack.0)\n  $x2 = frame-destroy ADDI $x2, 16\n\nbb.33.join_stub251:\n; predecessors: %bb.32, %bb.6\n  successors: %bb.34(0x80000000); %bb.34(100.00%)\n  liveins: $x13, $x14, $x36, $x1\n  VX_JOIN killed renamable $x36\n\nbb.34.join_stub256:\n; predecessors: %bb.1, %bb.33\n  successors: %bb.35(0x80000000); %bb.35(100.00%)\n  liveins: $x13, $x14, $x1\n  VX_JOIN killed renamable $x13\n\nbb.35.join_stub257:\n; predecessors: %bb.0, %bb.34\n  liveins: $x14, $x1\n  VX_JOIN killed renamable $x14\n  PseudoRET\n\n# End machine code for function _ZL11kernel_bodyPvjjj.\n\n2 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

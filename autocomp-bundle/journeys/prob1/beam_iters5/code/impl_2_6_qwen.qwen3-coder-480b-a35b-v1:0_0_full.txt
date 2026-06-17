@@ -1,0 +1,115 @@
+```cpp
+#include <stdint.h>
+
+// Macro to load from shared memory using a compile-time immediate offset.
+// This leverages the I2-type format of the lw.shared instruction.
+#define load32_shared_offset(addr, offset) ({ \
+    uint32_t __data; \
+    asm volatile("lw.shared %0, %1(%2)" : "=r"(__data) : "i"(offset), "r"(addr) : "memory"); \
+    __data; \
+})
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  // Precomputed constants based on problem dimensions.
+  const uint32_t CKK = 768;              // 3 * 16 * 16
+  const uint32_t P = 16;                 // 4 * 4
+  const uint32_t OC = 16;
+  const uint32_t smem_w = 49152;         // OC * CKK * 4
+  
+  const uint32_t Wd = 64;
+  const uint32_t HWd = 4096;             // 64 * 64
+  const uint32_t stride = 16;
+  const uint32_t total_patches = P * CKK; // 16 * 768 = 12288
+
+  // Phase 1: Stage weights (W) into shared memory.
+  {
+    uint32_t w_index = tid_in_threadblock;
+    uint32_t smem_addr = smem_w + w_index * 4;
+    while (w_index < OC * CKK) {
+      store_shared(smem_addr, 0, __builtin_bit_cast(uint32_t, a->w[w_index]));
+      w_index += threads_per_threadblock;
+      smem_addr += threads_per_threadblock * 4;
+    }
+  }
+
+  // Phase 2: Gather input patches using incremental addressing to eliminate div/mod.
+  {
+    uint32_t p = 0;
+    uint32_t ckk = tid_in_threadblock;
+    uint32_t smem_addr = tid_in_threadblock * 4;
+
+    while (p < P) {
+      // Bitwise extraction since KH=16, KW=16, OW=4 are powers of two.
+      const uint32_t c   = ckk >> 8;           // ckk / 256
+      const uint32_t tmp = ckk & 0xFF;         
+      const uint32_t kh  = tmp >> 4;           // (ckk % 256) / 16
+      const uint32_t kw  = tmp & 0xF;          // ckk % 16
+
+      const uint32_t ph = p >> 2;              // p / 4
+      const uint32_t pw = p & 0x3;             // p % 4
+
+      const uint32_t in_idx = c * HWd + (ph * stride + kh) * Wd + pw * stride + kw;
+      store_shared(smem_addr, 0, __builtin_bit_cast(uint32_t, a->in[in_idx]));
+
+      // Advance indices for next iteration.
+      ckk += threads_per_threadblock;
+      if (ckk >= CKK) {
+        ckk -= CKK;
+        ++p;
+      }
+      smem_addr += threads_per_threadblock * 4;
+    }
+  }
+
+  // Cross-core synchronization barrier.
+  mu_barrier(0, threads_per_threadblock / 16); // 8 warps total
+
+  // Phase 3: Compute output matrix multiplication with unrolled inner loop.
+  {
+    uint32_t out_index = tid_in_threadblock;
+    while (out_index < OC * P) {
+      const uint32_t oc = out_index >> 4;   // out_index / P
+      const uint32_t p  = out_index & 0xF;  // out_index % P
+
+      uint32_t wa_base = smem_w + oc * CKK * 4;
+      uint32_t pa_base = p * CKK * 4;
+
+      float acc = 0.0f;
+      uint32_t k = 0;
+      // Fully unroll the inner loop in chunks of 8 to maximize ILP (Rule #11, #9).
+      while (k < 768) {
+        acc += __builtin_bit_cast(float, load32_shared_offset(wa_base, 0)) *
+               __builtin_bit_cast(float, load32_shared_offset(pa_base, 0));
+        acc += __builtin_bit_cast(float, load32_shared_offset(wa_base, 4)) *
+               __builtin_bit_cast(float, load32_shared_offset(pa_base, 4));
+        acc += __builtin_bit_cast(float, load32_shared_offset(wa_base, 8)) *
+               __builtin_bit_cast(float, load32_shared_offset(pa_base, 8));
+        acc += __builtin_bit_cast(float, load32_shared_offset(wa_base, 12)) *
+               __builtin_bit_cast(float, load32_shared_offset(pa_base, 12));
+        acc += __builtin_bit_cast(float, load32_shared_offset(wa_base, 16)) *
+               __builtin_bit_cast(float, load32_shared_offset(pa_base, 16));
+        acc += __builtin_bit_cast(float, load32_shared_offset(wa_base, 20)) *
+               __builtin_bit_cast(float, load32_shared_offset(pa_base, 20));
+        acc += __builtin_bit_cast(float, load32_shared_offset(wa_base, 24)) *
+               __builtin_bit_cast(float, load32_shared_offset(pa_base, 24));
+        acc += __builtin_bit_cast(float, load32_shared_offset(wa_base, 28)) *
+               __builtin_bit_cast(float, load32_shared_offset(pa_base, 28));
+
+        wa_base += 32;
+        pa_base += 32;
+        k += 8;
+      }
+      a->out[out_index] = acc;
+      out_index += threads_per_threadblock;
+    }
+  }
+}
+```

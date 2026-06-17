@@ -1,0 +1,129 @@
+An elegant and highly effective optimization plan to significantly reduce execution time while strictly adhering to the 31-register limit.
+
+### Inefficiency Analysis
+
+1. **Heavy Integer Division and Modulo Overhead**: The baseline gather phase (`step 2`) performs multiple division and modulo operations per iteration (`i / CKK`, `i % CKK`, `ckk / (KH * KW)`, etc.) to calculate multi-dimensional input indices. On the Muon SIMT core, integer division is extremely slow and lacks hardware pipelining, introducing massive instruction stalls.
+2. **Severe Shared Memory Bank Conflicts**: During the matmul phase (`step 3`), the patch stride in shared memory is exactly $CKK = 768$ floats, which is a multiple of 16 (the bank count). Consequently, all 16 lanes in a warp access the exact same SMEM bank simultaneously, causing a **16-way bank conflict** that serializes the reads.
+3. **FP32 Instruction Latency Stalls**: FP32 operations are half-throughput on this architecture (taking 2 cycles). The baseline matmul loop does not unroll the accumulation, meaning there are no independent instructions to hide this 2-cycle pipeline latency.
+
+---
+
+### Optimization Plan (Strategy 5: Coalesced Thread Mapping & Zero-Conflict SMEM Layout)
+
+We will apply **Strategy 5** to map contiguous thread IDs to contiguous memory addresses while introducing padding to eliminate SMEM bank conflicts:
+
+1. **Restructure Loops for Coalescing and Shift/Mask Indexing**: 
+   Since $CKK = 768$ is a multiple of 128, we restructure the gather loop to let `ckk = ckk_base + tid_in_threadblock`. This guarantees that consecutive threads process contiguous memory addresses, achieving **perfectly coalesced global loads**.
+   Since $KH=16, KW=16, C=3$, all division and modulo operations can be replaced with fast bitwise shifts and masks (e.g. `c = ckk >> 8`, `kh = (ckk >> 4) & 15`, `kw = ckk & 15`).
+
+2. **1-Float Padding to Avoid SMEM Bank Conflicts**:
+   We will pad the patches in SMEM by exactly 1 float (stride in SMEM becomes $769$ floats). This changes the lane `i` address offset to `i * 769`, making lane accesses completely conflict-free across the 16 banks (`(i * 769) % 16 = i`).
+
+3. **Loop Unrolling (ILP) to Hide FP32 Latency**:
+   We will unroll the matmul inner loop by `4` to expose multiple independent FP32 MAC operations per cycle, hiding the 2-cycle execution latency without exceeding the 31-register budget.
+
+---
+
+### Optimized Code
+
+```cpp
+#include <stdint.h>
+
+// Definition of KernelArgs matching the harness
+struct KernelArgs {
+  float* in;
+  float* w;
+  float* out;
+  uint32_t OC, C, KH, KW, H, W, OH, OW, stride;
+};
+
+static inline void store_shared(uint32_t base, uint32_t offset, uint32_t data) {
+    asm volatile("sw.shared %2, %1(%0)" :: "r"(base), "I"(offset), "r"(data) : "memory");
+}
+
+static inline uint32_t load32_shared(uint32_t address) {
+    uint32_t data;
+    asm volatile("lw.shared %0, %1(%2)" : "=r"(data) : "I"(0), "r"(address) : "memory");
+    return data;
+}
+
+static inline void mu_barrier(unsigned barrier_id, unsigned num_warps) {
+    asm volatile ("vx_bar %0, %1" :: "r"(barrier_id), "r"(num_warps) : "memory");
+}
+
+inline void mu_fence_smem() {
+    asm volatile ("fence.s" ::: "memory");
+}
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  (void)threads_per_threadblock;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  
+  // (1) Stage W flat into SMEM (weights start after padded patches).
+  // Total size of padded patches: 16 patches * 769 floats * 4 bytes/float = 49216 bytes.
+  const uint32_t smem_w = 49216;
+  {
+    for (uint32_t i = tid_in_threadblock; i < 12288; i += 128) {
+      store_shared(smem_w + i * 4, 0, __builtin_bit_cast(uint32_t, a->w[i]));
+    }
+  }
+
+  // (2) Gather im2col patches into SMEM [0..49216].
+  // Restructured to eliminate division/modulo and align contiguous threads to contiguous memory.
+  {
+    for (uint32_t p = 0; p < 16; p++) {
+      const uint32_t pr = p >> 2;
+      const uint32_t pc = p & 3;
+      const uint32_t p_part = (pr << 10) + (pc << 4);
+      for (uint32_t ckk_base = 0; ckk_base < 768; ckk_base += 128) {
+        const uint32_t ckk = ckk_base + tid_in_threadblock;
+        const uint32_t c = ckk >> 8;
+        const uint32_t kh = (ckk >> 4) & 15;
+        const uint32_t kw = ckk & 15;
+        const uint32_t in_idx = (c << 12) + p_part + (kh << 6) + kw;
+        // Pad each patch to 769 floats in SMEM to completely avoid bank conflicts
+        store_shared((p * 769 + ckk) * 4, 0, __builtin_bit_cast(uint32_t, a->in[in_idx]));
+      }
+    }
+  }
+
+  // Enforce cross-core coherence of SMEM writes before proceeding to the matmul
+  mu_fence_smem();
+  mu_barrier(0, 8); // 8 warps total
+
+  // (3) Matmul: OUT[idx] = sum_ckk W[oc][ckk] * patch[p][ckk].
+  // Unrolled by 4 to exploit ILP and hide the 2-cycle FP32 SIMT latency.
+  {
+    for (uint32_t idx = tid_in_threadblock; idx < 256; idx += 128) {
+      const uint32_t wa_base = smem_w + (idx >> 4) * 3072;
+      const uint32_t pa_base = (idx & 15) * 3076; // 769 * 4 = 3076 bytes stride
+      float acc = 0.0f;
+      uint32_t wa = wa_base;
+      uint32_t pa = pa_base;
+      for (uint32_t k = 0; k < 768; k += 4) {
+        float w0 = __builtin_bit_cast(float, load32_shared(wa));
+        float p0 = __builtin_bit_cast(float, load32_shared(pa));
+        float w1 = __builtin_bit_cast(float, load32_shared(wa + 4));
+        float p1 = __builtin_bit_cast(float, load32_shared(pa + 4));
+        float w2 = __builtin_bit_cast(float, load32_shared(wa + 8));
+        float p2 = __builtin_bit_cast(float, load32_shared(pa + 8));
+        float w3 = __builtin_bit_cast(float, load32_shared(wa + 12));
+        float p3 = __builtin_bit_cast(float, load32_shared(pa + 12));
+        acc += w0 * p0;
+        acc += w1 * p1;
+        acc += w2 * p2;
+        acc += w3 * p3;
+        wa += 16;
+        pa += 16;
+      }
+      a->out[idx] = acc;
+    }
+  }
+}
+```

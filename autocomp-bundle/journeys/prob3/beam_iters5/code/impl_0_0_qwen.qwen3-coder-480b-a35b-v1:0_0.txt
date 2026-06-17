@@ -1,0 +1,210 @@
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t seq = a->seq;
+  const uint32_t d = a->d;
+  const uint32_t num_warps = threads_per_threadblock / MU_NUM_THREADS;
+  const float scale = 0.125f;
+
+  // Shared memory layout (base address 0x00000000)
+  const uint32_t smem_K_base     = 0x00000000; // 24 KiB
+  const uint32_t smem_V_base     = 0x00006000; // 24 KiB
+  const uint32_t smem_S_base     = 0x0000C000; // 36 KiB
+  const uint32_t smem_red_base   = 0x00015000; // 512 bytes
+
+  const __global float* Q = a->Q;
+  const __global float* K = a->K;
+  const __global float* V = a->V;
+        __global float* O = a->O;
+        __global float* scratch = a->scratch; // Not used in optimized version
+
+  const uint32_t warp_id = tid_in_threadblock / MU_NUM_THREADS;
+  const uint32_t lane_id = tid_in_threadblock % MU_NUM_THREADS;
+
+  // --- Phase 0: Cooperative Load K and V into SMEM ---
+  // Load K (seq x d) -> smem_K (seq x d)
+  for (uint32_t i = tid_in_threadblock; i < seq * d; i += threads_per_threadblock) {
+    const uint32_t addr = smem_K_base + i * sizeof(float);
+    store_shared(addr, 0, K[i]);
+  }
+
+  // Load V (seq x d) -> smem_V (seq x d)
+  for (uint32_t i = tid_in_threadblock; i < seq * d; i += threads_per_threadblock) {
+    const uint32_t addr = smem_V_base + i * sizeof(float);
+    store_shared(addr, 0, V[i]);
+  }
+
+  mu_barrier(0, num_warps); // Cross-core barrier for SMEM visibility
+
+  // --- Phase 1: Compute Scores S = QK^T * scale in SMEM ---
+  for (uint32_t idx = tid_in_threadblock; idx < seq * seq; idx += threads_per_threadblock) {
+    const uint32_t i = idx / seq; // Row in Q (and S)
+    const uint32_t j = idx % seq; // Col in K (and S)
+
+    float acc = 0.0f;
+    const uint32_t q_row_base_addr = i * d;
+    const uint32_t k_col_base_addr = j; // Stride is 'seq' because K is transposed implicitly
+
+    // Dot product Q[i,:] * K[:,j] (which is K[j,:])
+#pragma GCC unroll 1
+    for (uint32_t k_idx = 0; k_idx < d; k_idx++) {
+      const uint32_t q_addr = (q_row_base_addr + k_idx) * sizeof(float);
+      const uint32_t k_addr = (k_col_base_addr + k_idx * seq) * sizeof(float);
+      float q_val = load32_shared(smem_K_base + q_addr); // Reuse smem_K_base for Q load logic clarity - corrected below
+      // Correct Q load: Q is in global memory
+      q_val = Q[q_row_base_addr + k_idx];
+      const float k_val = load32_shared(smem_K_base + k_addr);
+      acc += q_val * k_val;
+    }
+    const float scaled_acc = acc * scale;
+    
+    const uint32_t s_addr = smem_S_base + idx * sizeof(float);
+    store_shared(s_addr, 0, scaled_acc);
+  }
+
+  mu_barrier(0, num_warps); // Sync after writing S to SMEM
+
+  // --- Phase 2: Hierarchical Softmax in SMEM ---
+  const uint32_t rows_per_warp = (seq + num_warps - 1) / num_warps;
+  const uint32_t start_row = warp_id * rows_per_warp;
+  const uint32_t end_row = (start_row + rows_per_warp > seq) ? seq : start_row + rows_per_warp;
+
+  for (uint32_t row = start_row; row < end_row; row++) {
+    const uint32_t s_row_base_addr = row * seq;
+
+    // 1. Find row max
+    float thread_max = -__builtin_inff();
+#pragma GCC unroll 1
+    for (uint32_t j = lane_id; j < seq; j += MU_NUM_THREADS) {
+      const uint32_t addr = (s_row_base_addr + j) * sizeof(float);
+      const float val = load32_shared(smem_S_base + addr);
+      if (val > thread_max) thread_max = val;
+    }
+
+    // 2. Warp-level reduction for max
+    const uint32_t red_max_addr_base = smem_red_base + (warp_id * MU_NUM_THREADS) * sizeof(float);
+    const uint32_t red_max_addr = red_max_addr_base + lane_id * sizeof(float);
+    store_shared(red_max_addr, 0, thread_max);
+    mu_barrier(0, num_warps); // Ensure all warps have written their partial maxes
+
+    // Reduce within a single warp (using all 16 lanes for a 16-element reduction)
+    if (lane_id < 8) {
+        const float v1 = load32_shared(red_max_addr_base + (lane_id * 2) * sizeof(float));
+        const float v2 = load32_shared(red_max_addr_base + (lane_id * 2 + 1) * sizeof(float));
+        const float m = (v1 > v2) ? v1 : v2;
+        store_shared(red_max_addr_base + lane_id * sizeof(float), 0, m);
+    }
+    mu_barrier(0, num_warps);
+    if (lane_id < 4) {
+        const float v1 = load32_shared(red_max_addr_base + (lane_id * 2) * sizeof(float));
+        const float v2 = load32_shared(red_max_addr_base + (lane_id * 2 + 1) * sizeof(float));
+        const float m = (v1 > v2) ? v1 : v2;
+        store_shared(red_max_addr_base + lane_id * sizeof(float), 0, m);
+    }
+    mu_barrier(0, num_warps);
+    if (lane_id < 2) {
+        const float v1 = load32_shared(red_max_addr_base + (lane_id * 2) * sizeof(float));
+        const float v2 = load32_shared(red_max_addr_base + (lane_id * 2 + 1) * sizeof(float));
+        const float m = (v1 > v2) ? v1 : v2;
+        store_shared(red_max_addr_base + lane_id * sizeof(float), 0, m);
+    }
+    mu_barrier(0, num_warps);
+    float row_max = -__builtin_inff();
+    if (lane_id == 0) {
+        const float v1 = load32_shared(red_max_addr_base + 0 * sizeof(float));
+        const float v2 = load32_shared(red_max_addr_base + 1 * sizeof(float));
+        row_max = (v1 > v2) ? v1 : v2;
+        store_shared(red_max_addr_base, 0, row_max); // Broadcast result
+    }
+    mu_barrier(0, num_warps); // Make sure row_max is available to all
+    row_max = load32_shared(red_max_addr_base);
+
+
+    // 3. Compute exp and find row sum
+    float thread_sum = 0.0f;
+#pragma GCC unroll 1
+    for (uint32_t j = lane_id; j < seq; j += MU_NUM_THREADS) {
+      const uint32_t addr = (s_row_base_addr + j) * sizeof(float);
+      const float val = load32_shared(smem_S_base + addr);
+      const float exp_val = mu_exp(val - row_max);
+      store_shared(smem_S_base + addr, 0, exp_val); // Overwrite S with exp(S[i,j] - max)
+      thread_sum += exp_val;
+    }
+
+    // 4. Warp-level reduction for sum
+    const uint32_t red_sum_addr_base = smem_red_base + (warp_id * MU_NUM_THREADS + MU_NUM_THREADS) * sizeof(float); // Offset by 16 floats
+    const uint32_t red_sum_addr = red_sum_addr_base + lane_id * sizeof(float);
+    store_shared(red_sum_addr, 0, thread_sum);
+    mu_barrier(0, num_warps); // Ensure all warps have written their partial sums
+
+    // Reduce within a single warp
+    if (lane_id < 8) {
+        const float v1 = load32_shared(red_sum_addr_base + (lane_id * 2) * sizeof(float));
+        const float v2 = load32_shared(red_sum_addr_base + (lane_id * 2 + 1) * sizeof(float));
+        const float s = v1 + v2;
+        store_shared(red_sum_addr_base + lane_id * sizeof(float), 0, s);
+    }
+    mu_barrier(0, num_warps);
+    if (lane_id < 4) {
+        const float v1 = load32_shared(red_sum_addr_base + (lane_id * 2) * sizeof(float));
+        const float v2 = load32_shared(red_sum_addr_base + (lane_id * 2 + 1) * sizeof(float));
+        const float s = v1 + v2;
+        store_shared(red_sum_addr_base + lane_id * sizeof(float), 0, s);
+    }
+    mu_barrier(0, num_warps);
+    if (lane_id < 2) {
+        const float v1 = load32_shared(red_sum_addr_base + (lane_id * 2) * sizeof(float));
+        const float v2 = load32_shared(red_sum_addr_base + (lane_id * 2 + 1) * sizeof(float));
+        const float s = v1 + v2;
+        store_shared(red_sum_addr_base + lane_id * sizeof(float), 0, s);
+    }
+    mu_barrier(0, num_warps);
+    float row_sum = 0.0f;
+    if (lane_id == 0) {
+        const float v1 = load32_shared(red_sum_addr_base + 0 * sizeof(float));
+        const float v2 = load32_shared(red_sum_addr_base + 1 * sizeof(float));
+        row_sum = v1 + v2;
+        store_shared(red_sum_addr_base, 0, row_sum); // Broadcast result
+    }
+    mu_barrier(0, num_warps); // Make sure row_sum is available to all
+    row_sum = load32_shared(red_sum_addr_base);
+    const float inv_row_sum = 1.0f / row_sum;
+
+
+    // 5. Normalize
+#pragma GCC unroll 1
+    for (uint32_t j = lane_id; j < seq; j += MU_NUM_THREADS) {
+      const uint32_t addr = (s_row_base_addr + j) * sizeof(float);
+      const float exp_val = load32_shared(smem_S_base + addr);
+      const float norm_val = exp_val * inv_row_sum;
+      store_shared(smem_S_base + addr, 0, norm_val);
+    }
+  }
+
+  mu_barrier(0, num_warps); // Sync after softmax
+
+  // --- Phase 3: Compute Output O = S * V ---
+  for (uint32_t idx = tid_in_threadblock; idx < seq * d; idx += threads_per_threadblock) {
+    const uint32_t i = idx / d; // Row in O (and S)
+    const uint32_t k = idx % d; // Col in O (and V)
+
+    float acc = 0.0f;
+    const uint32_t s_row_base_addr = i * seq;
+    const uint32_t v_col_base_addr = k; // Stride is 'd'
+
+#pragma GCC unroll 1
+    for (uint32_t j = 0; j < seq; j++) {
+      const uint32_t s_addr = (s_row_base_addr + j) * sizeof(float);
+      const uint32_t v_addr = (v_col_base_addr + j * d) * sizeof(float);
+      const float s_val = load32_shared(smem_S_base + s_addr);
+      const float v_val = load32_shared(smem_V_base + v_addr);
+      acc += s_val * v_val;
+    }
+    O[idx] = acc;
+  }
+}

@@ -1,0 +1,106 @@
+An elegant and highly optimized plan to improve performance of the 64x64 FP32 matrix multiplication on the Radiance Muon GPU architecture while strictly respecting the **<= 31 distinct registers limit** (RTL constraint).
+
+### Optimization Strategy: Shared Memory Staging + Register Reuse + Bank-Conflict-Free Thread Mapping
+
+1. **Leverage the entire 128 KiB Shared Memory (SMEM)**:
+   Since $M=64, N=64, K=64$, the entire input matrices $A$ (16 KiB) and $B$ (16 KiB) fit completely in SMEM. Staging them once into SMEM eliminates all redundant global memory accesses during the core computation loop, reducing memory latency overhead to almost zero.
+
+2. **Transposed layout with Padding for B to avoid bank conflicts**:
+   We will transpose matrix $B$ while loading it into SMEM. This makes accesses along the $K$-dimension contiguous. To avoid SMEM bank conflicts when different warps/threads read $B$, we will pad the column stride to 65 (`PAD = 1`).
+
+3. **Conflict-Free Column Spacing**:
+   Each thread will compute exactly 4 outputs in a row. Instead of adjacent columns (which would cause bank conflicts across threads in a warp), we space the columns by 16 (i.e. thread `i` computes columns `i, i+16, i+32, i+48`). This guarantees that every thread in the warp accesses a completely different SMEM bank on every step, yielding a **100% bank-conflict-free** execution.
+
+4. **Register Limit Safe (<= 31 Registers)**:
+   Instead of using multiple base address pointers or deep loop unrolling, we will keep the inner loop unrolled by only 2 and load elements using standard immediate offsets on a single base address. This lets the compiler optimize register reuse aggressively and keeps the register footprint well below 20 registers, safely avoiding RTL physical register oversubscription.
+
+5. **Cross-Core Barrier**:
+   We will use `mu_barrier(0, 8)` to synchronize SMEM staging across both cores (8 warps total).
+
+### Optimized Code
+
+```cpp
+#include <cstdint>
+
+// Custom load helper utilizing immediate offset to avoid address-arithmetic registers
+inline uint32_t load32_shared_offset(uint32_t address, uint32_t offset) {
+  uint32_t data;
+  asm volatile("lw.shared %0, %1(%2)" : "=r"(data) : "I"(offset), "r"(address) : "memory");
+  return data;
+}
+
+inline float bits_to_float(uint32_t bits) {
+  return __builtin_bit_cast(float, bits);
+}
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  (void)threads_per_threadblock;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  // Address definitions in SMEM (128 KiB total space available)
+  const uint32_t smem_a = 0;
+  const uint32_t smem_b = 16384; // 16 KiB offset
+
+  // 1. Cooperative coalesced load of A into SMEM
+  for (uint32_t i = tid_in_threadblock; i < 4096; i += 128) {
+    uint32_t val;
+    asm volatile("lw.global %0, 0(%1)" : "=r"(val) : "r"(&args->A[i]) : "memory");
+    store_shared(smem_a, i * 4, val);
+  }
+
+  // 2. Cooperative coalesced load of B into SMEM (transposed + padded layout)
+  for (uint32_t i = tid_in_threadblock; i < 4096; i += 128) {
+    uint32_t val;
+    asm volatile("lw.global %0, 0(%1)" : "=r"(val) : "r"(&args->B[i]) : "memory");
+    uint32_t k = i >> 6;    // i / 64
+    uint32_t col = i & 63;  // i % 64
+    store_shared(smem_b, (col * 65 + k) * 4, val);
+  }
+
+  // Enforce memory ordering and cross-core synchronization (8 warps total)
+  mu_fence_smem();
+  mu_barrier(0, 8);
+
+  // 3. Compute C using register tiles spaced for bank-conflict-free execution
+  for (uint32_t q = tid_in_threadblock; q < 1024; q += 128) {
+    uint32_t row = q >> 4;   // q / 16
+    uint32_t col0 = q & 15;  // q % 16
+    
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    uint32_t a_ptr = smem_a + row * 64 * 4;
+    uint32_t b0 = smem_b + col0 * 65 * 4;
+
+    // Unroll by 2 to balance ILP and Register Pressure
+    for (uint32_t k = 0; k < 64; k += 2) {
+      // k = 0
+      float a = bits_to_float(load32_shared(a_ptr));
+      acc0 += a * bits_to_float(load32_shared_offset(b0, 0));
+      acc1 += a * bits_to_float(load32_shared_offset(b0, 4160));  // 16 * 65 * 4
+      acc2 += a * bits_to_float(load32_shared_offset(b0, 8320));  // 32 * 65 * 4
+      acc3 += a * bits_to_float(load32_shared_offset(b0, 12480)); // 48 * 65 * 4
+
+      // k = 1
+      float a_next = bits_to_float(load32_shared(a_ptr + 4));
+      acc0 += a_next * bits_to_float(load32_shared_offset(b0, 4));
+      acc1 += a_next * bits_to_float(load32_shared_offset(b0, 4164));
+      acc2 += a_next * bits_to_float(load32_shared_offset(b0, 8324));
+      acc3 += a_next * bits_to_float(load32_shared_offset(b0, 12484));
+
+      a_ptr += 8;
+      b0 += 8;
+    }
+
+    // Write back results directly to global memory
+    args->C[row * 64 + col0] = acc0;
+    args->C[row * 64 + col0 + 16] = acc1;
+    args->C[row * 64 + col0 + 32] = acc2;
+    args->C[row * 64 + col0 + 48] = acc3;
+  }
+}
+```

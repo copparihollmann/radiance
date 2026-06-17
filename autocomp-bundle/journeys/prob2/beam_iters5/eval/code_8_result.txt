@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nundeclared identifier 'S_SOFFSET'\n  100 |     uint32_t row_base = S_SOFFSET + r * 65 * 4;\n      |                         ^\nkernel.cpp:103:15: error: use of undeclared identifier 'load_float_shared'\n  103 |     float m = load_float_shared(row_base);\n      |               ^\nkernel.cpp:105:17: error: use of undeclared identifier 'load_float_shared'\n  105 |       float v = load_float_shared(row_base + j * 4);\n      |                 ^\nkernel.cpp:114:17: error: use of undeclared identifier 'load_float_shared'\n  114 |       float v = load_float_shared(row_base + j * 4);\n      |                 ^\nkernel.cpp:116:7: error: use of undeclared identifier 'store_float_shared'\n  116 |       store_float_shared(row_base + j * 4, e);\n      |       ^\nkernel.cpp:123:17: error: use of undeclared identifier 'load_float_shared'\n  123 |       float e = load_float_shared(row_base + j * 4);\n      |                 ^\nkernel.cpp:124:7: error: use of undeclared identifier 'store_float_shared'\n  124 |       store_float_shared(row_base + j * 4, e * inv_sum);\n      |       ^\nkernel.cpp:138:35: error: use of undeclared identifier 'S_SOFFSET'\n  138 |       float p = load_float_shared(S_SOFFSET + (i * 65 + j) * 4);\n      |                                   ^\nkernel.cpp:139:35: error: use of undeclared identifier 'V_SOFFSET'\n  139 |       float v = load_float_shared(V_SOFFSET + (j * 65 + k) * 4);\n      |                                   ^\n15 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

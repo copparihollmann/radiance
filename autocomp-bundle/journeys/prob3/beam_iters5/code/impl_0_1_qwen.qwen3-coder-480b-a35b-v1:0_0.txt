@@ -1,0 +1,90 @@
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t seq = a->seq;
+  const uint32_t d = a->d;
+  const uint32_t num_warps = threads_per_threadblock / MU_NUM_THREADS;
+  const float scale = 0.125f;
+
+  // Phase 1: scores
+  for (uint32_t idx = tid_in_threadblock; idx < seq * seq; idx += threads_per_threadblock) {
+    const uint32_t i = idx / seq;
+    const uint32_t j = idx % seq;
+    float acc = 0.0f;
+    for (uint32_t k = 0; k < d; k++) {
+      acc += a->Q[i * d + k] * a->K[j * d + k];
+    }
+    a->scratch[idx] = acc * scale;
+  }
+  mu_barrier(1, num_warps);
+
+  // Phase 2: softmax with hierarchical reduction in shared memory
+  const uint32_t smem_max_offset = 0;
+  const uint32_t smem_exp_offset = 512; // 128 * 4 bytes, aligned
+
+  for (uint32_t row = 0; row < seq; row++) {
+    const uint32_t global_row_base = row * seq;
+
+    // Cooperative load into shared memory
+    float v = (tid_in_threadblock < seq) ? a->scratch[global_row_base + tid_in_threadblock] : -1e30f;
+    store_shared(0, smem_max_offset + tid_in_threadblock * 4, *(uint32_t*)&v);
+    mu_barrier(0, num_warps);
+
+    // Hierarchical max reduction in shared memory
+    for (uint32_t offset = 64; offset > 0; offset /= 2) {
+      if (tid_in_threadblock < offset) {
+        float lhs = *(float*)(&load32_shared(smem_max_offset + (tid_in_threadblock) * 4));
+        float rhs = *(float*)(&load32_shared(smem_max_offset + (tid_in_threadblock + offset) * 4));
+        float res = (lhs > rhs) ? lhs : rhs;
+        store_shared(0, smem_max_offset + tid_in_threadblock * 4, *(uint32_t*)&res);
+      }
+      mu_barrier(0, num_warps);
+    }
+
+    // Broadcast max value
+    float m = *(float*)(&load32_shared(smem_max_offset));
+
+    // Compute exp(v - m) and store back to shared memory
+    float e = (tid_in_threadblock < seq) ? mu_exp(v - m) : 0.0f;
+    store_shared(0, smem_exp_offset + tid_in_threadblock * 4, *(uint32_t*)&e);
+    mu_barrier(0, num_warps);
+
+    // Hierarchical sum reduction in shared memory
+    for (uint32_t offset = 64; offset > 0; offset /= 2) {
+      if (tid_in_threadblock < offset) {
+        float lhs = *(float*)(&load32_shared(smem_exp_offset + (tid_in_threadblock) * 4));
+        float rhs = *(float*)(&load32_shared(smem_exp_offset + (tid_in_threadblock + offset) * 4));
+        float res = lhs + rhs;
+        store_shared(0, smem_exp_offset + tid_in_threadblock * 4, *(uint32_t*)&res);
+      }
+      mu_barrier(0, num_warps);
+    }
+
+    // Broadcast inverse sum
+    float sum = *(float*)(&load32_shared(smem_exp_offset));
+    float inv_sum = 1.0f / sum;
+
+    // Normalize and write back to global memory
+    if (tid_in_threadblock < seq) {
+      float normalized_e = e * inv_sum;
+      a->scratch[global_row_base + tid_in_threadblock] = normalized_e;
+    }
+    mu_barrier(0, num_warps);
+  }
+
+  // Phase 3: O = P V
+  for (uint32_t idx = tid_in_threadblock; idx < seq * d; idx += threads_per_threadblock) {
+    const uint32_t i = idx / d;
+    const uint32_t k = idx % d;
+    float acc = 0.0f;
+    for (uint32_t j = 0; j < seq; j++) {
+      acc += a->scratch[i * seq + j] * a->V[j * d + k];
+    }
+    a->O[idx] = acc;
+  }
+}

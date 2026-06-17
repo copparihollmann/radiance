@@ -1,0 +1,104 @@
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t M = args->M, N = args->N, K = args->K;
+  const uint32_t num_warps = threads_per_threadblock / MU_NUM_THREADS; // 8 warps
+
+  // Tile dimensions
+  const uint32_t TILE_M = 64;
+  const uint32_t TILE_N = 64;
+  const uint32_t TILE_K = 32;
+
+  // Shared memory layout with padding to avoid bank conflicts
+  const uint32_t smem_a = 0;                                    // 64x32 => 8192 bytes
+  const uint32_t smem_b = smem_a + TILE_M * TILE_K * 4;         // 32x64 padded to 33 => 8448 bytes
+  const uint32_t smem_c = smem_b + TILE_K * (TILE_N + 1) * 4;   // 64x64 => 16384 bytes
+  // Total used: 8192 + 8448 + 16384 = 33024 bytes < 128 KiB
+
+  // Zero-initialize shared memory for C tile
+  for (uint32_t i = tid_in_threadblock; i < TILE_M * TILE_N; i += threads_per_threadblock) {
+    store_shared(smem_c + i * 4, 0, 0);
+  }
+  mu_barrier(0, num_warps);
+
+  // Process K-tiles
+  for (uint32_t k_outer = 0; k_outer < K; k_outer += TILE_K) {
+    // Collaborative loading of A tile (64 x 32)
+    for (uint32_t p = 0; p < TILE_M * TILE_K; p += threads_per_threadblock) {
+      uint32_t idx = tid_in_threadblock + p;
+      if (idx < TILE_M * TILE_K) {
+        uint32_t local_m = idx / TILE_K;
+        uint32_t local_k = idx % TILE_K;
+        uint32_t global_idx = (local_m) * K + (k_outer + local_k);
+        store_shared(smem_a + idx * 4, 0, __builtin_bit_cast(uint32_t, args->A[global_idx]));
+      }
+    }
+
+    // Collaborative loading of B tile (32 x 64) with padding +1 to avoid bank conflicts
+    for (uint32_t p = 0; p < TILE_K * TILE_N; p += threads_per_threadblock) {
+      uint32_t idx = tid_in_threadblock + p;
+      if (idx < TILE_K * TILE_N) {
+        uint32_t local_k = idx / TILE_N;
+        uint32_t local_n = idx % TILE_N;
+        uint32_t global_idx = (k_outer + local_k) * N + local_n;
+        uint32_t smem_idx = local_n * (TILE_K + 1) + local_k;
+        store_shared(smem_b + smem_idx * 4, 0, __builtin_bit_cast(uint32_t, args->B[global_idx]));
+      }
+    }
+
+    mu_barrier(0, num_warps);
+
+    // Thread mapping within the tile
+    // Each thread computes 4 elements in a 1x4 micro-tile of the C tile
+    const uint32_t thread_m = tid_in_threadblock / 16;
+    const uint32_t thread_n = (tid_in_threadblock % 16) * 4;
+
+    // Accumulate over K dimension
+    for (uint32_t k_inner = 0; k_inner < TILE_K; ++k_inner) {
+      // Load a full row of A for this thread's row index
+      float reg_a = __builtin_bit_cast(float, load32_shared(smem_a + (thread_m * TILE_K + k_inner) * 4));
+
+      // Reuse reg_a across 4 column computations of B/C
+      float reg_b0 = __builtin_bit_cast(float, load32_shared(smem_b + ((thread_n + 0) * (TILE_K + 1) + k_inner) * 4));
+      float reg_b1 = __builtin_bit_cast(float, load32_shared(smem_b + ((thread_n + 1) * (TILE_K + 1) + k_inner) * 4));
+      float reg_b2 = __builtin_bit_cast(float, load32_shared(smem_b + ((thread_n + 2) * (TILE_K + 1) + k_inner) * 4));
+      float reg_b3 = __builtin_bit_cast(float, load32_shared(smem_b + ((thread_n + 3) * (TILE_K + 1) + k_inner) * 4));
+
+      // Load previous accumulator values from SMEM
+      uint32_t c_offset = (thread_m * TILE_N + thread_n);
+      float acc0 = __builtin_bit_cast(float, load32_shared(smem_c + (c_offset + 0) * 4));
+      float acc1 = __builtin_bit_cast(float, load32_shared(smem_c + (c_offset + 1) * 4));
+      float acc2 = __builtin_bit_cast(float, load32_shared(smem_c + (c_offset + 2) * 4));
+      float acc3 = __builtin_bit_cast(float, load32_shared(smem_c + (c_offset + 3) * 4));
+
+      // Compute and accumulate
+      acc0 = __builtin_fmaf(reg_a, reg_b0, acc0);
+      acc1 = __builtin_fmaf(reg_a, reg_b1, acc1);
+      acc2 = __builtin_fmaf(reg_a, reg_b2, acc2);
+      acc3 = __builtin_fmaf(reg_a, reg_b3, acc3);
+
+      // Write updated accumulators back to SMEM
+      store_shared(smem_c + (c_offset + 0) * 4, 0, __builtin_bit_cast(uint32_t, acc0));
+      store_shared(smem_c + (c_offset + 1) * 4, 0, __builtin_bit_cast(uint32_t, acc1));
+      store_shared(smem_c + (c_offset + 2) * 4, 0, __builtin_bit_cast(uint32_t, acc2));
+      store_shared(smem_c + (c_offset + 3) * 4, 0, __builtin_bit_cast(uint32_t, acc3));
+    }
+    mu_barrier(0, num_warps);
+  }
+
+  // Write final C tile from SMEM to global memory
+  for (uint32_t p = 0; p < TILE_M * TILE_N; p += threads_per_threadblock) {
+    uint32_t idx = tid_in_threadblock + p;
+    if (idx < TILE_M * TILE_N) {
+      uint32_t m = idx / TILE_N;
+      uint32_t n = idx % TILE_N;
+      uint32_t global_idx = m * N + n;
+      args->C[global_idx] = __builtin_bit_cast(float, load32_shared(smem_c + idx * 4));
+    }
+  }
+}

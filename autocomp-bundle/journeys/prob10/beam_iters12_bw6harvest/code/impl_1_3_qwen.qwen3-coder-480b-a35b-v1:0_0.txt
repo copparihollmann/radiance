@@ -1,0 +1,104 @@
+#include <stdint.h>
+
+struct KernelArgs {
+  const float* A;
+  const float* B;
+  float* C;
+  uint32_t M;
+  uint32_t N;
+  uint32_t K;
+};
+
+static inline float bits_to_float(uint32_t b) {
+  union { uint32_t u; float f; } c;
+  c.u = b;
+  return c.f;
+}
+
+static inline uint32_t float_to_bits(float f) {
+  union { uint32_t u; float f; } c;
+  c.f = f;
+  return c.u;
+}
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  const uint32_t K = args->K; // 768
+  const uint32_t N = args->N; // 64
+
+  // Shared memory layout
+  const uint32_t smem_a_base = 0;
+  const uint32_t smem_b_base = 16 * 768 * 4; // 49152 bytes
+  const uint32_t PAD = 16; // Padding to avoid bank conflicts
+  const uint32_t b_stride = 768 + PAD; // Stride for B matrix in SMEM
+
+  // Iterate over 16 sub-blocks (4x4 grid of 16x16 blocks)
+  for (uint32_t block = 0; block < 16; ++block) {
+    const uint32_t block_row = block / 4; // 0 to 3
+    const uint32_t block_col = block % 4; // 0 to 3
+
+    const uint32_t global_row_base = block_row * 16;
+    const uint32_t global_col_base = block_col * 16;
+
+    // 1. Cooperatively load A tile (16 x 768) into SMEM
+    for (uint32_t i = tid_in_threadblock; i < 16 * 768; i += threads_per_threadblock) {
+      const uint32_t r = i / 768;
+      const uint32_t k = i % 768;
+      const uint32_t global_idx = (global_row_base + r) * K + k;
+      const uint32_t smem_addr = smem_a_base + i * 4;
+      store_shared(smem_addr, 0, float_to_bits(args->A[global_idx]));
+    }
+
+    // 2. Cooperatively load B tile (768 x 16) transposed into SMEM
+    for (uint32_t i = tid_in_threadblock; i < 768 * 16; i += threads_per_threadblock) {
+      const uint32_t k = i / 16;
+      const uint32_t col = i % 16;
+      const uint32_t global_idx = k * N + global_col_base + col;
+      const uint32_t smem_addr = smem_b_base + (col * b_stride + k) * 4;
+      store_shared(smem_addr, 0, float_to_bits(args->B[global_idx]));
+    }
+
+    // Cross-core barrier: Ensure SMEM writes are visible to all warps
+    mu_barrier(0, threads_per_threadblock / 16); // 8 warps total
+
+    // 3. Compute dot products using loaded tiles
+    const uint32_t lane_id = tid_in_threadblock % 16;
+    const uint32_t warp_id = tid_in_threadblock / 16;
+    const uint32_t row_1 = warp_id;
+    const uint32_t row_2 = warp_id + 8; // Second row for this thread
+
+    if (row_1 < 16) {
+      float acc_1 = 0.0f;
+      float acc_2 = 0.0f;
+
+      uint32_t ptr_a_1 = smem_a_base + row_1 * 768 * 4;
+      uint32_t ptr_a_2 = smem_a_base + row_2 * 768 * 4;
+      uint32_t ptr_b = smem_b_base + lane_id * b_stride * 4;
+
+      for (uint32_t k = 0; k < 768; ++k) {
+        const float b_val = bits_to_float(load32_shared(ptr_b));
+        acc_1 += bits_to_float(load32_shared(ptr_a_1)) * b_val;
+        acc_2 += bits_to_float(load32_shared(ptr_a_2)) * b_val;
+        ptr_a_1 += 4;
+        ptr_a_2 += 4;
+        ptr_b += 4;
+      }
+
+      // Store results to global memory
+      args->C[(global_row_base + row_1) * N + global_col_base + lane_id] = acc_1;
+      if (row_2 < 16) {
+        args->C[(global_row_base + row_2) * N + global_col_base + lane_id] = acc_2;
+      }
+    }
+
+    // Final cross-core barrier before next iteration
+    mu_barrier(0, threads_per_threadblock / 16);
+  }
+}

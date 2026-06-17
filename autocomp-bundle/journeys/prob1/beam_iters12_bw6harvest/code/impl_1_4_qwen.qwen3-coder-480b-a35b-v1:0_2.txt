@@ -1,0 +1,86 @@
+#include <mu_intrinsics.h>
+#include <mu_schedule.h>
+#include <stdint.h>
+
+// Assuming KernelArgs is defined by the harness
+struct KernelArgs;
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  // Vision Transformer Patch-Embedding Tile Dimensions
+  constexpr uint32_t OC = 16;
+  constexpr uint32_t CKK = 768;
+  constexpr uint32_t P = 16;
+  constexpr uint32_t OW = 4;
+  constexpr uint32_t KH = 16;
+  constexpr uint32_t KW = 16;
+  constexpr uint32_t HWd = 64 * 64;
+  constexpr uint32_t Wd = 64;
+  constexpr uint32_t stride = 16;
+  
+  // Pad CKK to eliminate SMEM bank conflicts. 769 is coprime to 16.
+  constexpr uint32_t CKK_padded = 769;
+  constexpr uint32_t smem_w = P * CKK_padded * 4; // W staged after patches
+
+  // (1) Stage W flat into SMEM[smem_w..].
+  for (uint32_t i = tid_in_threadblock; i < OC * CKK; i += threads_per_threadblock) {
+    uint32_t addr = smem_w + i * 4;
+    uint32_t data;
+    asm volatile("lw.global %0, 0(%1)" : "=r"(data) : "r"(&(a->w[i])) : "memory");
+    asm volatile("sw.shared %1, 0(%0)" :: "r"(addr), "r"(data) : "memory");
+  }
+
+  // (2) Restructured gather of im2col patches into SMEM[0..]
+  // Closed-form address calculation to eliminate divisions/modulos
+  for (uint32_t p = 0; p < P; ++p) {
+    const uint32_t p_div_OW = p >> 2;        // p / OW
+    const uint32_t p_mod_OW = p & 3;         // p % OW
+    const uint32_t h_base = p_div_OW * stride;
+    const uint32_t w_base = p_mod_OW * stride;
+
+    for (uint32_t ckk = tid_in_threadblock; ckk < CKK; ckk += threads_per_threadblock) {
+      // Bitwise computation of indices
+      const uint32_t c = ckk >> 8;              // ckk / (KH * KW)
+      const uint32_t rem = ckk & 255;           // ckk % (KH * KW)
+      const uint32_t kh = rem >> 4;             // rem / KW
+      const uint32_t kw = rem & 15;             // rem % KW
+
+      const uint32_t in_idx = c * HWd + (h_base + kh) * Wd + (w_base + kw);
+      const uint32_t smem_addr = (p * CKK_padded + ckk) * 4;
+      
+      uint32_t data;
+      asm volatile("lw.global %0, 0(%1)" : "=r"(data) : "r"(&(a->in[in_idx])) : "memory");
+      asm volatile("sw.shared %1, 0(%0)" :: "r"(smem_addr), "r"(data) : "memory");
+    }
+  }
+
+  // Synchronize across both cores (Cross-core barrier ID 0)
+  mu_barrier(0, threads_per_threadblock / MU_NUM_THREADS);
+
+  // (3) Frugal matmul with zero-bank-conflict SMEM access
+  for (uint32_t idx = tid_in_threadblock; idx < OC * P; idx += threads_per_threadblock) {
+    const uint32_t oc = idx >> 4; // idx / P
+    const uint32_t p = idx & 15;  // idx % P
+
+    uint32_t wa = smem_w + oc * CKK_padded * 4;
+    uint32_t pa = p * CKK_padded * 4;
+    float acc = 0.0f;
+
+    #pragma GCC unroll 1
+    for (uint32_t k = 0; k < CKK; ++k) {
+      float w_val = __builtin_bit_cast(float, load32_shared(wa));
+      float p_val = __builtin_bit_cast(float, load32_shared(pa));
+      acc += w_val * p_val;
+      wa += 4;
+      pa += 4;
+    }
+    a->out[idx] = acc;
+  }
+}

@@ -1,0 +1,90 @@
+#include <cstdint>
+
+// Custom load helper utilizing immediate offset to avoid address-arithmetic registers
+inline uint32_t load32_shared_offset(uint32_t address, uint32_t offset) {
+  uint32_t data;
+  asm volatile("lw.shared %0, %1(%2)" : "=r"(data) : "I"(offset), "r"(address) : "memory");
+  return data;
+}
+
+inline float bits_to_float(uint32_t bits) {
+  return __builtin_bit_cast(float, bits);
+}
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  (void)threads_per_threadblock;
+  auto* args = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  // Address definitions in SMEM (128 KiB total space available)
+  const uint32_t smem_a = 0;
+  const uint32_t smem_b = 16384; // 16 KiB offset for A (64x64 * 4 = 16384 bytes)
+
+  // 1. Cooperative coalesced load of A into SMEM
+  for (uint32_t i = tid_in_threadblock; i < 4096; i += 128) {
+    uint32_t val;
+    asm volatile("lw.global %0, 0(%1)" : "=r"(val) : "r"(&args->A[i]) : "memory");
+    store_shared(smem_a, i * 4, val);
+  }
+
+  // 2. Cooperative coalesced load of B into SMEM (transposed + padded layout)
+  for (uint32_t i = tid_in_threadblock; i < 4096; i += 128) {
+    uint32_t val;
+    asm volatile("lw.global %0, 0(%1)" : "=r"(val) : "r"(&args->B[i]) : "memory");
+    uint32_t k = i >> 6;    // i / 64
+    uint32_t col = i & 63;  // i % 64
+    // Store in transposed and padded manner to avoid bank conflicts
+    // New layout: B^T[col][k] stored at [col * (64 + PAD) + k]
+    // PAD = 1 => 65 elements per row stride
+    store_shared(smem_b, (col * 65 + k) * 4, val);
+  }
+
+  // Enforce memory ordering and cross-core synchronization (8 warps total)
+  mu_barrier(0, 8); // Cross-core barrier to ensure visibility of SMEM writes
+
+  // 3. Compute C using register tiles spaced for bank-conflict-free execution
+  // Each thread processes 4 elements in a row, spaced by 16 to avoid conflicts
+  for (uint32_t q = tid_in_threadblock; q < 1024; q += 128) {
+    uint32_t row = q >> 4;   // q / 16
+    uint32_t col0 = q & 15;  // q % 16
+
+    // Initialize accumulators - only one per output to stay under register limit
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+
+    // Base pointers into SMEM
+    uint32_t a_base = smem_a + row * 64 * 4;
+    uint32_t b0_base = smem_b + col0 * 65 * 4;
+
+    // Loop over K dimension with manual unrolling by 2 to balance ILP and register pressure
+    for (uint32_t k = 0; k < 64; k += 2) {
+      // Load A elements for current k and k+1
+      uint32_t a_elem0_bits = load32_shared_offset(a_base, k * 4);
+      uint32_t a_elem1_bits = load32_shared_offset(a_base, (k + 1) * 4);
+      float a_elem0 = bits_to_float(a_elem0_bits);
+      float a_elem1 = bits_to_float(a_elem1_bits);
+
+      // Accumulate for each output column with spacing to avoid bank conflicts
+      // Columns accessed: col0, col0+16, col0+32, col0+48
+      acc0 += a_elem0 * bits_to_float(load32_shared_offset(b0_base, k * 4));
+      acc1 += a_elem0 * bits_to_float(load32_shared_offset(b0_base, (k * 65 + 16 * 65) * 4));
+      acc2 += a_elem0 * bits_to_float(load32_shared_offset(b0_base, (k * 65 + 32 * 65) * 4));
+      acc3 += a_elem0 * bits_to_float(load32_shared_offset(b0_base, (k * 65 + 48 * 65) * 4));
+
+      acc0 += a_elem1 * bits_to_float(load32_shared_offset(b0_base, (k + 1) * 4));
+      acc1 += a_elem1 * bits_to_float(load32_shared_offset(b0_base, ((k + 1) * 65 + 16 * 65) * 4));
+      acc2 += a_elem1 * bits_to_float(load32_shared_offset(b0_base, ((k + 1) * 65 + 32 * 65) * 4));
+      acc3 += a_elem1 * bits_to_float(load32_shared_offset(b0_base, ((k + 1) * 65 + 48 * 65) * 4));
+    }
+
+    // Write back results directly to global memory
+    args->C[row * 64 + col0] = acc0;
+    args->C[row * 64 + col0 + 16] = acc1;
+    args->C[row * 64 + col0 + 32] = acc2;
+    args->C[row * 64 + col0 + 48] = acc3;
+  }
+}

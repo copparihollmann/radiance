@@ -1,0 +1,129 @@
+#include <vx_intrinsics.h>
+#include <mu_intrinsics.h>
+#include <mu_schedule.h>
+#include <shared_mem.h>
+#include <stdint.h>
+
+struct KernelArgs {
+  __global float* in;
+  __global float* w;
+  __global float* out;
+  uint32_t C;
+  uint32_t H;
+  uint32_t W;
+  uint32_t OC;
+  uint32_t OH;
+  uint32_t OW;
+  uint32_t KH;
+  uint32_t KW;
+  uint32_t stride;
+};
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t CKK = a->C * a->KH * a->KW;
+  const uint32_t smem_w = a->OH * a->OW * CKK * 4;
+
+  // Stage W flat into SMEM
+  for (uint32_t i = tid_in_threadblock; i < a->OC * CKK; i += threads_per_threadblock) {
+    store_shared(smem_w + i * 4, 0, __builtin_bit_cast(uint32_t, a->w[i]));
+  }
+
+  // Gather im2col patches with strength-reduced coordinate tracking
+  {
+    const uint32_t KH = a->KH, KW = a->KW, OW = a->OW;
+    const uint32_t Wd = a->W, HWd = a->H * Wd, stride = a->stride;
+    const uint32_t total = a->OH * OW * CKK;
+    const uint32_t C = a->C;
+    const uint32_t CK = C * KH;
+    
+    // Precompute derived constants
+    const uint32_t stride_Wd = stride * Wd;
+    const uint32_t KH_KW = KH * KW;
+    const uint32_t C_KH_KW = C * KH_KW;
+    
+    // Initialize coordinates for tid_in_threadblock
+    uint32_t p = 0; 
+    uint32_t p_div_OW = 0;
+    uint32_t p_mod_OW = 0;
+    uint32_t ckk = tid_in_threadblock;
+    
+    // Compute initial c, kh, kw without division in loop
+    uint32_t c = (tid_in_threadblock / KH_KW);
+    uint32_t kh = (tid_in_threadblock / KW) % KH;
+    uint32_t kw = tid_in_threadblock % KW;
+
+    for (uint32_t i = tid_in_threadblock; i < total; i += threads_per_threadblock) {
+      // Calculate input index using tracked coordinates
+      const uint32_t in_idx = c * HWd
+                            + (p_div_OW * stride + kh) * Wd
+                            + p_mod_OW * stride + kw;
+      store_shared(i * 4, 0, __builtin_bit_cast(uint32_t, a->in[in_idx]));
+
+      // Strength-reduced updates for next iteration (i += 128)
+      ckk += threads_per_threadblock;
+      
+      // Update kh,kw,c based on ckk increment
+      kh += threads_per_threadblock / KW; // 128/16 = 8
+      if (kh >= KH) {
+        kh -= KH;
+        c++;
+      }
+      
+      // Handle ckk wraparound
+      if (ckk >= CKK) {
+        ckk -= CKK;
+        p++;
+        
+        // Update p coordinates
+        p_mod_OW++;
+        if (p_mod_OW >= OW) {
+          p_mod_OW = 0;
+          p_div_OW++;
+        }
+        
+        // Adjust c when wrapping through CKK
+        c -= C;
+      }
+    }
+  }
+
+  // Synchronize cross-core SMEM writes
+  mu_barrier(0, threads_per_threadblock / MU_NUM_THREADS);
+
+  // Frugal matmul with strength-reduced tracking
+  {
+    const uint32_t P = a->OH * a->OW;
+    const uint32_t CKK = a->C * a->KH * a->KW;
+    
+    // Initialize output coordinates
+    uint32_t oc = tid_in_threadblock / P;
+    uint32_t p = tid_in_threadblock % P;
+    const uint32_t oc_inc = threads_per_threadblock / P; // 128/16 = 8
+
+    for (uint32_t idx = tid_in_threadblock; idx < a->OC * P; idx += threads_per_threadblock) {
+      // Calculate base addresses
+      uint32_t wa = smem_w + oc * CKK * 4;
+      uint32_t pa = p * CKK * 4;
+      
+      // Accumulate dot product
+      float acc = 0.0f;
+      for (uint32_t k = 0; k < CKK; k++) {
+        acc += __builtin_bit_cast(float, load32_shared(wa)) *
+               __builtin_bit_cast(float, load32_shared(pa));
+        wa += 4;
+        pa += 4;
+      }
+      a->out[idx] = acc;
+      
+      // Update oc for next iteration
+      oc += oc_inc;
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\n  114 |       const float v = load_shared_float(row_base + j * 4);\n      |                       ^\nkernel.cpp:121:30: error: use of undeclared identifier 'load_shared_float'\n  121 |       const float e = mu_exp(load_shared_float(row_base + j * 4) - max_val);\n      |                              ^\nkernel.cpp:122:7: error: use of undeclared identifier 'store_shared_float'\n  122 |       store_shared_float(row_base + j * 4, e);\n      |       ^\nkernel.cpp:129:19: error: use of undeclared identifier 'load_shared_float'\n  129 |       float val = load_shared_float(row_base + j * 4);\n      |                   ^\nkernel.cpp:130:7: error: use of undeclared identifier 'store_shared_float'\n  130 |       store_shared_float(row_base + j * 4, val * inv_sum);\n      |       ^\nkernel.cpp:142:23: error: use of undeclared identifier 'SMEM_S_OFFSET'\n  142 |     uint32_t s_base = SMEM_S_OFFSET + (i * 96) * 4;\n      |                       ^\nkernel.cpp:143:23: error: use of undeclared identifier 'SMEM_V_OFFSET'\n  143 |     uint32_t v_base = SMEM_V_OFFSET + k * 4;\n      |                       ^\nkernel.cpp:147:21: error: use of undeclared identifier 'load_shared_float'\n  147 |       float s_val = load_shared_float(s_base + j * 4);\n      |                     ^\nkernel.cpp:148:21: error: use of undeclared identifier 'load_shared_float'\n  148 |       float v_val = load_shared_float(v_base + (j * 64) * 4);\n      |                     ^\n19 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

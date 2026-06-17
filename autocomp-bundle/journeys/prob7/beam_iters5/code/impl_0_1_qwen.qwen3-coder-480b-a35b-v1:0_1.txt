@@ -1,0 +1,106 @@
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+  const uint32_t seq = a->seq;
+  const uint32_t d = a->d;
+  const uint32_t nw = threads_per_threadblock / MU_NUM_THREADS;
+
+  // Shared memory layout:
+  // s_K/s_V:       0x00000 .. 0x07FFF (32 KiB = 8192 floats)
+  // s_scratch:     0x08000 .. 0x17FFF (64 KiB = 16384 floats)
+  // s_Q/s_O:       0x18000 .. 0x1FFFF (32 KiB = 8192 floats)
+  constexpr uint32_t SMEM_BASE = 0x00000000;
+  constexpr uint32_t S_K_ADDR = SMEM_BASE + 0x00000;
+  constexpr uint32_t S_SCRATCH_ADDR = SMEM_BASE + 0x08000;
+  constexpr uint32_t S_Q_ADDR = SMEM_BASE + 0x18000;
+
+  const __global float* __restrict__ Q = a->Q;
+  const __global float* __restrict__ K = a->K;
+  const __global float* __restrict__ V = a->V;
+  __global float* __restrict__ O = a->O;
+
+  // Phase 1: Coalesced load Q/K into SMEM, then compute S[] = scale * Q * K^T => s_scratch
+  // Each thread loads one element every 128 steps
+  for (uint32_t idx = tid_in_threadblock; idx < seq * d; idx += threads_per_threadblock) {
+    store_shared(S_Q_ADDR, (idx << 2), *((uint32_t*)(Q + idx)));
+  }
+  for (uint32_t idx = tid_in_threadblock; idx < seq * d; idx += threads_per_threadblock) {
+    store_shared(S_K_ADDR, (idx << 2), *((uint32_t*)(K + idx)));
+  }
+  mu_barrier(0, nw); // Cross-core sync after SMEM writes
+
+  // GEMM: scratch[i][j] = 0.125 * sum_k(Q[i][k] * K[j][k])
+  for (uint32_t i = tid_in_threadblock; i < seq * seq; i += threads_per_threadblock) {
+    const uint32_t row = i / seq;
+    const uint32_t col = i % seq;
+    float acc = 0.0f;
+    for (uint32_t k = 0; k < d; k++) {
+      float q_val = *((float*)(&load32_shared(S_Q_ADDR + ((row * d + k) << 2))));
+      float k_val = *((float*)(&load32_shared(S_K_ADDR + ((col * d + k) << 2))));
+      acc += q_val * k_val;
+    }
+    store_shared(S_SCRATCH_ADDR, (i << 2), *((uint32_t*)(&(acc *= 0.125f))));
+  }
+  mu_barrier(0, nw); // Cross-core sync after scratch write
+
+  // Phase 2: In-place softmax over s_scratch rows
+  const uint32_t row_id = tid_in_threadblock;
+  if (row_id < seq) {
+    float* row_ptr = (float*)(S_SCRATCH_ADDR + (row_id * seq << 2));
+
+    // Find max
+    float m = row_ptr[0];
+    for (uint32_t j = 1; j < seq; j++) {
+      float val = *((float*)(&load32_shared((uint32_t)row_ptr + (j << 2))));
+      if (val > m) m = val;
+    }
+
+    // Exp subtracted and sum
+    float sum = 0.0f;
+    for (uint32_t j = 0; j < seq; j++) {
+      float val = *((float*)(&load32_shared((uint32_t)row_ptr + (j << 2))));
+      float exp_val = mu_exp(val - m);
+      store_shared((uint32_t)row_ptr, (j << 2), *((uint32_t*)(&exp_val)));
+      sum += exp_val;
+    }
+
+    // Normalize
+    const float inv_sum = 1.0f / sum;
+    for (uint32_t j = 0; j < seq; j++) {
+      float val = *((float*)(&load32_shared((uint32_t)row_ptr + (j << 2))));
+      val *= inv_sum;
+      store_shared((uint32_t)row_ptr, (j << 2), *((uint32_t*)(&val)));
+    }
+  }
+  mu_barrier(0, nw); // Cross-core sync after softmax
+
+  // Phase 3: Load V into s_V, compute O = scratch * V => s_O, then write O globally
+  for (uint32_t idx = tid_in_threadblock; idx < seq * d; idx += threads_per_threadblock) {
+    store_shared(S_K_ADDR, (idx << 2), *((uint32_t*)(V + idx))); // Reuse s_K addr for V
+  }
+  mu_barrier(0, nw); // Cross-core sync after loading V
+
+  // Compute O = scratch * V
+  for (uint32_t i = tid_in_threadblock; i < seq * d; i += threads_per_threadblock) {
+    const uint32_t row = i / d;
+    const uint32_t col = i % d;
+    float acc = 0.0f;
+    for (uint32_t k = 0; k < seq; k++) {
+      float p_val = *((float*)(&load32_shared(S_SCRATCH_ADDR + ((row * seq + k) << 2))));
+      float v_val = *((float*)(&load32_shared(S_K_ADDR + ((k * d + col) << 2)))); // V is at S_K_ADDR
+      acc += p_val * v_val;
+    }
+    store_shared(S_Q_ADDR, (i << 2), *((uint32_t*)(&acc))); // Store O in s_Q
+  }
+  mu_barrier(0, nw); // Cross-core sync after output computed
+
+  // Write final output from s_O (stored in s_Q_ADDR)
+  for (uint32_t idx = tid_in_threadblock; idx < seq * d; idx += threads_per_threadblock) {
+    *((uint32_t*)(O + idx)) = load32_shared(S_Q_ADDR + (idx << 2));
+  }
+}

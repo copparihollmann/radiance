@@ -1,0 +1,131 @@
+```cpp
+#include <stdint.h>
+
+struct KernelArgs {
+  const __global float* A;
+  const __global float* B;
+  __global float* C;
+  uint32_t M;
+  uint32_t N;
+  uint32_t K;
+};
+
+// Inline helper to avoid function call overhead
+static inline uint32_t float_to_bits(float f) {
+  return __builtin_bit_cast(uint32_t, f);
+}
+
+static inline float bits_to_float(uint32_t b) {
+  return __builtin_bit_cast(float, b);
+}
+
+// Simplified shared memory access wrappers
+static inline void store32_shared(uint32_t addr, uint32_t data) {
+  asm volatile("sw.shared %1, 0(%0)" :: "r"(addr), "r"(data) : "memory");
+}
+
+static inline uint32_t load32_shared(uint32_t addr) {
+  uint32_t data;
+  asm volatile("lw.shared %0, 0(%1)" : "=r"(data) : "r"(addr) : "memory");
+  return data;
+}
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* args = reinterpret_cast<const KernelArgs*>(raw_arg);
+
+  const uint32_t N = args->N;
+  const uint32_t K = args->K;
+  const uint32_t total_outputs = 64 * 64; // Fixed tile size
+
+  // Shared Memory Layout (all in bytes)
+  const uint32_t smem_A_base = 0;
+  const uint32_t smem_B_base = 4096;  // 64 * 16 * 4
+  const uint32_t smem_C_base = 8192;  // 64 * 64 * 4 + padding
+
+  // Zero out C array in shared memory
+  for (uint32_t i = tid_in_threadblock; i < total_outputs; i += threads_per_threadblock) {
+    store32_shared(smem_C_base + (i << 2), 0);
+  }
+  mu_barrier(0, 8); // Cross-core sync after init
+
+  // Loop over K dimension in tiles of BK=16
+  for (uint32_t k_tile_start = 0; k_tile_start < K; k_tile_start += 16) {
+    // Phase 1: Load A and B tile into shared memory
+    {
+      // Load A tile: 64 rows x 16 cols
+      const uint32_t a_tile_elems = 64 * 16;
+      for (uint32_t i = tid_in_threadblock; i < a_tile_elems; i += threads_per_threadblock) {
+        const uint32_t row = i >> 4; // div 16
+        const uint32_t col = i & 15; // mod 16
+        const uint32_t gidx = row * K + k_tile_start + col;
+        const float val = args->A[gidx];
+        store32_shared(smem_A_base + (i << 2), float_to_bits(val));
+      }
+
+      // Load B tile: 16 rows x 64 cols
+      const uint32_t b_tile_elems = 16 * 64;
+      for (uint32_t i = tid_in_threadblock; i < b_tile_elems; i += threads_per_threadblock) {
+        const uint32_t k_idx = i >> 6; // div 64
+        const uint32_t n_idx = i & 63; // mod 64
+        const uint32_t gidx = (k_tile_start + k_idx) * N + n_idx;
+        const float val = args->B[gidx];
+        store32_shared(smem_B_base + (i << 2), float_to_bits(val));
+      }
+    }
+
+    mu_barrier(0, 8); // Cross-core sync after loading tiles
+
+    // Phase 2: Compute and accumulate results in shared memory
+    {
+      for (uint32_t op = 0; op < 32; ++op) {
+        const uint32_t out_idx = (op << 7) + tid_in_threadblock; // op * 128 + tid
+        if (out_idx >= total_outputs) continue;
+
+        const uint32_t row_c = out_idx >> 6; // div 64
+        const uint32_t col_c = out_idx & 63; // mod 64
+
+        float acc = bits_to_float(load32_shared(smem_C_base + (out_idx << 2)));
+
+        // Base pointers for current row of A and column of B
+        uint32_t a_ptr = smem_A_base + (row_c * 16 << 2);
+        uint32_t b_ptr = smem_B_base + (col_c << 2);
+
+        // Manual unroll by 2 to hide SMEM latency
+        for (uint32_t k_inner = 0; k_inner < 16; k_inner += 2) {
+          const float a0 = bits_to_float(load32_shared(a_ptr));
+          const float b0 = bits_to_float(load32_shared(b_ptr));
+
+          acc += a0 * b0;
+
+          const float a1 = bits_to_float(load32_shared(a_ptr + 4));
+          const float b1 = bits_to_float(load32_shared(b_ptr + (16 * 64 << 2))); // 16 rows stride
+
+          acc += a1 * b1;
+
+          // Advance pointers by 2 elements
+          a_ptr += 8;
+          b_ptr += (2 * 16 * 64 << 2);
+        }
+
+        store32_shared(smem_C_base + (out_idx << 2), float_to_bits(acc));
+      }
+    }
+
+    mu_barrier(0, 8); // Cross-core sync before next tile
+  }
+
+  // Phase 3: Write result from shared memory to global memory
+  for (uint32_t i = tid_in_threadblock; i < total_outputs; i += threads_per_threadblock) {
+    const uint32_t row = i >> 6;
+    const uint32_t col = i & 63;
+    const uint32_t gidx = row * N + col;
+    args->C[gidx] = bits_to_float(load32_shared(smem_C_base + (i << 2)));
+  }
+}
+```

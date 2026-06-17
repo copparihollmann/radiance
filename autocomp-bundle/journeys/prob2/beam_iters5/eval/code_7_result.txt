@@ -1,0 +1,8 @@
+{
+    "correct": false,
+    "test_results": {
+        "0": false
+    },
+    "compiled": false,
+    "stderr": "COMPILE ERROR:\nr 'K_OFFSET'\n  100 |       float k_val = load_float_shared(K_OFFSET + (j * ROW_STRIDE + k) * 4);\n      |                                       ^\nkernel.cpp:100:55: error: use of undeclared identifier 'ROW_STRIDE'\n  100 |       float k_val = load_float_shared(K_OFFSET + (j * ROW_STRIDE + k) * 4);\n      |                                                       ^\nkernel.cpp:104:23: error: use of undeclared identifier 'S_OFFSET'\n  104 |     uint32_t s_addr = S_OFFSET + (i * ROW_STRIDE + j) * 4;\n      |                       ^\nkernel.cpp:104:39: error: use of undeclared identifier 'ROW_STRIDE'\n  104 |     uint32_t s_addr = S_OFFSET + (i * ROW_STRIDE + j) * 4;\n      |                                       ^\nkernel.cpp:105:5: error: use of undeclared identifier 'store_float_shared'\n  105 |     store_float_shared(s_addr, acc * scale);\n      |     ^\nkernel.cpp:114:25: error: use of undeclared identifier 'S_OFFSET'\n  114 |     uint32_t row_base = S_OFFSET + row * ROW_STRIDE * 4;\n      |                         ^\nkernel.cpp:114:42: error: use of undeclared identifier 'ROW_STRIDE'\n  114 |     uint32_t row_base = S_OFFSET + row * ROW_STRIDE * 4;\n      |                                          ^\nkernel.cpp:117:21: error: use of undeclared identifier 'load_float_shared'\n  117 |     float max_val = load_float_shared(row_base);\n      |                     ^\nfatal error: too many errors emitted, stopping now [-ferror-limit=]\n20 errors generated.\nmake: *** [../common.mk:94: kernel.mu.o] Error 1\n"
+}

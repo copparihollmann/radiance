@@ -1,0 +1,28 @@
+### Optimization Strategy: Thread-Private SMEM Allocation for Complete Phase Fusion and Barrier/Scratch Elimination
+
+#### Concept
+We can leverage the 128 KiB Shared Memory (SMEM) to allocate thread-private scratchpads for each of the 128 threads in the threadblock. Because $SEQ=128$ and $D=64$, we can partition SMEM as follows:
+* `smem_Q`: $128 \text{ threads} \times 64 \text{ floats} \times 4 \text{ bytes} = 32\text{ KiB}$
+* `smem_S`: $128 \text{ threads} \times 128 \text{ floats} \times 4 \text{ bytes} = 64\text{ KiB}$
+
+The total SMEM required is $96\text{ KiB}$, which safely fits within the $128\text{ KiB}$ hardware limit. 
+
+By giving each thread $tid$ exclusive ownership of its own SMEM segments (`smem_Q[tid * 64]` and `smem_S[tid * 128]`), we can **fully fuse Phase 1, Phase 2, and Phase 3** into a single row-serial pipeline per thread. Thread $tid$ independently computes row $i = tid$ from start to finish without needing to communicate with any other thread.
+
+#### Why This Improves Performance
+1. **Elimination of Global Scratch Traffic:** In the baseline, intermediate attention scores $S[i][j]$ and softmax outputs $P[i][j]$ are written to and read from the slow global `scratch` buffer multiple times. With thread-private SMEM buffering, these intermediates are kept entirely on-chip in low-latency SMEM ($\sim2$ cycles vs. $\sim400$ cycles for DRAM). The global `scratch` buffer is never accessed.
+2. **Complete Elimination of Barriers:** Because there is no cross-thread or cross-core data sharing (each thread works on its own independent row), we can completely remove all `mu_barrier` synchronization points. This eliminates synchronization latency and avoids pipeline stalls.
+3. **Strict Register-Limit Compliance:** Storing the 64-element $Q[i]$ vector and 128-element score vector $S[i]$ in SMEM rather than in registers ensures that we easily respect the hard RTL limit of $\le 31$ active registers per thread, avoiding physical register over-subscription.
+
+#### Implementation Plan
+1. Define the SMEM base addresses using the shared memory intrinsics:
+   ```cpp
+   // Base address of SMEM is 0x00000000
+   uint32_t smem_Q_base = 0;
+   uint32_t smem_S_base = 32768; // 32 KiB offset
+   ```
+2. For each thread $tid = \text{tid\_in\_threadblock}$:
+   * **Stage Q Row:** Load $Q[tid \times 64 + k]$ from global memory once and store it to `smem_Q_base + (tid * 64 + k) * 4` using `store_shared`.
+   * **Compute Scores (Fused Phase 1):** Loop over $j \in [0, 128)$. For each $j$, compute the dot product of $Q[tid]$ (read from `smem_Q`) and $K[j]$ (read from global memory). Store the scaled score $S[tid][j]$ to `smem_S_base + (tid * 128 + j) * 4` using `store_shared`.
+   * **Softmax (Fused Phase 2):** Perform the row-softmax in-place within the thread's `smem_S` segment. Find the max, compute the sum of exponentials using `mu_exp`, and normalize the values using `load32_shared` and `store_shared`.
+   * **Compute Output (Fused Phase 3):** For each $k \in [0, 64)$, compute the weighted sum of $V[j][k]$ using the softmax probabilities $P[tid][j]$ loaded from `smem_S`. Write the final accumulated result directly to $O[tid \times 64 + k]$ in global memory.

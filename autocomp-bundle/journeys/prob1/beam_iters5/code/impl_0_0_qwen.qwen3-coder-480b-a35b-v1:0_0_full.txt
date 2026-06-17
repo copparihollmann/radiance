@@ -1,0 +1,162 @@
+```cpp
+#include <stdint.h>
+#include <type_traits>
+
+// Template-specialized kernel implementation for power-of-two dimensions
+template <
+  uint32_t OC,
+  uint32_t C,
+  uint32_t KH,
+  uint32_t KW,
+  uint32_t OH,
+  uint32_t OW,
+  uint32_t stride
+>
+static inline void kernel_body_specialized(
+  KernelArgs* a,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock
+) {
+  constexpr uint32_t CKK = C * KH * KW;
+  constexpr uint32_t P = OH * OW;
+  constexpr uint32_t smem_w = P * CKK * 4;
+
+  // (1) Stage W flat into SMEM
+  for (uint32_t i = tid_in_threadblock; i < OC * CKK; i += threads_per_threadblock) {
+    uint32_t addr = smem_w + i * 4;
+    uint32_t data = __builtin_bit_cast(uint32_t, a->w[i]);
+    store_shared(addr, 0, data);
+  }
+
+  // (2) Gather im2col patches into SMEM
+  {
+    const uint32_t Wd = a->W;
+    const uint32_t HWd = a->H * Wd;
+    
+    for (uint32_t p = 0; p < P; ++p) {
+      const uint32_t pr = p >> 2;  // p / OW (OW = 4)
+      const uint32_t pc = p & 3;   // p % OW
+      const uint32_t out_p_base = p * CKK;
+
+      for (uint32_t ckk = tid_in_threadblock; ckk < CKK; ckk += threads_per_threadblock) {
+        const uint32_t c = ckk >> 8;         // ckk / (KH * KW) (KH * KW = 256)
+        const uint32_t kh = (ckk >> 4) & 15; // (ckk / KW) % KH (KW = 16, KH = 16)
+        const uint32_t kw = ckk & 15;        // ckk % KW
+
+        const uint32_t in_idx = c * HWd
+                              + (pr * stride + kh) * Wd
+                              + pc * stride + kw;
+        uint32_t addr = (out_p_base + ckk) * 4;
+        uint32_t data = __builtin_bit_cast(uint32_t, a->in[in_idx]);
+        store_shared(addr, 0, data);
+      }
+    }
+  }
+
+  // Cross-core synchronization
+  mu_barrier(0, threads_per_threadblock / MU_NUM_THREADS);
+
+  // (3) Frugal matmul with pointer bumping
+  {
+    for (uint32_t idx = tid_in_threadblock; idx < OC * P; idx += threads_per_threadblock) {
+      const uint32_t oc = idx >> 4;  // idx / P (P = 16)
+      const uint32_t p = idx & 15;   // idx % P
+
+      uint32_t wa = smem_w + oc * CKK * 4;
+      uint32_t pa = p * CKK * 4;
+      float acc = 0.0f;
+
+      for (uint32_t k = 0; k < CKK; k++) {
+        float w_val = __builtin_bit_cast(float, load32_shared(wa));
+        float p_val = __builtin_bit_cast(float, load32_shared(pa));
+        acc += w_val * p_val;
+        wa += 4;
+        pa += 4;
+      }
+      a->out[idx] = acc;
+    }
+  }
+}
+
+static inline void kernel_body(
+  void* raw_arg,
+  uint32_t tid_in_threadblock,
+  uint32_t threads_per_threadblock,
+  uint32_t threadblock_id
+) {
+  (void)threadblock_id;
+  auto* a = reinterpret_cast<KernelArgs*>(raw_arg);
+
+  // Specialize for the exact vision transformer patch embedding layout:
+  // OUT[16,4,4] = IN[3,64,64] * W[16,3,16,16], stride 16
+  if (a->OC == 16 && a->C == 3 && a->KH == 16 && a->KW == 16 &&
+      a->OH == 4 && a->OW == 4 && a->stride == 16) {
+    kernel_body_specialized<16, 3, 16, 16, 4, 4, 16>(
+      a, tid_in_threadblock, threads_per_threadblock
+    );
+  } else {
+    // Fallback generic implementation
+    const uint32_t CKK = a->C * a->KH * a->KW;
+    const uint32_t P = a->OH * a->OW;
+    const uint32_t smem_w = P * CKK * 4;
+
+    // (1) Stage W flat into SMEM
+    for (uint32_t i = tid_in_threadblock; i < a->OC * CKK; i += threads_per_threadblock) {
+      uint32_t addr = smem_w + i * 4;
+      uint32_t data = __builtin_bit_cast(uint32_t, a->w[i]);
+      store_shared(addr, 0, data);
+    }
+
+    // (2) Gather im2col patches into SMEM
+    {
+      const uint32_t KH = a->KH, KW = a->KW, OW = a->OW;
+      const uint32_t Wd = a->W;
+      const uint32_t HWd = a->H * Wd;
+      const uint32_t stride = a->stride;
+
+      for (uint32_t p = 0; p < P; ++p) {
+        const uint32_t pr = p / OW;
+        const uint32_t pc = p % OW;
+        const uint32_t out_p_base = p * CKK;
+
+        for (uint32_t ckk = tid_in_threadblock; ckk < CKK; ckk += threads_per_threadblock) {
+          const uint32_t c = ckk / (KH * KW);
+          const uint32_t kh = (ckk / KW) % KH;
+          const uint32_t kw = ckk % KW;
+
+          const uint32_t in_idx = c * HWd
+                                + (pr * stride + kh) * Wd
+                                + pc * stride + kw;
+          uint32_t addr = (out_p_base + ckk) * 4;
+          uint32_t data = __builtin_bit_cast(uint32_t, a->in[in_idx]);
+          store_shared(addr, 0, data);
+        }
+      }
+    }
+
+    // Cross-core synchronization
+    mu_barrier(0, threads_per_threadblock / MU_NUM_THREADS);
+
+    // (3) Frugal matmul with pointer bumping
+    {
+      for (uint32_t idx = tid_in_threadblock; idx < a->OC * P; idx += threads_per_threadblock) {
+        const uint32_t oc = idx / P;
+        const uint32_t p = idx % P;
+
+        uint32_t wa = smem_w + oc * CKK * 4;
+        uint32_t pa = p * CKK * 4;
+        float acc = 0.0f;
+
+        for (uint32_t k = 0; k < CKK; k++) {
+          float w_val = __builtin_bit_cast(float, load32_shared(wa));
+          float p_val = __builtin_bit_cast(float, load32_shared(pa));
+          acc += w_val * p_val;
+          wa += 4;
+          pa += 4;
+        }
+        a->out[idx] = acc;
+      }
+    }
+  }
+}
+```
