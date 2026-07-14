@@ -371,7 +371,7 @@ class CyclotronDiffTest(clusterId: Int = 0, coreId: Int = 0, tick: Boolean = tru
         "ARCH_LEN"     -> p(MuonKey).archLen,
         "NUM_WARPS"    -> p(MuonKey).numWarps,
         "NUM_LANES"    -> p(MuonKey).numLanes,
-        "REG_BITS"     -> Isa.regBits,
+        "REG_BITS"     -> p(MuonKey).pRegBits,
         "SIM_TICK"     -> (if (tick) 1 else 0),
   )) with HasBlackBoxResource with HasCoreParameters {
     val io = IO(new Bundle {
@@ -484,8 +484,12 @@ extends CoreModule {
   }
 
   val cbox = Module(new TracerBlackBox()(p))
+  val cycle = RegInit(0.U(64.W))
+  cycle := cycle + 1.U
+
   cbox.io.clock := clock
   cbox.io.reset := reset.asBool
+  cbox.io.cycle := cycle
 
   cbox.io.inst.valid := io.inst.valid
   cbox.io.inst.pc := io.inst.bits.pc
@@ -526,7 +530,7 @@ extends CoreModule {
         "NUM_WARPS"    -> p(MuonKey).numWarps,
         "NUM_LANES"    -> p(MuonKey).numLanes,
         "LSU_LANES"    -> p(MuonKey).lsu.numLsuLanes,
-        "REG_BITS"     -> Isa.regBits,
+        "REG_BITS"     -> p(MuonKey).pRegBits,
         "DMEM_TAG_BITS" -> dmemTagBits,
         "DMEM_DATA_BITS" -> dmemDataBits,
         "SMEM_TAG_BITS" -> smemTagBits,
@@ -538,6 +542,7 @@ extends CoreModule {
     val io = IO(new Bundle {
       val clock = Input(Clock())
       val reset = Input(Bool())
+      val cycle = Input(UInt(64.W))
       val inst = Input(new TraceVerilogIO)
       val dmem_req_valid = Input(UInt(muonParams.lsu.numLsuLanes.W))
       val dmem_req_bits_store = Input(UInt(muonParams.lsu.numLsuLanes.W))
