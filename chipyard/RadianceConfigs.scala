@@ -8,6 +8,27 @@ import org.chipsalliance.cde.config.Config
 import radiance.subsystem._
 import radiance.unittest.WithMemPerfMuonTileReplacement
 import testchipip.soc.OBUS
+import shuttle.common.ShuttleTileAttachParams
+import boom.v3.common.BoomTileAttachParams
+
+// Cork the host tile's master so a Shuttle/BOOM host attaches INCOHERENTLY to the Radiance host
+// bus (which only supports incoherent masters). WithIncoherentTiles only matches RocketTileAttachParams,
+// so non-Rocket hosts need this. Must sit leftmost so up(TilesLocated) sees the host tile.
+class WithIncoherentHostTile extends Config((site, here, up) => {
+  case TilesLocated(location) => up(TilesLocated(location)) map {
+    case tp: ShuttleTileAttachParams => tp.copy(crossingParams = tp.crossingParams.copy(
+      master = tp.crossingParams.master match {
+        case x: HierarchicalElementMasterPortParams => x.copy(cork = Some(true))
+        case o => o
+      }))
+    case tp: BoomTileAttachParams => tp.copy(crossingParams = tp.crossingParams.copy(
+      master = tp.crossingParams.master match {
+        case x: HierarchicalElementMasterPortParams => x.copy(cork = Some(true))
+        case o => o
+      }))
+    case o => o
+  }
+})
 
 // ----------------
 // Radiance Configs
@@ -298,6 +319,31 @@ class RadianceGemminiOnlyConfig extends Config(
   new WithRadianceCluster(0, smemConfig = TapeoutSmemConfig, l1Config = L1CacheConfig) ++
   new WithExtGPUMem() ++
   new freechips.rocketchip.rocket.WithNSmallCores(1) ++
+  new RadianceBaseConfig
+)
+
+// Host-core experiment: same MX-Gemmini-only cluster, but the host that drives the Gemmini
+// (via MMIO) is a dual-issue in-order Shuttle core instead of the small in-order Rocket.
+// Tests whether a wider host pipelines the fine-grained MMIO command stream better.
+class RadianceGemminiShuttleConfig extends Config(
+  new WithIncoherentHostTile ++
+  new WithRadianceMxGemmini(location = InCluster(0), dim = 16, accSizeInKB = 32, tileSize = (8, 8, 8)) ++
+  new WithMuonCores(1, location = InCluster(0), l0i = Some(L0iCacheConfig), l0d = Some(L0dCacheConfig), disabled = true) ++
+  new WithRadianceCluster(0, smemConfig = TapeoutSmemConfig, l1Config = L1CacheConfig) ++
+  new WithExtGPUMem() ++
+  new shuttle.common.WithNShuttleCores ++
+  new RadianceBaseConfig
+)
+
+// Host-core experiment (OoO): same cluster, host is an out-of-order BOOM core. Strongest test
+// of whether issuing ROCC/MMIO commands ahead + reordering around stalls keeps the array fed.
+class RadianceGemminiBoomConfig extends Config(
+  new WithIncoherentHostTile ++
+  new WithRadianceMxGemmini(location = InCluster(0), dim = 16, accSizeInKB = 32, tileSize = (8, 8, 8)) ++
+  new WithMuonCores(1, location = InCluster(0), l0i = Some(L0iCacheConfig), l0d = Some(L0dCacheConfig), disabled = true) ++
+  new WithRadianceCluster(0, smemConfig = TapeoutSmemConfig, l1Config = L1CacheConfig) ++
+  new WithExtGPUMem() ++
+  new boom.v3.common.WithNMediumBooms(1) ++
   new RadianceBaseConfig
 )
 
