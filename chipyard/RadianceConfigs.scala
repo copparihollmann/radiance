@@ -332,3 +332,42 @@ class RadianceMemPerfConfig extends Config(
   new WithExtGPUMem() ++
   new RadianceBaseConfig
 )
+
+// ------------------------------------------------------------------
+// GSIM-friendly harness clocking
+// ------------------------------------------------------------------
+// GSIM (FIRRTL -> C++ simulator) can only drive a clock that is a true
+// top-level input of the elaborated design. The default Chipyard harness
+// clocking (WithAbsoluteFreqHarnessClockInstantiator) *generates* every clock
+// inside an unsynthesizable `ClockSourceAtFreqMHz` Verilog blackbox, which GSIM
+// cannot drive -> it degenerates to a constant/dead clock.
+//
+// This instantiator instead drives every requested harness clock directly from
+// the TestHarness reference clock (`referenceClock == clock`, a genuine
+// top-level input port), with no blackbox. It is like
+// AllClocksFromHarnessClockInstantiator but drops the per-domain
+// `freqMHz == refClockFreqMHz` assertion, so GSIM can treat the whole design as
+// a single top-level-driven clock domain (all on-chip domains are synchronous
+// crossings combined into one "uncore" group in RadianceBaseConfig).
+class GsimHarnessClockInstantiator extends chipyard.harness.HarnessClockInstantiator {
+  def instantiateHarnessClocks(refClock: chisel3.Clock, refClockFreqMHz: Double): Unit = {
+    for ((_, (_, clock)) <- clockMap) {
+      clock := refClock
+    }
+  }
+}
+
+class WithGsimHarnessClockInstantiator extends Config((site, here, up) => {
+  case chipyard.harness.HarnessClockInstantiatorKey => () => new GsimHarnessClockInstantiator
+})
+
+// A GSIM-clean variant of RadianceTapeoutSimConfig:
+//  - WithoutTLMonitors strips the TileLink protocol-checker monitors that trip
+//    GSIM's splitArray pass with a cyclic-dependency panic.
+//  - WithGsimHarnessClockInstantiator replaces the ClockSourceAtFreqMHz blackbox
+//    clock generators with the top-level TestHarness clock input.
+class RadianceGsimConfig extends Config(
+  new freechips.rocketchip.subsystem.WithoutTLMonitors ++
+  new WithGsimHarnessClockInstantiator ++
+  new RadianceTapeoutSimConfig
+)
